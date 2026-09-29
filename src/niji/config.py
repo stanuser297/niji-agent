@@ -1,0 +1,101 @@
+import json
+import os
+from pathlib import Path
+
+CONFIG_DIR = Path.home() / ".niji"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+SESSION_DIR = CONFIG_DIR / "sessions"
+MCP_FILE = CONFIG_DIR / "mcp.json"
+MEMORY_FILE = CONFIG_DIR / "MEMORY.md"
+
+# Any provider with an OpenAI-compatible endpoint works out of the box.
+PRESETS = {
+    "openai":     {"base_url": "https://api.openai.com/v1",
+                   "env_key": "OPENAI_API_KEY", "model": "gpt-5"},
+    "openrouter": {"base_url": "https://api.openrouter.ai/api/v1",
+                   "env_key": "OPENROUTER_API_KEY", "model": "openai/gpt-4o-mini"},
+    "anthropic":  {"base_url": "https://api.anthropic.com/v1/",
+                   "env_key": "ANTHROPIC_API_KEY", "model": "claude-sonnet-4-5"},
+    "gemini":     {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+                   "env_key": "GEMINI_API_KEY", "model": "gemini-2.5-flash"},
+    "groq":       {"base_url": "https://api.groq.com/openai/v1",
+                   "env_key": "GROQ_API_KEY", "model": "llama-3.3-70b-versatile"},
+    "deepseek":   {"base_url": "https://api.deepseek.com/v1",
+                   "env_key": "DEEPSEEK_API_KEY", "model": "deepseek-chat"},
+    "together":   {"base_url": "https://api.together.xyz/v1",
+                   "env_key": "TOGETHER_API_KEY",
+                   "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo"},
+    "ollama":     {"base_url": "http://localhost:11434/v1",
+                   "env_key": None, "model": "llama3.1"},
+}
+
+
+def load_config():
+    if CONFIG_FILE.exists():
+        try:
+            return json.loads(CONFIG_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+
+
+def load_mcp_servers(path=None):
+    """Load MCP connector servers from mcp.json (or a custom path)."""
+    p = Path(path) if path else MCP_FILE
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text())
+        return data.get("servers", data)
+    except Exception as e:
+        print(f"[niji] warning: could not parse {p}: {e}")
+        return {}
+
+
+def resolve_provider(name=None, model=None, api_key=None):
+    cfg = load_config()
+    name = (name or os.environ.get("NIJI_PROVIDER")
+            or cfg.get("provider") or "openrouter")
+
+    preset = PRESETS.get(name)
+
+    # custom provider via env: NIJI_BASE_URL works with ANY name
+    custom_base = os.environ.get("NIJI_BASE_URL")
+    if preset is None and custom_base:
+        return {
+            "provider": name,
+            "base_url": custom_base,
+            "api_key": (api_key or os.environ.get("NIJI_API_KEY")
+                        or cfg.get("api_keys", {}).get(name) or "niji"),
+            "model": (model or os.environ.get("NIJI_MODEL")
+                      or cfg.get("models", {}).get(name) or "default"),
+        }
+
+    if preset is None:
+        known = ", ".join(PRESETS)
+        raise SystemExit(
+            f"Unknown provider '{name}'. Options: {known}\n"
+            f"Or set NIJI_BASE_URL env var to use any OpenAI-compatible endpoint.")
+
+    key = (api_key
+           or (preset["env_key"] and os.environ.get(preset["env_key"]))
+           or os.environ.get("NIJI_API_KEY")
+           or cfg.get("api_keys", {}).get(name))
+    if preset["env_key"] and not key:
+        raise SystemExit(
+            f"API key missing for '{name}'. Either:\n"
+            f"  export {preset['env_key']}=sk-...\n"
+            f"  niji config set-key {name} sk-...")
+
+    return {
+        "provider": name,
+        "base_url": preset["base_url"],
+        "api_key": key or "ollama",
+        "model": (model or os.environ.get("NIJI_MODEL")
+                  or cfg.get("models", {}).get(name) or preset["model"]),
+    }

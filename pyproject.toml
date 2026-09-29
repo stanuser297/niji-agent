@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "niji-agent"
+version = "0.2.0"
+description = "niji-agent — powerful provider-agnostic coding agent CLI with MCP connectors, subagents, memory, planning and parallel execution"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "openai>=1.30",
+    "rich>=13.0",
+]
+
+[project.scripts]
+niji = "niji.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
