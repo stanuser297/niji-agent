@@ -1,10 +1,65 @@
 import argparse
+import getpass
 import json
+import os
 import sys
 from pathlib import Path
 
 from .config import (PRESETS, SESSION_DIR, load_config, load_mcp_servers,
                      resolve_provider, save_config)
+
+
+def _first_run_setup(provider_hint=None):
+    """Prompt for provider credentials on first interactive launch."""
+    cfg = load_config()
+    provider_names = list(PRESETS)
+    selected = provider_hint or "openrouter"
+
+    if provider_hint is None:
+        print("\nWelcome to niji-agent! Let's set up your model provider first.")
+        print("Choose a provider (OpenRouter is a convenient default):")
+        for index, name in enumerate(provider_names, 1):
+            print(f"  {index}. {name}")
+        choice = input(f"Provider [default {provider_names.index('openrouter') + 1} - OpenRouter]: ").strip()
+        if choice:
+            if choice.isdigit() and 1 <= int(choice) <= len(provider_names):
+                selected = provider_names[int(choice) - 1]
+            elif choice.lower() in PRESETS:
+                selected = choice.lower()
+            else:
+                raise SystemExit("Unknown provider selection. Run 'niji' again and choose a listed provider.")
+
+    preset = PRESETS[selected]
+    cfg["provider"] = selected
+    if preset["env_key"]:
+        try:
+            key = getpass.getpass(f"Paste your {selected} API key (input hidden): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            raise SystemExit("Setup cancelled. Run 'niji' when you're ready to configure it.")
+        if not key:
+            raise SystemExit("No API key entered. Run 'niji' again to finish setup.")
+        cfg.setdefault("api_keys", {})[selected] = key
+
+    save_config(cfg)
+    print(f"[ok] Setup saved for {selected}. Starting niji...\n")
+
+
+def _ensure_setup(args):
+    cfg = load_config()
+    provider = (args.provider or os.environ.get("NIJI_PROVIDER")
+                or cfg.get("provider") or "openrouter")
+    preset = PRESETS.get(provider)
+    if not preset or not preset["env_key"] or args.api_key:
+        return
+    has_key = (os.environ.get(preset["env_key"])
+               or os.environ.get("NIJI_API_KEY")
+               or cfg.get("api_keys", {}).get(provider))
+    if has_key:
+        return
+    if not sys.stdin.isatty():
+        raise SystemExit("First-run setup needs an interactive terminal. Run 'niji' without arguments to configure your provider.")
+    hint = provider if (args.provider or os.environ.get("NIJI_PROVIDER") or cfg.get("provider")) else None
+    _first_run_setup(hint)
 
 
 def _build_agent(args, mcp_path=None):
@@ -139,6 +194,7 @@ def main():
     p.add_argument("--mcp", help="Path to a custom mcp.json")
     p.add_argument("--no-mcp", action="store_true", help="Skip MCP connectors")
     args = p.parse_args(argv)
+    _ensure_setup(args)
 
     mcp_path = None if args.no_mcp else args.mcp
 

@@ -31,11 +31,18 @@ pip install .
 
 ## Setup
 
+First launch pe `niji` setup wizard kholta hai: provider choose karo, API key paste karo, phir chat start ho jaati hai. Key `~/.niji/config.json` mein locally save hoti hai; environment variable export karna zaroori nahi. Config file private permissions ke saath save hoti hai.
+
+```bash
+niji
+# Local Ollama ke liye pehle: ollama pull llama3.1
+```
+
+Non-interactive setup ya existing config ke liye manual commands bhi available hain:
+
 ```bash
 niji config set-key openrouter sk-or-...
 niji config set-default openrouter
-# ya: export OPENAI_API_KEY=... / ANTHROPIC_API_KEY=... etc.
-# local free: ollama pull llama3.1   (koi key nahi)
 ```
 
 ## Use
