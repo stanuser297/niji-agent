@@ -37,6 +37,12 @@ def task(prompt: str, ctx: dict = None) -> str:
         mcp_clients=[],
         allowed_tools=SUBAGENT_TOOLS,
     )
+    # Parent /undo can also reverse a subagent's file changes; the same guarded
+    # snapshot stack prevents a child from creating an invisible edit trail.
+    sub.file_change_history = parent.file_change_history
+    sub._file_change_lock = parent._file_change_lock
+    sub.activity_callback = lambda event: parent._record_activity(
+        event.get("level", "INFO"), "Subagent: " + event.get("message", ""))
     result = sub.chat(prompt)
     return "[subagent report]\n" + str(result)[:12000]
 

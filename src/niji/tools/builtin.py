@@ -41,25 +41,63 @@ def read_file(path: str, offset: int = 0, limit: int = 400) -> str:
     return header + "\n" + "\n".join(chunk)
 
 
-def write_file(path: str, content: str) -> str:
+def _snapshot_before(p: Path):
+    """Return (snapshot, reversible); cap in-memory undo snapshots at 1 MiB."""
+    if not p.exists():
+        return None, True
+    if not p.is_file():
+        return None, False
+    try:
+        if p.stat().st_size > 1_000_000:
+            return None, False
+        return p.read_bytes(), True
+    except OSError:
+        return None, False
+
+
+def _record_undo(ctx, p: Path, before, after: bytes, operation, reversible):
+    agent = (ctx or {}).get("agent")
+    if not reversible or agent is None:
+        return False
+    return agent.record_file_change(p, before, after, operation)
+
+
+def write_file(path: str, content: str, ctx: dict = None) -> str:
     p = Path(path)
+    existed = p.exists()
+    before, reversible = _snapshot_before(p)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content)
-    return f"[ok] wrote {len(content)} chars to {path}"
+    recorded = _record_undo(ctx, p, before if existed else None,
+                            content.encode("utf-8"), "write_file", reversible)
+    message = f"[ok] wrote {len(content)} chars to {path}"
+    if recorded:
+        message += " (undo checkpoint available with /undo)"
+    elif existed and not reversible:
+        message += " (file exceeded the 1 MB undo-snapshot limit)"
+    return message
 
 
-def edit_file(path: str, old_text: str, new_text: str) -> str:
+def edit_file(path: str, old_text: str, new_text: str, ctx: dict = None) -> str:
     p = Path(path)
     if not p.is_file():
         return f"[error] not a file: {path}"
+    before, reversible = _snapshot_before(p)
     text = p.read_text(errors="replace")
     n = text.count(old_text)
     if n == 0:
         return "[error] old_text not found in file"
     if n > 1:
         return f"[error] old_text found {n} times — must be unique. Give more context."
-    p.write_text(text.replace(old_text, new_text, 1))
-    return "[ok] edit applied"
+    updated = text.replace(old_text, new_text, 1)
+    p.write_text(updated)
+    recorded = _record_undo(ctx, p, before, updated.encode("utf-8"), "edit_file", reversible)
+    message = "[ok] edit applied"
+    if recorded:
+        message += " (undo checkpoint available with /undo)"
+    elif not reversible:
+        message += " (file exceeded the 1 MB undo-snapshot limit)"
+    return message
 
 
 def list_files(path: str = ".", depth: int = 2) -> str:

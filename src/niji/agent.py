@@ -1,5 +1,8 @@
+import hashlib
 import json
+import os
 import random
+import tempfile
 import threading
 import time
 import uuid
@@ -77,6 +80,10 @@ class Agent:
         self.started_at = time.monotonic()
         self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "turns": 0}
         self.tool_usage = {}
+        # Reversible file edits are kept in memory only; snapshots never write
+        # project contents into global config or session transcripts.
+        self.file_change_history = []
+        self._file_change_lock = threading.Lock()
         self.activity = [{"time": datetime.now().strftime("%H:%M:%S"),
                           "level": "INFO", "message": "Provider configuration loaded"}]
         self.activity_callback = None
@@ -135,6 +142,76 @@ class Agent:
                 callback(event)
             except Exception:
                 pass
+
+    def record_file_change(self, path, before, after, operation):
+        """Track a bounded, session-local snapshot for a user-requested undo."""
+        if before == after:
+            return False
+        if before is not None and len(before) > 1_000_000:
+            return False
+        p = Path(path).resolve()
+        try:
+            mode = p.stat().st_mode if before is not None else None
+        except OSError:
+            mode = None
+        entry = {
+            "path": str(p), "before": before,
+            "after_sha256": hashlib.sha256(after).hexdigest(),
+            "operation": operation, "mode": mode,
+        }
+        with self._file_change_lock:
+            self.file_change_history.append(entry)
+            self.file_change_history = self.file_change_history[-20:]
+        self._record_activity("CHECKPOINT", f"Undo checkpoint saved: {p.name}")
+        return True
+
+    def latest_file_change(self):
+        with self._file_change_lock:
+            if not self.file_change_history:
+                return None
+            entry = self.file_change_history[-1]
+            return {"path": entry["path"], "operation": entry["operation"]}
+
+    def undo_last_file_change(self):
+        with self._file_change_lock:
+            if not self.file_change_history:
+                return {"ok": False, "message": "No reversible file changes in this session."}
+            entry = self.file_change_history[-1]
+            path = Path(entry["path"])
+            try:
+                if path.is_symlink() or path.resolve(strict=False) != path:
+                    return {"ok": False, "message": "Path changed through a symlink; refusing to restore it."}
+                if not path.is_file():
+                    return {"ok": False, "message": "File is missing or no longer a regular file; nothing was changed."}
+                current = path.read_bytes()
+            except OSError as exc:
+                return {"ok": False, "message": f"Could not verify the current file: {exc}"}
+            digest = hashlib.sha256(current).hexdigest()
+            if digest != entry["after_sha256"]:
+                return {"ok": False, "message": "File changed since the checkpoint; refusing to overwrite newer edits."}
+            try:
+                if entry["before"] is None:
+                    path.unlink()
+                    action = "removed newly created file"
+                else:
+                    fd, temp_name = tempfile.mkstemp(prefix=".niji-undo-", dir=str(path.parent))
+                    try:
+                        with os.fdopen(fd, "wb") as temp_file:
+                            temp_file.write(entry["before"])
+                            temp_file.flush()
+                            os.fsync(temp_file.fileno())
+                        if entry["mode"] is not None:
+                            os.chmod(temp_name, entry["mode"] & 0o7777)
+                        os.replace(temp_name, path)
+                    finally:
+                        if os.path.exists(temp_name):
+                            os.unlink(temp_name)
+                    action = "restored previous file contents"
+            except OSError as exc:
+                return {"ok": False, "message": f"Restore failed: {exc}"}
+            self.file_change_history.pop()
+        self._record_activity("UNDO", f"Undid {entry['operation']}: {path.name}")
+        return {"ok": True, "message": f"{action}: {path}"}
 
     def chat(self, user_text: str) -> str:
         self._request_tool_calls = 0

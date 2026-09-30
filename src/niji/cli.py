@@ -58,6 +58,10 @@ def _activity_notice(event):
         console.print(f"[bold cyan]⚒ {message}[/]")
     elif level == "TOOL_DONE":
         console.print(f"[green]✓ {message}[/]")
+    elif level == "CHECKPOINT":
+        console.print(f"[dim cyan]↶ {message}[/]")
+    elif level == "UNDO":
+        console.print(f"[bold green]↶ {message}[/]")
     elif level == "DENIED":
         console.print(f"[yellow]⊘ {message}[/]")
     elif level == "ERROR":
@@ -333,20 +337,54 @@ def _cmd_doctor():
 
 # ---------------- sessions ----------------
 
-def _list_sessions():
+def _list_sessions(query=""):
     if not SESSION_DIR.exists():
         print("no sessions yet")
         return
     files = sorted(SESSION_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime,
                    reverse=True)
-    for f in files[:20]:
+    query = str(query or "").strip().casefold()
+    shown = 0
+    for f in files:
         try:
             msgs = json.loads(f.read_text())
-            first_user = next((str(m.get("content")) for m in msgs
-                               if m.get("role") == "user"), "?")[:60]
+            user_msgs = [str(m.get("content", "")) for m in msgs
+                         if m.get("role") == "user"]
+            first_user = (user_msgs[0] if user_msgs else "?").replace("\n", " ")
+            haystack = (f.stem + " " + " ".join(user_msgs)).casefold()
+            if query and query not in haystack:
+                continue
+            if query:
+                first_user = next((msg.replace("\n", " ") for msg in user_msgs
+                                   if query in msg.casefold()), first_user)
         except Exception:
             first_user = "?"
-        print(f"  {f.stem}  ({f.stat().st_size // 1024} KB)  {first_user}")
+            if query:
+                continue
+        print(f"  {f.stem}  ({f.stat().st_size // 1024} KB)  {first_user[:80]}")
+        shown += 1
+        if shown >= 20:
+            break
+    if shown == 0:
+        suffix = f" matching {query!r}" if query else ""
+        print(f"no sessions found{suffix}")
+
+
+def _undo_last_change(agent):
+    change = agent.latest_file_change()
+    if not change:
+        Console().print("[dim]No reversible file changes in this session.[/]")
+        return
+    Console().print(Panel(
+        f"[bold]{change['operation']}[/] · {change['path']}\n"
+        "Undo is allowed only if the file still matches Niji's last saved version.",
+        title="Undo latest file change?", border_style="yellow"))
+    if Prompt.ask("Restore the previous contents?", choices=["y", "n"], default="n") != "y":
+        Console().print("[dim]No changes made.[/]")
+        return
+    result = agent.undo_last_file_change()
+    style = "green" if result["ok"] else "red"
+    Console().print(f"[{style}]{result['message']}[/]")
 
 
 # ---------------- interactive terminal UI ----------------
@@ -386,7 +424,9 @@ def _show_help():
         ("/approval", "Toggle auto/ask confirmation mode for tool execution"),
         ("/cost", "Show token usage so far"),
         ("/compact", "Summarize older context to free space"),
-        ("/memory", "View saved long-term memory"),
+        ("/memory [show|add <note>|clear]", "View or manage long-term memory (never store secrets)"),
+        ("/undo", "Safely restore the last Niji file write/edit in this session"),
+        ("/sessions [search words]", "List or search saved chat sessions"),
         ("/setup", "Reconnect/switch provider and model"),
         ("/providers", "List provider choices"),
         ("/doctor", "Test the saved provider and setup"),
@@ -533,10 +573,36 @@ def _interactive_chat(agent, provider, quiet=False):
         if user == "/cost":
             console.print(agent.cost_line())
             continue
-        if user == "/memory":
+        if user == "/undo":
+            _undo_last_change(agent)
+            continue
+        if user == "/memory" or user.startswith("/memory "):
+            parts = user.split(maxsplit=2)
+            action = parts[1].lower() if len(parts) > 1 else "show"
             from .config import MEMORY_FILE
-            console.print(MEMORY_FILE.read_text(errors="replace")
-                          if MEMORY_FILE.exists() else "[dim]Memory is empty.[/]")
+            if action in ("show", "list"):
+                content = MEMORY_FILE.read_text(errors="replace") if MEMORY_FILE.exists() else "Memory is empty."
+                console.print(Panel(Text(content), title="Long-term memory · private local file", border_style="cyan"))
+            elif action == "add" and len(parts) == 3:
+                note = parts[2].strip()
+                if not note:
+                    console.print("Usage: /memory add <short preference or project fact>")
+                elif len(note) > 1000:
+                    console.print("[yellow]Keep each memory note under 1,000 characters.[/]")
+                else:
+                    from .tools.stateful import memory_write
+                    memory_write(note)
+                    console.print("[green]Saved memory locally. Avoid storing API keys or other secrets.[/]")
+            elif action == "clear":
+                if not MEMORY_FILE.exists():
+                    console.print("[dim]Memory is already empty.[/]")
+                elif Prompt.ask("Permanently clear Niji's saved memory?", choices=["y", "n"], default="n") == "y":
+                    MEMORY_FILE.unlink(missing_ok=True)
+                    console.print("[green]Saved memory cleared.[/]")
+                else:
+                    console.print("[dim]No changes made.[/]")
+            else:
+                console.print("Usage: /memory [show|add <note>|clear]")
             continue
         if user == "/compact":
             from .compaction import maybe_compact
@@ -553,8 +619,11 @@ def _interactive_chat(agent, provider, quiet=False):
         if user == "/doctor":
             _cmd_doctor()
             continue
-        if user == "/sessions":
-            _list_sessions()
+        if user == "/sessions" or user.startswith("/sessions "):
+            query = user[len("/sessions"):].strip()
+            if query.startswith("search "):
+                query = query[len("search "):].strip()
+            _list_sessions(query)
             continue
         if user == "/setup":
             try:
@@ -616,7 +685,10 @@ def main():
         run_setup()
         return
     if argv and argv[0] == "sessions":
-        _list_sessions()
+        query = " ".join(argv[1:]).strip()
+        if query.startswith("search "):
+            query = query[len("search "):].strip()
+        _list_sessions(query)
         return
     if argv and argv[0] == "config":
         if len(argv) >= 4 and argv[1] == "set-key":

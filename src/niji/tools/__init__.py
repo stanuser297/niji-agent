@@ -21,7 +21,7 @@ def dispatch(name: str, args: dict, ctx: dict = None):
     if fn:
         if name == "todo_read":
             return fn(ctx)
-        if name in ("todo_write", "task"):
+        if name in ("todo_write", "task", "write_file", "edit_file"):
             return fn(ctx=ctx, **args)
         return fn(**args)
     # MCP connector tools: "<server>__<tool>"
@@ -58,13 +58,13 @@ CORE_SCHEMAS = [
              "offset": _s("integer", "Start line (0-based)"),
              "limit": _s("integer", "Max lines (default 400)")},
             ["path"]),
-    _schema("write_file", "Create or overwrite a file with exact content.",
+    _schema("write_file", "Create or overwrite a file with exact content. Niji keeps a private, session-local undo checkpoint for files up to 1 MB; the user can restore it with /undo.",
             {"path": _s("string", "File path"),
              "content": _s("string", "Full file content")},
             ["path", "content"]),
     _schema("edit_file",
             "Replace exactly ONE unique occurrence of old_text with new_text. "
-            "Prefer over write_file for small changes.",
+            "Prefer over write_file for small changes. Niji keeps a private, session-local undo checkpoint for files up to 1 MB; the user can restore it with /undo.",
             {"path": _s("string", "File path"),
              "old_text": _s("string", "Exact unique text to replace"),
              "new_text": _s("string", "Replacement text")},
