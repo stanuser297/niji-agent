@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -32,7 +33,30 @@ def _build_agent(args, mcp_path=None):
                   max_turns=getattr(args, "max_turns", 60),
                   verbose=not getattr(args, "quiet", False),
                   mcp_clients=clients)
+    if not getattr(args, "quiet", False):
+        agent.activity_callback = _activity_notice
     return agent, provider
+
+
+def _activity_notice(event):
+    """Render concise execution phases, never private model reasoning."""
+    level = event.get("level")
+    message = event.get("message", "")
+    console = Console()
+    if level == "THINKING":
+        console.print(f"[dim bright_cyan]✧ {message}[/]")
+    elif level == "PLAN":
+        console.print(f"[bold cyan]⚙ {message}[/]")
+    elif level == "TOOL":
+        console.print(f"[bold cyan]⚒ {message}[/]")
+    elif level == "TOOL_DONE":
+        console.print(f"[green]✓ {message}[/]")
+    elif level == "DENIED":
+        console.print(f"[yellow]⊘ {message}[/]")
+    elif level == "ERROR":
+        console.print(f"[bold red]✗ {message}[/]")
+    elif level == "DONE":
+        console.print("[dim green]✓ Response complete[/]")
 
 
 # ---------------- provider management ----------------
@@ -115,11 +139,10 @@ def _cmd_models(argv):
             console.print(f"  [dim]Configured model: {active}[/]")
             continue
         table = Table(show_header=True, header_style="bold")
-        table.add_column("#", style="dim", justify="right")
         table.add_column("Model ID", style="white")
         table.add_column("State", style="green")
-        for idx, model_id in enumerate(models, 1):
-            table.add_row(str(idx), escape(model_id), "active" if model_id == active else "")
+        for model_id in models:
+            table.add_row(escape(model_id), "active" if model_id == active else "")
         console.print(table)
     if not requested:
         console.print("\n[dim]Catalogs require a connected provider key and a compatible `/models` endpoint. "
@@ -138,10 +161,20 @@ def _activate_model(agent, provider, name, model_id):
     from .setup_wizard import _connection_guidance, test_connection
     with Console().status(f"[cyan]Testing {name}/{model_id}...[/]"):
         ok, message = test_connection(provider_cfg)
+    verified = ok
     if not ok:
         Console().print(Panel(_connection_guidance(provider_cfg, message),
-                              title="Model switch not applied", border_style="yellow"))
-        return False
+                              title="Model chat check did not pass", border_style="yellow"))
+        match = re.search(r"\b(401|403|404)\b", message)
+        if match:
+            Console().print("[dim]This model/key was explicitly rejected; the current model stays active.[/]")
+            return False
+        apply_anyway = Prompt.ask(
+            "Switch to this model without a successful chat test?",
+            choices=["y", "n"], default="n")
+        if apply_anyway != "y":
+            Console().print("[dim]No changes made; current model remains active.[/]")
+            return False
 
     cfg = load_config()
     cfg["provider"] = name
@@ -161,9 +194,92 @@ def _activate_model(agent, provider, name, model_id):
     provider.update(provider_cfg)
     agent.messages.append({"role": "system", "content":
                            f"The active model was changed to {name}/{model_id}. Continue the same task and conversation."})
-    Console().print(f"[green]✓ Switched to {name}/{model_id}[/] — {message}")
+    if verified:
+        Console().print(f"[green]✓ Switched to {name}/{model_id}[/] — chat test passed")
+    else:
+        Console().print(f"[yellow]Switched to {name}/{model_id} (not verified).[/] Send a short test prompt; use `/model` to switch back if needed.")
     _render_home(agent, provider)
     return True
+
+
+def _arrow_select(title, choices, selected=0):
+    """Pick a (value, label) option with arrow keys; safe text fallback if non-TTY."""
+    if not choices:
+        return None
+    selected = max(0, min(selected, len(choices) - 1))
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        value = Prompt.ask(f"{title} (type an option)", default=choices[selected][0]).strip()
+        return next((item[0] for item in choices if value == item[0]), None)
+
+    try:
+        import os
+        import select
+        import shutil
+        import termios
+        import tty
+        if os.name != "posix":
+            raise OSError("Arrow selection is unavailable on this terminal")
+        fd = sys.stdin.fileno()
+        previous = termios.tcgetattr(fd)
+    except (ImportError, OSError, AttributeError):
+        value = Prompt.ask(f"{title} (type an option)", default=choices[selected][0]).strip()
+        return next((item[0] for item in choices if value == item[0]), None)
+
+    console = Console()
+    try:
+        tty.setcbreak(fd)
+        current_terminal = termios.tcgetattr(fd)
+        current_terminal[3] &= ~termios.ECHO
+        termios.tcsetattr(fd, termios.TCSADRAIN, current_terminal)
+        while True:
+            height = shutil.get_terminal_size((80, 24)).lines
+            page_size = max(4, height - 8)
+            start = min(max(0, selected - page_size + 1), max(0, len(choices) - page_size))
+            end = min(len(choices), start + page_size)
+            console.clear()
+            console.print(Panel(title, border_style="bright_cyan"))
+            for index in range(start, end):
+                label = choices[index][1]
+                row = Text()
+                if index == selected:
+                    row.append(" ❯ ", style="bold black on bright_cyan")
+                    row.append(label, style="bold bright_white on blue")
+                else:
+                    row.append("   ")
+                    row.append(label)
+                console.print(row)
+            console.print(f"[dim]↑/↓ or j/k move · Enter select · q/Esc cancel · {selected + 1}/{len(choices)}[/]")
+            key = sys.stdin.read(1)
+            if key in ("\r", "\n"):
+                return choices[selected][0]
+            if key in ("q", "Q", "\x03", "\x04"):
+                return None
+            if key in ("j", "J"):
+                selected = min(len(choices) - 1, selected + 1)
+            elif key in ("k", "K"):
+                selected = max(0, selected - 1)
+            elif key == "\x1b":
+                if select.select([sys.stdin], [], [], 0.15)[0]:
+                    sequence = sys.stdin.read(2)
+                    if sequence == "[A":
+                        selected = max(0, selected - 1)
+                    elif sequence == "[B":
+                        selected = min(len(choices) - 1, selected + 1)
+                    elif sequence == "[5":
+                        if select.select([sys.stdin], [], [], 0.05)[0]:
+                            sys.stdin.read(1)
+                        selected = max(0, selected - page_size)
+                    elif sequence == "[6":
+                        if select.select([sys.stdin], [], [], 0.05)[0]:
+                            sys.stdin.read(1)
+                        selected = min(len(choices) - 1, selected + page_size)
+                else:
+                    return None
+    except KeyboardInterrupt:
+        return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+        console.print()
 
 
 def _interactive_model_picker(agent, provider, provider_name=None, requested_model=None):
@@ -173,27 +289,19 @@ def _interactive_model_picker(agent, provider, provider_name=None, requested_mod
     console = Console()
     name = provider_name
     if name is None:
-        table = Table(title="Providers", show_header=True, header_style="bold cyan")
-        table.add_column("#", style="dim", justify="right")
-        table.add_column("Provider")
-        table.add_column("Status")
-        for idx, candidate in enumerate(names, 1):
+        choices = []
+        for candidate in names:
             preset = PRESETS.get(candidate, {})
             custom = cfg.get("custom_providers", {}).get(candidate, {})
             status = "connected" if provider_is_configured(candidate, cfg) else "setup needed"
             default_model = cfg.get("models", {}).get(candidate) or custom.get("model") or preset.get("model", "")
-            table.add_row(str(idx), candidate + (" ★" if candidate == provider.get("provider") else ""),
-                          f"{status} · {default_model}")
-        console.print(table)
+            marker = " · current" if candidate == provider.get("provider") else ""
+            choices.append((candidate, f"{candidate} · {status} · {default_model}{marker}"))
         current = provider.get("provider")
-        default_idx = str(names.index(current) + 1) if current in names else "1"
-        choice = Prompt.ask("Choose provider number or name", default=default_idx).strip()
-        if choice.isdigit() and 1 <= int(choice) <= len(names):
-            name = names[int(choice) - 1]
-        elif choice in names:
-            name = choice
-        else:
-            console.print("[yellow]Unknown provider choice.[/]")
+        selected = names.index(current) if current in names else 0
+        name = _arrow_select("Choose a provider", choices, selected)
+        if name is None:
+            console.print("[dim]Provider selection cancelled.[/]")
             return
     elif name not in names:
         console.print(f"[yellow]Unknown provider '{name}'. Use `/providers` to see options.[/]")
@@ -206,25 +314,19 @@ def _interactive_model_picker(agent, provider, provider_name=None, requested_mod
 
     model_ids, catalog_message = fetch_provider_models(provider_cfg)
     if requested_model is None and model_ids:
-        table = Table(title=f"{name} models ({len(model_ids)} available)",
-                      show_header=True, header_style="bold cyan")
-        table.add_column("#", style="dim", justify="right")
-        table.add_column("Model ID")
-        table.add_column("State", style="green")
-        for idx, model_id in enumerate(model_ids, 1):
-            table.add_row(str(idx), escape(model_id),
-                          "current" if model_id == provider_cfg.get("model") else "")
-        console.print(table)
-        choice = Prompt.ask("Choose number, or `m` to enter a model ID manually").strip()
-        if choice.lower() == "m":
-            requested_model = Prompt.ask("Model ID").strip()
-        elif choice.isdigit() and 1 <= int(choice) <= len(model_ids):
-            requested_model = model_ids[int(choice) - 1]
-        elif choice in model_ids:
-            requested_model = choice
-        else:
-            console.print("[yellow]Invalid model choice; no changes made.[/]")
+        choices = [(model_id, model_id + (" · current" if model_id == provider_cfg.get("model") else ""))
+                   for model_id in model_ids]
+        choices.append(("__manual__", "Enter a model ID manually…"))
+        selected = next((i for i, model_id in enumerate(model_ids)
+                         if model_id == provider_cfg.get("model")), 0)
+        selected = _arrow_select(f"{name}: choose a model", choices, selected)
+        if selected is None:
+            console.print("[dim]Model selection cancelled.[/]")
             return
+        if selected == "__manual__":
+            requested_model = Prompt.ask("Model ID").strip()
+        else:
+            requested_model = selected
     elif requested_model is None:
         console.print(f"[yellow]{catalog_message}[/]")
         requested_model = Prompt.ask("Enter model ID manually", default=provider_cfg["model"]).strip()
@@ -235,7 +337,7 @@ def _interactive_model_picker(agent, provider, provider_name=None, requested_mod
     _activate_model(agent, provider, name, requested_model)
 
 
-def _provider_add(): 
+def _provider_add():
     from .setup_wizard import _wizard_custom_provider
     cfg = load_config()
     custom = cfg.setdefault("custom_providers", {})
@@ -320,6 +422,20 @@ def _render_home(agent, provider, quiet=False):
     render_home(agent, provider, quiet=quiet)
 
 
+def _show_activity(agent):
+    table = Table(title="Niji activity feed", show_header=True, header_style="bold cyan")
+    table.add_column("Time", style="dim", no_wrap=True)
+    table.add_column("Phase", style="bold", no_wrap=True)
+    table.add_column("Event", overflow="fold")
+    events = list(getattr(agent, "activity", []))[-20:]
+    if not events:
+        table.add_row("—", "INFO", "No activity yet")
+    for event in events:
+        table.add_row(str(event.get("time", "—")), str(event.get("level", "INFO")),
+                      str(event.get("message", "")))
+    Console().print(table)
+
+
 def _show_help():
     console = Console()
     table = Table(title="Niji commands", show_header=True, header_style="bold cyan")
@@ -329,6 +445,7 @@ def _show_help():
         ("/help", "Show this command list"),
         ("/status", "Show provider, model, workspace and usage"),
         ("/tools", "List built-in and connected MCP tools"),
+        ("/activity", "Show recent thinking/execution phases and tool outcomes"),
         ("/model", "Browse providers and their available models; switch for this session"),
         ("/models", "List model catalogs for configured providers"),
         ("/approval", "Toggle auto/ask confirmation mode for tool execution"),
@@ -378,6 +495,10 @@ def _show_provider_error(provider, exc):
                   "The saved key is never shown here." % status)
     elif status in (401, 403):
         detail = "The provider rejected the API key or account permissions. Run `/setup` to replace the key."
+    elif status == 400:
+        detail = ("The provider rejected this chat request (HTTP 400). The selected model may not "
+                  "support chat completions or the request options. Run `/model` and choose a "
+                  "chat/text model.")
     elif status == 429:
         detail = "The provider rate limit or quota was reached. Check the account quota and try again."
     else:
@@ -439,6 +560,9 @@ def _interactive_chat(agent, provider, quiet=False):
                      for schema in agent.tool_schemas]
             console.print(Panel(Text("\n".join(names) or "No tools available"),
                                 title=f"Available tools ({len(names)})", border_style="blue"))
+            continue
+        if user == "/activity":
+            _show_activity(agent)
             continue
         if user == "/cost":
             console.print(agent.cost_line())

@@ -59,22 +59,33 @@ def needs_setup(provider_name: str | None = None, api_key: str | None = None) ->
 
 
 def test_connection(provider_cfg: dict):
-    """Returns (ok, message) after a small authenticated request; never raises."""
+    """Returns (ok, message) after a minimal authenticated chat request; never raises."""
     try:
         from openai import OpenAI
         client = OpenAI(api_key=provider_cfg["api_key"],
                         base_url=provider_cfg["base_url"], timeout=25)
     except Exception as e:
         return False, str(e)[:300]
-    try:
-        client.chat.completions.create(
-            model=provider_cfg["model"],
-            messages=[{"role": "user", "content": "ping"}],
-            max_tokens=1)
-        return True, "chat endpoint OK"
-    except Exception as e:
-        # Listing models is not enough: validate the exact chat route and model.
-        return False, str(e)[:300]
+
+    # OpenAI-compatible providers disagree on the completion-limit parameter.
+    # Newer reasoning models may reject max_tokens, while older providers may
+    # not accept max_completion_tokens; retry only that known compatibility case.
+    for limit_name in ("max_tokens", "max_completion_tokens"):
+        try:
+            client.chat.completions.create(
+                model=provider_cfg["model"],
+                messages=[{"role": "user", "content": "ping"}],
+                **{limit_name: 1})
+            return True, "chat endpoint OK"
+        except Exception as exc:
+            message = str(exc)
+            status = getattr(exc, "status_code", None)
+            if (limit_name == "max_tokens" and status == 400
+                    and "max_tokens" in message.lower()):
+                continue
+            # Listing models is not enough: validate the exact chat route/model.
+            return False, message[:300]
+    return False, "Provider rejected both supported completion-limit parameters."
 
 
 def _read_secret(label: str, allow_blank: bool = False):
@@ -150,7 +161,7 @@ def _wizard_custom_provider():
 def _connection_guidance(provider_cfg: dict, message: str) -> str:
     """Turn common provider failures into actionable, provider-aware guidance."""
     text = message.lower()
-    status = next((code for code in (401, 403, 404, 429) if str(code) in text), None)
+    status = next((code for code in (400, 401, 403, 404, 429) if str(code) in text), None)
     nvidia = "nvidia.com" in provider_cfg.get("base_url", "")
     groq = (provider_cfg.get("provider") == "groq"
             or "api.groq.com" in provider_cfg.get("base_url", ""))
@@ -183,6 +194,10 @@ def _connection_guidance(provider_cfg: dict, message: str) -> str:
                 "`openai/gpt-oss-120b`.")
     if status == 404:
         return "The provider could not find this model or API route (HTTP 404). Check the base URL and exact model ID."
+    if status == 400:
+        return ("The provider rejected this chat request (HTTP 400). The catalog can include models "
+                "that are not chat-capable or require different request options. Choose a text/chat "
+                "model; if you knowingly want to try this model, the picker can apply it unverified.")
     if status == 429:
         return "The provider quota or rate limit was reached (HTTP 429). Check billing/quota and retry later."
     return "The connection test failed. Check network/DNS, API base URL, and model name."

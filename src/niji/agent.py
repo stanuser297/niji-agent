@@ -58,6 +58,7 @@ class Agent:
         self.tool_usage = {}
         self.activity = [{"time": datetime.now().strftime("%H:%M:%S"),
                           "level": "INFO", "message": "Provider configuration loaded"}]
+        self.activity_callback = None
         self._activity_lock = threading.Lock()
         self._usage_supported = True
 
@@ -102,15 +103,25 @@ class Agent:
         return base
 
     def _record_activity(self, level: str, message: str):
+        event = {"time": datetime.now().strftime("%H:%M:%S"),
+                 "level": level, "message": message}
         with self._activity_lock:
-            self.activity.append({"time": datetime.now().strftime("%H:%M:%S"),
-                                  "level": level, "message": message})
+            self.activity.append(event)
             self.activity = self.activity[-24:]
+        callback = self.activity_callback
+        if callback:
+            try:
+                callback(event)
+            except Exception:
+                pass
 
     def chat(self, user_text: str) -> str:
         self.messages.append({"role": "user", "content": user_text})
         try:
             return self._loop()
+        except Exception as exc:
+            self._record_activity("ERROR", f"Request failed ({exc.__class__.__name__})")
+            raise
         finally:
             self._save_session()
 
@@ -138,12 +149,15 @@ class Agent:
     def _loop(self) -> str:
         for turn in range(1, self.max_turns + 1):
             self.usage["turns"] += 1
+            self._record_activity("THINKING", f"Thinking · {self.provider_name}/{self.model} · turn {turn}")
             msg, text, tool_calls = self._chat()
             self.messages.append(msg)
 
             if not tool_calls:
+                self._record_activity("DONE", "Response complete")
                 return text or "[done]"
 
+            self._record_activity("PLAN", f"Executing {len(tool_calls)} tool call(s)")
             if (len(tool_calls) > 1 and self.approval != "ask"
                     and all(tc["name"] in PARALLEL_SAFE_TOOLS for tc in tool_calls)):
                 # Parallelize only read-only operations; mutations may depend on one another.
@@ -246,9 +260,7 @@ class Agent:
         name, args = tc["name"], tc["args"]
         with self._activity_lock:
             self.tool_usage[name] = self.tool_usage.get(name, 0) + 1
-            self.activity.append({"time": datetime.now().strftime("%H:%M:%S"),
-                                  "level": "TOOL", "message": f"Tool call: {name}"})
-            self.activity = self.activity[-24:]
+        self._record_activity("TOOL", f"Tool call: {name}")
         if self.verbose:
             self._print(f"\n[tool] {name} {json.dumps(args, default=str)[:250]}")
 
@@ -259,6 +271,7 @@ class Agent:
                        else json.dumps(args, default=str)[:300])
             print(f"\nApprove {name}: {preview}")
             if input("Approve? [y/N] ").strip().lower() != "y":
+                self._record_activity("DENIED", f"User declined {name}")
                 return "[denied by user]"
 
         ctx = {"agent": self, "depth": self.depth, "todos": self.todos,
@@ -269,6 +282,14 @@ class Agent:
             result = f"[blocked by safety] {e}"
         except Exception as e:
             result = f"[error] {e}"
+
+        if result == "[denied by user]":
+            self._record_activity("DENIED", f"User declined {name}")
+        elif isinstance(result, str) and (result.startswith("[error]")
+                                           or result.startswith("[blocked by safety]")):
+            self._record_activity("ERROR", f"{name} did not complete")
+        else:
+            self._record_activity("TOOL_DONE", f"{name} completed")
 
         if self.verbose and result:
             preview = result if isinstance(result, str) else str(result)[:300]

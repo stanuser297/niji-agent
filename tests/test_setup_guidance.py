@@ -5,7 +5,8 @@ from unittest.mock import patch
 
 from rich.console import Console
 
-from niji.setup_wizard import _connection_guidance, _read_secret, run_setup
+from niji.setup_wizard import (_connection_guidance, _read_secret,
+                               run_setup, test_connection)
 
 
 class ConnectionGuidanceTests(unittest.TestCase):
@@ -78,7 +79,7 @@ class ConnectionGuidanceTests(unittest.TestCase):
         self.assertEqual(result["api_key"], "accepted-key")
         self.assertEqual(cfg["api_keys"]["nvidia"], "accepted-key")
         save.assert_called_once_with(cfg)
-        self.assertIn("N I J I", output.getvalue())
+        self.assertIn("Niji-Agent", output.getvalue())
         self.assertIn("Connected", output.getvalue())
 
     def test_failed_authorization_keeps_saved_key_unchanged(self):
@@ -101,6 +102,30 @@ class ConnectionGuidanceTests(unittest.TestCase):
                 run_setup()
         save.assert_not_called()
         self.assertEqual(cfg["api_keys"]["nvidia"], "rejected-key")
+
+    def test_connection_probe_retries_newer_completion_limit_parameter(self):
+        import sys
+        import types
+        calls = []
+        class BadParameter(Exception):
+            status_code = 400
+        class Completions:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                if "max_tokens" in kwargs:
+                    raise BadParameter("Unsupported parameter max_tokens")
+                return object()
+        fake_openai = types.ModuleType("openai")
+        fake_openai.OpenAI = lambda **kwargs: types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=Completions()))
+        with patch.dict(sys.modules, {"openai": fake_openai}):
+            ok, message = test_connection({"provider": "openai", "model": "gpt-5-mini",
+                                          "api_key": "not-printed",
+                                          "base_url": "https://api.openai.com/v1"})
+        self.assertTrue(ok)
+        self.assertEqual(message, "chat endpoint OK")
+        self.assertEqual(calls[0]["max_tokens"], 1)
+        self.assertEqual(calls[1]["max_completion_tokens"], 1)
 
 
 if __name__ == "__main__":

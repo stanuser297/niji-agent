@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.5.0
+# Niji Agent 🌈 — v2.5.1
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -15,6 +15,12 @@ niji
 Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, enter its API key (visible input is the Termux-friendly default; hidden entry is optional), and choose a model. The key is saved locally in `~/.niji/config.json` with private file permissions—no `export` command is needed. Ollama can be used without an API key.
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
+
+## What's new in 2.5.1
+
+- Provider/model menus are arrow-key navigable (↑/↓, Enter, q/Esc); no numeric choice entry is required
+- Model activation retries newer/older completion-limit parameters, gives a clear chat-test result, and permits an explicit unverified switch only for non-auth/non-404 probe failures
+- Live phase feed reports thinking, tool start/completion, errors and response completion; `/activity` shows the recent event history
 
 ## What's new in 2.5.0
 
@@ -64,7 +70,7 @@ niji providers add                        # add a custom provider
 niji providers use openrouter             # switch default provider
 ```
 
-Interactive slash commands: `/help`, `/model` (browse/switch provider and model), `/models`, `/approval [ask|auto]`, `/status`, `/tools`, `/setup`, `/doctor`, `/cost`, `/compact`, `/memory`, `/sessions`, `/clear`, `/exit`.
+Interactive slash commands: `/help`, `/model` (browse/switch provider and model with arrows), `/models`, `/approval [ask|auto]`, `/activity`, `/status`, `/tools`, `/setup`, `/doctor`, `/cost`, `/compact`, `/memory`, `/sessions`, `/clear`, `/exit`.
 
 Model discovery uses each connected provider's compatible models endpoint when available. Some providers hide catalogs or require manual model IDs; the picker explains that and keeps manual entry available. No API keys are shown in catalog output.
 

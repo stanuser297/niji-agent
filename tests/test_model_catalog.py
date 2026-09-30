@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from rich.console import Console
 
-from niji.cli import _activate_model, _cmd_models
+from niji.cli import _activate_model, _arrow_select, _cmd_models
 from niji.model_catalog import fetch_provider_models, provider_is_configured, provider_names
 
 
@@ -113,6 +113,47 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual(cfg["models"]["openai"], "gpt-5-mini")
         self.assertEqual(cfg["provider"], "openai")
         save.assert_called_once_with(cfg)
+
+    def test_arrow_menu_fallback_uses_provider_name_not_an_index(self):
+        fake_stdin = types.SimpleNamespace(isatty=lambda: False)
+        fake_stdout = types.SimpleNamespace(isatty=lambda: False)
+        with (
+            patch("niji.cli.sys.stdin", fake_stdin),
+            patch("niji.cli.sys.stdout", fake_stdout),
+            patch("niji.cli.Prompt.ask", return_value="groq") as prompt,
+        ):
+            selected = _arrow_select("Choose provider", [("openai", "OpenAI"), ("groq", "Groq")])
+        self.assertEqual(selected, "groq")
+        self.assertIn("type an option", prompt.call_args.args[0])
+
+    def test_selected_model_can_be_applied_if_non_auth_probe_is_unavailable(self):
+        cfg = {"api_keys": {"openai": "key"}, "models": {},
+               "custom_providers": {}}
+        provider_cfg = {"provider": "openai", "base_url": "https://api.openai.com/v1",
+                        "api_key": "key", "model": "gpt-5-mini"}
+        fake_openai = types.ModuleType("openai")
+        fake_openai.OpenAI = lambda **kwargs: object()
+
+        class Agent:
+            messages = []
+        agent = Agent()
+        provider = {"provider": "groq", "model": "old-model"}
+        output = io.StringIO()
+        with ExitStack() as stack:
+            stack.enter_context(patch("niji.cli.resolve_provider", return_value=provider_cfg))
+            stack.enter_context(patch("niji.cli.load_config", return_value=cfg))
+            stack.enter_context(patch("niji.cli.save_config"))
+            stack.enter_context(patch("niji.setup_wizard.test_connection",
+                                      return_value=(False, "HTTP 400 unsupported test parameter")))
+            stack.enter_context(patch("niji.cli._render_home"))
+            stack.enter_context(patch("niji.cli.Console",
+                                      return_value=Console(file=output, color_system=None)))
+            stack.enter_context(patch("niji.cli.Prompt.ask", return_value="y"))
+            stack.enter_context(patch.dict(sys.modules, {"openai": fake_openai}))
+            applied = _activate_model(agent, provider, "openai", "gpt-5-mini")
+        self.assertTrue(applied)
+        self.assertEqual(agent.model, "gpt-5-mini")
+        self.assertIn("not verified", output.getvalue())
 
 
 if __name__ == "__main__":
