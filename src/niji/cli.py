@@ -1,6 +1,13 @@
 import argparse
 import json
 import sys
+from pathlib import Path
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Prompt
+from rich.table import Table
+from rich.text import Text
 
 from . import __version__
 from .config import (CONFIG_DIR, CONFIG_FILE, MCP_FILE, PRESETS, SESSION_DIR,
@@ -151,52 +158,164 @@ def _list_sessions():
         print(f"  {f.stem}  ({f.stat().st_size // 1024} KB)  {first_user}")
 
 
-# ---------------- chat ----------------
+# ---------------- interactive terminal UI ----------------
+
+
+def _render_home(agent, provider, quiet=False):
+    if quiet:
+        return
+    console = Console()
+    title = Text.assemble(("🌙  NIJI AGENT", "bold cyan"),
+                          (f"   v{__version__}", "dim"))
+    details = Table.grid(padding=(0, 1))
+    details.add_column(style="bold cyan", no_wrap=True)
+    details.add_column()
+    details.add_row("Provider", Text(str(provider.get("provider", "unknown"))))
+    details.add_row("Model", Text(str(provider.get("model", "default"))))
+    details.add_row("Workspace", Text(str(Path.cwd())))
+    details.add_row("Session", Text(str(agent.session_id)))
+    details.add_row("Mode", Text("Confirm side effects" if agent.approval == "ask" else "Auto"))
+    details.add_row("MCP", Text(f"{len(agent.mcp_clients)} connector(s)"))
+    console.print(Panel.fit(details, title=title, border_style="cyan", padding=(1, 2)))
+
+    names = [schema.get("function", {}).get("name", "tool")
+             for schema in agent.tool_schemas]
+    visible = names[:10]
+    tool_text = Text(", ".join(visible))
+    if len(names) > len(visible):
+        tool_text.append(f"  +{len(names) - len(visible)} more", style="dim")
+    console.print(Panel(tool_text, title=f"Ready • {len(names)} tools", border_style="blue"))
+    console.print("[dim]Type a task in plain language, or use /help for commands.[/]")
+
+
+def _show_help():
+    console = Console()
+    table = Table(title="Niji commands", show_header=True, header_style="bold cyan")
+    table.add_column("Command", style="green", no_wrap=True)
+    table.add_column("What it does")
+    rows = [
+        ("/help", "Show this command list"),
+        ("/status", "Show provider, model, workspace and usage"),
+        ("/tools", "List built-in and connected MCP tools"),
+        ("/model", "Show the active provider/model"),
+        ("/cost", "Show token usage so far"),
+        ("/compact", "Summarize older context to free space"),
+        ("/memory", "View saved long-term memory"),
+        ("/setup", "Reconnect/switch provider and model"),
+        ("/providers", "List provider choices"),
+        ("/doctor", "Test the saved provider and setup"),
+        ("/sessions", "List saved sessions"),
+        ("/clear", "Clear the screen and redraw the home panel"),
+        ("/exit", "Save and leave Niji"),
+    ]
+    for command, description in rows:
+        table.add_row(command, description)
+    console.print(table)
+    console.print("[dim]Or just type what you want Niji to do.[/]")
+
+
+def _show_provider_error(provider, exc):
+    console = Console(stderr=True)
+    status = getattr(exc, "status_code", None)
+    provider_name = str(provider.get("provider", ""))
+    if status == 404 and (provider_name == "nvidia" or "nvidia.com" in str(provider.get("base_url", ""))):
+        detail = ("NVIDIA returned 404. Verify the model ID and base URL. "
+                  "For GLM 5.3 Flash use `z-ai/glm-5.3-flash` (with dots), "
+                  "then run `/setup` to save it.")
+    elif status == 404:
+        detail = ("The provider returned 404. Check the OpenAI-compatible base URL "
+                  "and exact model ID, then run `/setup`.")
+    elif status in (401, 403):
+        detail = "The provider rejected the API key or account permissions. Run `/setup` to replace the key."
+    elif status == 429:
+        detail = "The provider rate limit or quota was reached. Check the account quota and try again."
+    else:
+        detail = str(exc)
+    console.print(Panel(Text(detail), title="Request failed — chat is still open",
+                        border_style="red"))
+
 
 def _interactive_chat(agent, provider, quiet=False):
-    print(f"[niji] {provider['provider']}/{provider['model']} — chat mode")
-    print("commands: /help /model /cost /compact /memory /exit (or 'exit')")
+    console = Console()
+    _render_home(agent, provider, quiet)
     while True:
         try:
-            user = input("\nniji> ").strip()
+            user = Prompt.ask("\n[bold cyan]you ❯[/]").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nbye")
+            console.print("\n[dim]Niji saved. See you next time.[/]")
             break
         if not user:
             continue
-        if user in ("/exit", "exit", "quit"):
+        if user.lower() in ("/exit", "exit", "quit", "/quit"):
             break
         if user == "/help":
-            print("Just type a task in plain language. Slash commands:")
-            print("  /model    show current model")
-            print("  /cost     token usage so far")
-            print("  /compact  force-summarize old context")
-            print("  /memory   show long-term memory")
-            print("  /exit     quit")
+            _show_help()
             continue
-        if user == "/model":
-            print(f"{provider['provider']} / {agent.model}")
+        if user in ("/model", "/provider"):
+            console.print(f"[bold cyan]{provider['provider']}[/] / {agent.model}")
+            continue
+        if user == "/status":
+            _render_home(agent, provider, quiet=False)
+            console.print(agent.cost_line())
+            continue
+        if user == "/tools":
+            names = [schema.get("function", {}).get("name", "tool")
+                     for schema in agent.tool_schemas]
+            console.print(Panel(Text("\n".join(names) or "No tools available"),
+                                title=f"Available tools ({len(names)})", border_style="blue"))
             continue
         if user == "/cost":
-            print(agent.cost_line())
+            console.print(agent.cost_line())
             continue
         if user == "/memory":
             from .config import MEMORY_FILE
-            print(MEMORY_FILE.read_text(errors="replace")
-                  if MEMORY_FILE.exists() else "[memory empty]")
+            console.print(MEMORY_FILE.read_text(errors="replace")
+                          if MEMORY_FILE.exists() else "[dim]Memory is empty.[/]")
             continue
         if user == "/compact":
             from .compaction import maybe_compact
             agent.messages, done = maybe_compact(
                 agent.messages, agent.client, agent.model, force=True)
-            print("[compacted]" if done else "[nothing to compact]")
+            console.print("[green]Context compacted.[/]" if done else "[dim]Nothing to compact.[/]")
+            continue
+        if user == "/clear":
+            console.clear()
+            _render_home(agent, provider, quiet)
+            continue
+        if user == "/providers":
+            _cmd_providers(["niji", "providers"])
+            continue
+        if user == "/doctor":
+            _cmd_doctor()
+            continue
+        if user == "/sessions":
+            _list_sessions()
+            continue
+        if user == "/setup":
+            try:
+                from .setup_wizard import run_setup
+                from openai import OpenAI
+                new_provider = run_setup()
+                agent.provider_cfg = new_provider
+                agent.client = OpenAI(api_key=new_provider["api_key"],
+                                      base_url=new_provider["base_url"])
+                agent.model = new_provider["model"]
+                agent.provider_name = new_provider["provider"]
+                provider.update(new_provider)
+                console.print("[green]Provider switched. Continue chatting.[/]")
+                _render_home(agent, provider, quiet)
+            except SystemExit as exc:
+                console.print(f"[yellow]{exc}[/]")
             continue
         try:
+            console.print("\n[bold green]niji ❯[/]")
             agent.chat(user)
             if not quiet:
-                print(agent.cost_line())
+                console.print(f"[dim]{agent.cost_line()}[/]")
         except KeyboardInterrupt:
-            print("\n[interrupted]")
+            console.print("\n[yellow]Request interrupted.[/]")
+        except Exception as exc:
+            _show_provider_error(provider, exc)
 
 
 # ---------------- main ----------------
@@ -281,19 +400,26 @@ def main():
         agent, provider = _build_agent(args, mcp_path)
         agent.resume(json.loads(f.read_text()))
         agent.session_id = sid
-        print(f"[niji] resumed session {sid} ({len(agent.messages)} messages)")
-        _interactive_chat(agent, provider, args.quiet)
+        Console().print(f"[green]Resumed session[/] {sid} ({len(agent.messages)} messages)")
+        try:
+            _interactive_chat(agent, provider, args.quiet)
+        finally:
+            for client in agent.mcp_clients:
+                client.stop()
         return
 
     task = " ".join(args.task).strip()
     agent, provider = _build_agent(args, mcp_path)
 
     if task:
-        print(f"[niji] {provider['provider']}/{provider['model']}")
+        Console().print(f"[bold green]niji[/] • {provider['provider']}/{provider['model']}")
         try:
             agent.chat(task)
+        except Exception as exc:
+            _show_provider_error(provider, exc)
+            sys.exit(1)
         finally:
-            print(agent.cost_line())
+            Console().print(f"[dim]{agent.cost_line()}[/]")
             for c in agent.mcp_clients:
                 c.stop()
         return

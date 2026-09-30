@@ -14,6 +14,8 @@ PRESETS = {
                    "env_key": "OPENAI_API_KEY", "model": "gpt-5"},
     "openrouter": {"base_url": "https://api.openrouter.ai/api/v1",
                    "env_key": "OPENROUTER_API_KEY", "model": "openai/gpt-4o-mini"},
+    "nvidia":     {"base_url": "https://integrate.api.nvidia.com/v1",
+                   "env_key": "NVIDIA_API_KEY", "model": "z-ai/glm-5.3-flash"},
     "anthropic":  {"base_url": "https://api.anthropic.com/v1/",
                    "env_key": "ANTHROPIC_API_KEY", "model": "claude-sonnet-4-5"},
     "gemini":     {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",

@@ -21,6 +21,7 @@ WIZARD_PROVIDERS = [
     ("deepseek", "DeepSeek"),
     ("together", "Together AI"),
     ("ollama", "Ollama (local, free, no API key)"),
+    ("nvidia", "NVIDIA NIM (GLM 5.3 Flash and more)"),
 ]
 
 BANNER = (
@@ -40,6 +41,9 @@ def needs_setup(provider_name: str | None = None, api_key: str | None = None) ->
     if name:
         preset = PRESETS.get(name)
         if preset:
+            # Migrate a same-name custom provider through the preset wizard (e.g. NVIDIA).
+            if cfg.get("custom_providers", {}).get(name):
+                return True
             env_key = preset.get("env_key")
             if not env_key:
                 return False
@@ -73,12 +77,9 @@ def test_connection(provider_cfg: dict):
             messages=[{"role": "user", "content": "ping"}],
             max_tokens=1)
         return True, "chat endpoint OK"
-    except Exception as e1:
-        try:
-            client.models.list()
-            return True, "models endpoint OK"
-        except Exception:
-            return False, str(e1)[:300]
+    except Exception as e:
+        # Listing models is not enough: validate the exact chat route and model.
+        return False, str(e)[:300]
 
 
 def _ask_key(provider_name: str, env_key: str | None, stored_key: str | None = None):
@@ -135,11 +136,11 @@ def run_setup(default_model: str | None = None,
     console.print("[bold]Choose a provider:[/]")
     for i, (_, label) in enumerate(WIZARD_PROVIDERS, 1):
         console.print(f"  {i}) {label}")
-    console.print("  9) Custom (any OpenAI-compatible endpoint)")
-    choice = Prompt.ask("> ", choices=[str(i) for i in range(1, 10)],
+    console.print("  10) Custom (any OpenAI-compatible endpoint)")
+    choice = Prompt.ask("> ", choices=[str(i) for i in range(1, 11)],
                         default=default_choice)
 
-    if choice == "9":
+    if choice == "10":
         name, custom = _wizard_custom_provider()
         cfg.setdefault("custom_providers", {})[name] = custom
         cfg["provider"] = name
@@ -148,7 +149,8 @@ def run_setup(default_model: str | None = None,
     else:
         name = provider_names[int(choice) - 1]
         preset = PRESETS[name]
-        stored_key = cfg.get("api_keys", {}).get(name)
+        stored_key = (cfg.get("api_keys", {}).get(name)
+                      or cfg.get("custom_providers", {}).get(name, {}).get("api_key"))
         key = _ask_key(name, preset.get("env_key"), stored_key)
         has_env_key = bool((preset.get("env_key") and os.environ.get(preset["env_key"]))
                            or os.environ.get("NIJI_API_KEY"))
@@ -158,6 +160,8 @@ def run_setup(default_model: str | None = None,
         model = Prompt.ask("Default model", default=default_m).strip()
         if key:
             cfg.setdefault("api_keys", {})[name] = key
+        # A named preset supersedes an older custom-provider entry of the same name.
+        cfg.setdefault("custom_providers", {}).pop(name, None)
         cfg["provider"] = name
         cfg.setdefault("models", {})[name] = model
         save_config(cfg)
@@ -169,6 +173,9 @@ def run_setup(default_model: str | None = None,
         console.print(f"[green]✓ Connected[/] — {provider_cfg['provider']}/"
                       f"{provider_cfg['model']} ({msg})")
     else:
-        console.print(f"[yellow]Provider saved; connection test failed:[/] {msg}")
+        console.print(f"[red]Connection test failed:[/] {msg}")
+        if "nvidia.com" in provider_cfg.get("base_url", "") and "404" in msg:
+            console.print("[yellow]NVIDIA GLM 5.3 Flash model ID: z-ai/glm-5.3-flash (dots, not hyphens).[/]")
         console.print("Check the key/model/network, then run: niji setup")
+        raise SystemExit("Provider is not ready; chat was not started.")
     return provider_cfg

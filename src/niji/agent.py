@@ -204,7 +204,11 @@ class Agent:
                 return self.client.chat.completions.create(**kwargs)
             except KeyboardInterrupt:
                 raise
-            except Exception:
+            except Exception as exc:
+                status = getattr(exc, "status_code", None)
+                # Do not waste retries on deterministic client errors (e.g. wrong model/404).
+                if status and 400 <= status < 500 and status not in (408, 409, 429):
+                    raise
                 if attempt == 3:
                     raise
                 time.sleep(delay)
