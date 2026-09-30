@@ -222,6 +222,8 @@ def _activity_panel(agent):
 
 def _quick_commands():
     commands = [("/help", "Show help"), ("/tools", "List tools"), ("/status", "Agent status"),
+                ("/model", "Browse/switch models"), ("/models", "List model catalogs"),
+                ("/approval", "Toggle tool confirmations"),
                 ("/setup", "Provider setup"), ("/providers", "Providers"),
                 ("/doctor", "Diagnostics"), ("/sessions", "Sessions"),
                 ("/clear", "Redraw"), ("/exit", "Quit Niji")]

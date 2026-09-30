@@ -5,6 +5,7 @@ from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.markup import escape
 from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
@@ -14,6 +15,8 @@ from .ui import render_home
 from .config import (CONFIG_DIR, CONFIG_FILE, MCP_FILE, PRESETS, SESSION_DIR,
                      load_config, load_mcp_servers, resolve_provider,
                      save_config)
+from .model_catalog import (fetch_provider_models, provider_is_configured,
+                            provider_names, resolve_catalog_provider)
 
 
 def _build_agent(args, mcp_path=None):
@@ -81,7 +84,158 @@ def _cmd_providers(argv):
     return True
 
 
-def _provider_add():
+def _cmd_models(argv):
+    """List provider model catalogs; unconfigured providers are clearly marked."""
+    cfg = load_config()
+    requested = argv[2] if len(argv) >= 3 else None
+    names = provider_names(cfg)
+    if requested:
+        if requested not in names:
+            print(f"Unknown provider '{requested}'. See: niji providers")
+            return True
+        names = [requested]
+
+    console = Console()
+    for name in names:
+        preset = PRESETS.get(name, {})
+        custom = cfg.get("custom_providers", {}).get(name, {})
+        active = cfg.get("models", {}).get(name) or custom.get("model") or preset.get("model", "(manual)")
+        console.print(f"\n[bold cyan]{name}[/]" + (" [green](default)[/]" if cfg.get("provider") == name else ""))
+        if not provider_is_configured(name, cfg):
+            console.print(f"  [dim]Not connected. Preset model: {active}. Run `niji setup` to connect.[/]")
+            continue
+        resolved, error = resolve_catalog_provider(name)
+        if error:
+            console.print(f"  [yellow]{error}[/]")
+            continue
+        active = resolved.get("model", active)
+        models, message = fetch_provider_models(resolved)
+        if not models:
+            console.print(f"  [yellow]{message}[/]")
+            console.print(f"  [dim]Configured model: {active}[/]")
+            continue
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("#", style="dim", justify="right")
+        table.add_column("Model ID", style="white")
+        table.add_column("State", style="green")
+        for idx, model_id in enumerate(models, 1):
+            table.add_row(str(idx), escape(model_id), "active" if model_id == active else "")
+        console.print(table)
+    if not requested:
+        console.print("\n[dim]Catalogs require a connected provider key and a compatible `/models` endpoint. "
+                      "Use `niji models <provider>` to inspect one; `/model` to switch.[/]")
+    return True
+
+
+def _activate_model(agent, provider, name, model_id):
+    """Validate a selected model, then persist and switch the live session."""
+    try:
+        provider_cfg = resolve_provider(name, model=model_id)
+    except SystemExit as exc:
+        Console().print(f"[yellow]{exc}[/]")
+        Console().print("Run `/setup` to connect this provider first.")
+        return False
+    from .setup_wizard import _connection_guidance, test_connection
+    with Console().status(f"[cyan]Testing {name}/{model_id}...[/]"):
+        ok, message = test_connection(provider_cfg)
+    if not ok:
+        Console().print(Panel(_connection_guidance(provider_cfg, message),
+                              title="Model switch not applied", border_style="yellow"))
+        return False
+
+    cfg = load_config()
+    cfg["provider"] = name
+    if name in PRESETS:
+        cfg.setdefault("models", {})[name] = model_id
+    elif name in cfg.get("custom_providers", {}):
+        cfg["custom_providers"][name]["model"] = model_id
+    save_config(cfg)
+
+    from openai import OpenAI
+    agent.client = OpenAI(api_key=provider_cfg["api_key"],
+                          base_url=provider_cfg["base_url"])
+    agent.model = model_id
+    agent.provider_name = name
+    agent.provider_cfg = provider_cfg
+    provider.clear()
+    provider.update(provider_cfg)
+    agent.messages.append({"role": "system", "content":
+                           f"The active model was changed to {name}/{model_id}. Continue the same task and conversation."})
+    Console().print(f"[green]✓ Switched to {name}/{model_id}[/] — {message}")
+    _render_home(agent, provider)
+    return True
+
+
+def _interactive_model_picker(agent, provider, provider_name=None, requested_model=None):
+    """Browse providers and their live model lists, with manual-ID fallback."""
+    cfg = load_config()
+    names = provider_names(cfg)
+    console = Console()
+    name = provider_name
+    if name is None:
+        table = Table(title="Providers", show_header=True, header_style="bold cyan")
+        table.add_column("#", style="dim", justify="right")
+        table.add_column("Provider")
+        table.add_column("Status")
+        for idx, candidate in enumerate(names, 1):
+            preset = PRESETS.get(candidate, {})
+            custom = cfg.get("custom_providers", {}).get(candidate, {})
+            status = "connected" if provider_is_configured(candidate, cfg) else "setup needed"
+            default_model = cfg.get("models", {}).get(candidate) or custom.get("model") or preset.get("model", "")
+            table.add_row(str(idx), candidate + (" ★" if candidate == provider.get("provider") else ""),
+                          f"{status} · {default_model}")
+        console.print(table)
+        current = provider.get("provider")
+        default_idx = str(names.index(current) + 1) if current in names else "1"
+        choice = Prompt.ask("Choose provider number or name", default=default_idx).strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(names):
+            name = names[int(choice) - 1]
+        elif choice in names:
+            name = choice
+        else:
+            console.print("[yellow]Unknown provider choice.[/]")
+            return
+    elif name not in names:
+        console.print(f"[yellow]Unknown provider '{name}'. Use `/providers` to see options.[/]")
+        return
+
+    provider_cfg, error = resolve_catalog_provider(name)
+    if error:
+        console.print(f"[yellow]{name}: {error}[/]")
+        return
+
+    model_ids, catalog_message = fetch_provider_models(provider_cfg)
+    if requested_model is None and model_ids:
+        table = Table(title=f"{name} models ({len(model_ids)} available)",
+                      show_header=True, header_style="bold cyan")
+        table.add_column("#", style="dim", justify="right")
+        table.add_column("Model ID")
+        table.add_column("State", style="green")
+        for idx, model_id in enumerate(model_ids, 1):
+            table.add_row(str(idx), escape(model_id),
+                          "current" if model_id == provider_cfg.get("model") else "")
+        console.print(table)
+        choice = Prompt.ask("Choose number, or `m` to enter a model ID manually").strip()
+        if choice.lower() == "m":
+            requested_model = Prompt.ask("Model ID").strip()
+        elif choice.isdigit() and 1 <= int(choice) <= len(model_ids):
+            requested_model = model_ids[int(choice) - 1]
+        elif choice in model_ids:
+            requested_model = choice
+        else:
+            console.print("[yellow]Invalid model choice; no changes made.[/]")
+            return
+    elif requested_model is None:
+        console.print(f"[yellow]{catalog_message}[/]")
+        requested_model = Prompt.ask("Enter model ID manually", default=provider_cfg["model"]).strip()
+
+    if not requested_model:
+        console.print("[yellow]No model ID entered; no changes made.[/]")
+        return
+    _activate_model(agent, provider, name, requested_model)
+
+
+def _provider_add(): 
     from .setup_wizard import _wizard_custom_provider
     cfg = load_config()
     custom = cfg.setdefault("custom_providers", {})
@@ -175,7 +329,9 @@ def _show_help():
         ("/help", "Show this command list"),
         ("/status", "Show provider, model, workspace and usage"),
         ("/tools", "List built-in and connected MCP tools"),
-        ("/model", "Show the active provider/model"),
+        ("/model", "Browse providers and their available models; switch for this session"),
+        ("/models", "List model catalogs for configured providers"),
+        ("/approval", "Toggle auto/ask confirmation mode for tool execution"),
         ("/cost", "Show token usage so far"),
         ("/compact", "Summarize older context to free space"),
         ("/memory", "View saved long-term memory"),
@@ -247,7 +403,32 @@ def _interactive_chat(agent, provider, quiet=False):
             _show_help()
             continue
         if user in ("/model", "/provider"):
-            console.print(f"[bold cyan]{provider['provider']}[/] / {agent.model}")
+            _interactive_model_picker(agent, provider)
+            continue
+        if user == "/models":
+            _cmd_models(["niji", "models"])
+            continue
+        if user.startswith("/model "):
+            parts = user.split(maxsplit=2)
+            if len(parts) >= 2 and parts[1].lower() == "list":
+                _cmd_models(["niji", "models", parts[2] if len(parts) > 2 else provider["provider"]])
+            elif len(parts) >= 2:
+                _interactive_model_picker(agent, provider, parts[1],
+                                          parts[2] if len(parts) > 2 else None)
+            continue
+        if user == "/approval" or user.startswith("/approval "):
+            parts = user.split(maxsplit=1)
+            if len(parts) == 1:
+                agent.approval = "ask" if agent.approval != "ask" else "auto"
+            elif parts[1].strip().lower() in ("ask", "auto"):
+                agent.approval = parts[1].strip().lower()
+            else:
+                console.print("Usage: /approval [ask|auto]")
+                continue
+            if agent.approval == "ask":
+                console.print("[yellow]Approval mode: ask — tool actions need confirmation. This is not a sandbox.[/]")
+            else:
+                console.print("[green]Approval mode: auto — tools can execute actions without per-action confirmation.[/]")
             continue
         if user == "/status":
             _render_home(agent, provider, quiet=False)
@@ -321,6 +502,9 @@ def main():
     # ---------- subcommands ----------
     if argv and argv[0] == "providers":
         _cmd_providers(argv)
+        return
+    if argv and argv[0] == "models":
+        _cmd_models(["niji", *argv])
         return
     if argv and argv[0] == "doctor":
         ok = _cmd_doctor()

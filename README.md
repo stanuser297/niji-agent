@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.4.1
+# Niji Agent 🌈 — v2.5.0
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -15,6 +15,13 @@ niji
 Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, enter its API key (visible input is the Termux-friendly default; hidden entry is optional), and choose a model. The key is saved locally in `~/.niji/config.json` with private file permissions—no `export` command is needed. Ollama can be used without an API key.
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
+
+## What's new in 2.5.0
+
+- `/model` interactively browses preset and custom providers, fetches the selected provider's available model IDs, tests the choice, then switches and saves it without leaving the chat
+- `/models` and `niji models [provider]` show full accessible catalogs when the provider exposes a compatible models endpoint; unconfigured providers are marked, and manual model entry remains available
+- `/approval [ask|auto]` toggles tool confirmation during a session; `ask` is confirmation, not a security sandbox
+- Loads the current workspace's `AGENTS.md` as project-specific guidance and reminds the agent to inspect diffs and run relevant checks after edits
 
 ## What's new in 2.4.1
 
@@ -51,11 +58,15 @@ niji sessions                             # list saved sessions
 niji setup                                # run provider setup again
 niji doctor                               # diagnose setup
 niji providers                            # list available providers
+niji models                               # list catalogs for connected providers
+niji models groq                          # list Groq model IDs
 niji providers add                        # add a custom provider
 niji providers use openrouter             # switch default provider
 ```
 
-Interactive slash commands: `/help`, `/model`, `/cost`, `/compact`, `/memory`, `/exit`.
+Interactive slash commands: `/help`, `/model` (browse/switch provider and model), `/models`, `/approval [ask|auto]`, `/status`, `/tools`, `/setup`, `/doctor`, `/cost`, `/compact`, `/memory`, `/sessions`, `/clear`, `/exit`.
+
+Model discovery uses each connected provider's compatible models endpoint when available. Some providers hide catalogs or require manual model IDs; the picker explains that and keeps manual entry available. No API keys are shown in catalog output.
 
 Use the tool only in directories where you trust it to read and modify files. It runs with your operating-system account's permissions; it is not a sandbox. MCP servers are separate programs, so only configure servers you trust. `--ask` adds confirmations, but does not turn the operating system into a sandbox.
 
