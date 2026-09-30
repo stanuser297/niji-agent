@@ -196,13 +196,30 @@ def _show_provider_error(provider, exc):
     console = Console(stderr=True)
     status = getattr(exc, "status_code", None)
     provider_name = str(provider.get("provider", ""))
-    if status == 404 and (provider_name == "nvidia" or "nvidia.com" in str(provider.get("base_url", ""))):
+    base_url = str(provider.get("base_url", ""))
+    groq = provider_name == "groq" or "api.groq.com" in base_url
+    if status == 404 and (provider_name == "nvidia" or "nvidia.com" in base_url):
         detail = ("NVIDIA returned 404. Verify the model ID and base URL. "
                   "For GLM 5.3 Flash use `z-ai/glm-5.3-flash` (with dots), "
                   "then run `/setup` to save it.")
+    elif status == 404 and groq:
+        model = str(provider.get("model", "(unknown)"))
+        if model == "llama-3.3-70b-versatile":
+            detail = ("Groq returned 404. `llama-3.3-70b-versatile` was shut down for "
+                      "developer/free-tier accounts on August 16, 2026. Use model "
+                      "`openai/gpt-oss-120b` with base URL `https://api.groq.com/openai/v1`, "
+                      "then run `/setup`.")
+        else:
+            detail = (f"Groq returned 404 for model `{model}`. Check that the exact model ID "
+                      "is available to your account and use base URL "
+                      "`https://api.groq.com/openai/v1`; run `/setup` to change it.")
     elif status == 404:
         detail = ("The provider returned 404. Check the OpenAI-compatible base URL "
                   "and exact model ID, then run `/setup`.")
+    elif status in (401, 403) and groq:
+        detail = ("Groq rejected the API key or account access (HTTP %s). Replace it with a "
+                  "fresh GroqCloud API key in `/setup`, and confirm the account has API access. "
+                  "The saved key is never shown here." % status)
     elif status in (401, 403):
         detail = "The provider rejected the API key or account permissions. Run `/setup` to replace the key."
     elif status == 429:

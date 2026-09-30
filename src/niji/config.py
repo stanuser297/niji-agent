@@ -21,7 +21,7 @@ PRESETS = {
     "gemini":     {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
                    "env_key": "GEMINI_API_KEY", "model": "gemini-2.5-flash"},
     "groq":       {"base_url": "https://api.groq.com/openai/v1",
-                   "env_key": "GROQ_API_KEY", "model": "llama-3.3-70b-versatile"},
+                   "env_key": "GROQ_API_KEY", "model": "openai/gpt-oss-120b"},
     "deepseek":   {"base_url": "https://api.deepseek.com/v1",
                    "env_key": "DEEPSEEK_API_KEY", "model": "deepseek-chat"},
     "together":   {"base_url": "https://api.together.xyz/v1",
@@ -29,6 +29,15 @@ PRESETS = {
                    "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo"},
     "ollama":     {"base_url": "http://localhost:11434/v1",
                    "env_key": None, "model": "llama3.1"},
+}
+
+# Provider model IDs can be retired while a user's key/config remains unchanged.
+# Migrate known retired defaults automatically, without changing explicit
+# --model or NIJI_MODEL overrides.
+MODEL_MIGRATIONS = {
+    "groq": {
+        "llama-3.3-70b-versatile": "openai/gpt-oss-120b",
+    },
 }
 
 
@@ -116,6 +125,16 @@ def resolve_provider(name=None, model=None, api_key=None):
             f"Unknown provider '{name}'. Options: {known}\n"
             f"Or set NIJI_BASE_URL env var to use any OpenAI-compatible endpoint.")
 
+    # Migrate only a stored known-retired model. Explicit CLI/environment model
+    # overrides remain untouched so users retain control.
+    configured_model = cfg.get("models", {}).get(name)
+    has_model_override = bool(model or os.environ.get("NIJI_MODEL"))
+    replacement = MODEL_MIGRATIONS.get(name, {}).get(configured_model)
+    if replacement and not has_model_override:
+        cfg.setdefault("models", {})[name] = replacement
+        save_config(cfg)
+        configured_model = replacement
+
     # Explicit CLI credentials win, then saved wizard config, then environment fallbacks.
     key = (api_key
            or cfg.get("api_keys", {}).get(name)
@@ -132,5 +151,5 @@ def resolve_provider(name=None, model=None, api_key=None):
         "base_url": preset["base_url"],
         "api_key": key or "ollama",
         "model": (model or os.environ.get("NIJI_MODEL")
-                  or cfg.get("models", {}).get(name) or preset["model"]),
+                  or configured_model or preset["model"]),
     }

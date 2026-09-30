@@ -152,6 +152,8 @@ def _connection_guidance(provider_cfg: dict, message: str) -> str:
     text = message.lower()
     status = next((code for code in (401, 403, 404, 429) if str(code) in text), None)
     nvidia = "nvidia.com" in provider_cfg.get("base_url", "")
+    groq = (provider_cfg.get("provider") == "groq"
+            or "api.groq.com" in provider_cfg.get("base_url", ""))
     if status in (401, 403):
         if nvidia:
             return ("NVIDIA denied this key or its access (HTTP %s). This is an authorization issue, "
@@ -159,11 +161,26 @@ def _connection_guidance(provider_cfg: dict, message: str) -> str:
                     "replace the saved key with an NVIDIA NIM API key, and check that your NVIDIA "
                     "account is allowed to use this model. Hidden input is available; visible mode "
                     "shows the key as you type." % status)
+        if groq:
+            return (f"Groq rejected this API key or account access (HTTP {status}). The model/route "
+                    "is separate from authorization. In setup, replace the saved key with a fresh "
+                    "GroqCloud API key and confirm the account can use the API. Niji never displays "
+                    "or prints the saved key.")
         return (f"The provider denied this API key or its account access (HTTP {status}). "
                 "Replace it with a key for this provider and confirm the account has API access.")
     if status == 404 and nvidia:
         return ("NVIDIA could not find this model or route (HTTP 404). For GLM 5.3 Flash the model "
                 "ID is `z-ai/glm-5.3-flash` (dots, not hyphens).")
+    if status == 404 and groq:
+        model = provider_cfg.get("model", "(unknown)")
+        if model == "llama-3.3-70b-versatile":
+            return ("Groq returned HTTP 404. `llama-3.3-70b-versatile` was shut down for "
+                    "developer/free-tier accounts on August 16, 2026. Use the current model "
+                    "ID `openai/gpt-oss-120b`; keep base URL `https://api.groq.com/openai/v1`.")
+        return (f"Groq returned HTTP 404 for model `{model}`. Check that the exact model ID is "
+                "listed in your Groq account and that the base URL is "
+                "`https://api.groq.com/openai/v1`. Niji's current Groq default is "
+                "`openai/gpt-oss-120b`.")
     if status == 404:
         return "The provider could not find this model or API route (HTTP 404). Check the base URL and exact model ID."
     if status == 429:
@@ -177,7 +194,8 @@ def _read_replacement_key(provider_name: str) -> str:
 
 def run_setup(default_model: str | None = None,
               provider_name: str | None = None) -> dict:
-    from .config import PRESETS, load_config, resolve_provider, save_config
+    from .config import (MODEL_MIGRATIONS, PRESETS, load_config,
+                         resolve_provider, save_config)
     from .ui import render_setup_banner
 
     render_setup_banner(console)
@@ -216,7 +234,9 @@ def run_setup(default_model: str | None = None,
                            or os.environ.get("NIJI_API_KEY"))
         if preset.get("env_key") and not key and not stored_key and not has_env_key:
             raise SystemExit("No API key entered. Run 'niji setup' again when ready.")
-        default_m = default_model or cfg.get("models", {}).get(name) or preset["model"]
+        saved_model = cfg.get("models", {}).get(name)
+        saved_model = MODEL_MIGRATIONS.get(name, {}).get(saved_model, saved_model)
+        default_m = default_model or saved_model or preset["model"]
         model = Prompt.ask("Default model", default=default_m).strip()
         provider_cfg = resolve_provider(name, model=model, api_key=key)
 
@@ -228,7 +248,7 @@ def run_setup(default_model: str | None = None,
         console.print(Panel(_connection_guidance(provider_cfg, msg),
                             title="[bold yellow]Key or provider access denied[/]",
                             border_style="yellow"))
-        replace = Prompt.ask("Replace the saved key and test again? (input stays hidden)",
+        replace = Prompt.ask("Replace the saved key and test again?",
                              choices=["y", "n"], default="y")
         if replace == "y":
             replacement = _read_replacement_key(name)
