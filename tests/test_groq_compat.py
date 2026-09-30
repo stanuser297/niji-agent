@@ -85,12 +85,14 @@ class GroqCompatibilityTests(unittest.TestCase):
             stack.enter_context(patch("niji.setup_wizard._ask_key", return_value="saved-key"))
             stack.enter_context(patch("niji.setup_wizard.test_connection",
                                       return_value=(True, "chat endpoint OK")))
+            picker = stack.enter_context(patch("niji.setup_wizard.arrow_select", return_value="groq"))
             ask = stack.enter_context(patch("niji.setup_wizard.Prompt.ask",
-                                            side_effect=["5", "openai/gpt-oss-120b"]))
+                                            side_effect=["openai/gpt-oss-120b"]))
             stack.enter_context(patch("niji.setup_wizard.console",
                                       Console(file=output, width=90, color_system=None)))
             run_setup()
-        self.assertEqual(ask.call_args_list[1].kwargs["default"], "openai/gpt-oss-120b")
+        self.assertEqual(picker.call_args.args[1][0][0], "openrouter")
+        self.assertEqual(ask.call_args_list[0].kwargs["default"], "openai/gpt-oss-120b")
 
     def test_runtime_groq_401_message_distinguishes_auth_from_model_route(self):
         class ProviderError(Exception):

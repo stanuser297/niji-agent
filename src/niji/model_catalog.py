@@ -49,7 +49,8 @@ def fetch_provider_models(provider_cfg, timeout=15):
     try:
         from openai import OpenAI
         client = OpenAI(api_key=provider_cfg["api_key"],
-                        base_url=provider_cfg["base_url"], timeout=timeout)
+                        base_url=provider_cfg["base_url"], timeout=timeout,
+                        max_retries=0)
         response = client.models.list()
         models = sorted({str(item.id) for item in response.data
                          if getattr(item, "id", None)})

@@ -30,7 +30,9 @@ def _build_agent(args, mcp_path=None):
         else connect_all(load_mcp_servers(mcp_path or getattr(args, "mcp", None)))
     agent = Agent(provider,
                   approval="ask" if getattr(args, "ask", False) else "auto",
-                  max_turns=getattr(args, "max_turns", 60),
+                  max_turns=getattr(args, "max_turns", 20),
+                  max_tool_calls=getattr(args, "max_tool_calls", 30),
+                  max_tool_calls_per_turn=getattr(args, "max_tool_calls_per_turn", 6),
                   verbose=not getattr(args, "quiet", False),
                   mcp_clients=clients)
     if not getattr(args, "quiet", False):
@@ -45,6 +47,10 @@ def _activity_notice(event):
     console = Console()
     if level == "THINKING":
         console.print(f"[dim bright_cyan]✧ {message}[/]")
+    elif level == "RETRY":
+        console.print(f"[yellow]↻ {message}[/]")
+    elif level == "LIMIT":
+        console.print(f"[bold yellow]⏸ {message}[/]")
     elif level == "PLAN":
         console.print(f"[bold cyan]⚙ {message}[/]")
     elif level == "TOOL":
@@ -186,7 +192,8 @@ def _activate_model(agent, provider, name, model_id):
 
     from openai import OpenAI
     agent.client = OpenAI(api_key=provider_cfg["api_key"],
-                          base_url=provider_cfg["base_url"])
+                          base_url=provider_cfg["base_url"],
+                          timeout=120, max_retries=0)
     agent.model = model_id
     agent.provider_name = name
     agent.provider_cfg = provider_cfg
@@ -203,83 +210,9 @@ def _activate_model(agent, provider, name, model_id):
 
 
 def _arrow_select(title, choices, selected=0):
-    """Pick a (value, label) option with arrow keys; safe text fallback if non-TTY."""
-    if not choices:
-        return None
-    selected = max(0, min(selected, len(choices) - 1))
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        value = Prompt.ask(f"{title} (type an option)", default=choices[selected][0]).strip()
-        return next((item[0] for item in choices if value == item[0]), None)
-
-    try:
-        import os
-        import select
-        import shutil
-        import termios
-        import tty
-        if os.name != "posix":
-            raise OSError("Arrow selection is unavailable on this terminal")
-        fd = sys.stdin.fileno()
-        previous = termios.tcgetattr(fd)
-    except (ImportError, OSError, AttributeError):
-        value = Prompt.ask(f"{title} (type an option)", default=choices[selected][0]).strip()
-        return next((item[0] for item in choices if value == item[0]), None)
-
-    console = Console()
-    try:
-        tty.setcbreak(fd)
-        current_terminal = termios.tcgetattr(fd)
-        current_terminal[3] &= ~termios.ECHO
-        termios.tcsetattr(fd, termios.TCSADRAIN, current_terminal)
-        while True:
-            height = shutil.get_terminal_size((80, 24)).lines
-            page_size = max(4, height - 8)
-            start = min(max(0, selected - page_size + 1), max(0, len(choices) - page_size))
-            end = min(len(choices), start + page_size)
-            console.clear()
-            console.print(Panel(title, border_style="bright_cyan"))
-            for index in range(start, end):
-                label = choices[index][1]
-                row = Text()
-                if index == selected:
-                    row.append(" ❯ ", style="bold black on bright_cyan")
-                    row.append(label, style="bold bright_white on blue")
-                else:
-                    row.append("   ")
-                    row.append(label)
-                console.print(row)
-            console.print(f"[dim]↑/↓ or j/k move · Enter select · q/Esc cancel · {selected + 1}/{len(choices)}[/]")
-            key = sys.stdin.read(1)
-            if key in ("\r", "\n"):
-                return choices[selected][0]
-            if key in ("q", "Q", "\x03", "\x04"):
-                return None
-            if key in ("j", "J"):
-                selected = min(len(choices) - 1, selected + 1)
-            elif key in ("k", "K"):
-                selected = max(0, selected - 1)
-            elif key == "\x1b":
-                if select.select([sys.stdin], [], [], 0.15)[0]:
-                    sequence = sys.stdin.read(2)
-                    if sequence == "[A":
-                        selected = max(0, selected - 1)
-                    elif sequence == "[B":
-                        selected = min(len(choices) - 1, selected + 1)
-                    elif sequence == "[5":
-                        if select.select([sys.stdin], [], [], 0.05)[0]:
-                            sys.stdin.read(1)
-                        selected = max(0, selected - page_size)
-                    elif sequence == "[6":
-                        if select.select([sys.stdin], [], [], 0.05)[0]:
-                            sys.stdin.read(1)
-                        selected = min(len(choices) - 1, selected + page_size)
-                else:
-                    return None
-    except KeyboardInterrupt:
-        return None
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, previous)
-        console.print()
+    """Compatibility wrapper for the shared unbuffered, Termux-safe picker."""
+    from .terminal_picker import arrow_select
+    return arrow_select(title, choices, selected)
 
 
 def _interactive_model_picker(agent, provider, provider_name=None, requested_model=None):
@@ -446,6 +379,7 @@ def _show_help():
         ("/status", "Show provider, model, workspace and usage"),
         ("/tools", "List built-in and connected MCP tools"),
         ("/activity", "Show recent thinking/execution phases and tool outcomes"),
+        ("/limits", "Show turn/tool-call limits for this request"),
         ("/model", "Browse providers and their available models; switch for this session"),
         ("/models", "List model catalogs for configured providers"),
         ("/approval", "Toggle auto/ask confirmation mode for tool execution"),
@@ -466,43 +400,57 @@ def _show_help():
 
 
 def _show_provider_error(provider, exc):
+    """Give a safe, actionable recovery path without dumping a traceback or key."""
     console = Console(stderr=True)
     status = getattr(exc, "status_code", None)
     provider_name = str(provider.get("provider", ""))
     base_url = str(provider.get("base_url", ""))
     groq = provider_name == "groq" or "api.groq.com" in base_url
+    message = str(exc)[:500]
+    api_key = str(provider.get("api_key", ""))
+    if api_key:
+        message = message.replace(api_key, "[redacted]")
+    lower = message.lower()
     if status == 404 and (provider_name == "nvidia" or "nvidia.com" in base_url):
         detail = ("NVIDIA returned 404. Verify the model ID and base URL. "
-                  "For GLM 5.3 Flash use `z-ai/glm-5.3-flash` (with dots), "
-                  "then run `/setup` to save it.")
+                  "For GLM 5.3 Flash use `z-ai/glm-5.3-flash` (with dots); `/model` or `/setup` to correct it.")
     elif status == 404 and groq:
         model = str(provider.get("model", "(unknown)"))
         if model == "llama-3.3-70b-versatile":
-            detail = ("Groq returned 404. `llama-3.3-70b-versatile` was shut down for "
-                      "developer/free-tier accounts on August 16, 2026. Use model "
-                      "`openai/gpt-oss-120b` with base URL `https://api.groq.com/openai/v1`, "
-                      "then run `/setup`.")
+            detail = ("Groq returned 404. `llama-3.3-70b-versatile` was retired for developer/free accounts "
+                      "on August 16, 2026. Choose an active model (for example `openai/gpt-oss-120b`) "
+                      "from `/model` or run `/setup`. Keep base URL `https://api.groq.com/openai/v1`.")
         else:
-            detail = (f"Groq returned 404 for model `{model}`. Check that the exact model ID "
-                      "is available to your account and use base URL "
-                      "`https://api.groq.com/openai/v1`; run `/setup` to change it.")
+            detail = (f"Groq returned 404 for `{model}`. Check the exact model ID and base URL; "
+                      "use `/model` to choose an active chat model or `/setup` to change the endpoint.")
     elif status == 404:
-        detail = ("The provider returned 404. Check the OpenAI-compatible base URL "
-                  "and exact model ID, then run `/setup`.")
+        detail = "HTTP 404: provider route or model ID not found. Check `/setup` base URL and choose a model in `/model`; do not retry the same ID blindly."
     elif status in (401, 403) and groq:
-        detail = ("Groq rejected the API key or account access (HTTP %s). Replace it with a "
-                  "fresh GroqCloud API key in `/setup`, and confirm the account has API access. "
-                  "The saved key is never shown here." % status)
-    elif status in (401, 403):
-        detail = "The provider rejected the API key or account permissions. Run `/setup` to replace the key."
-    elif status == 400:
-        detail = ("The provider rejected this chat request (HTTP 400). The selected model may not "
-                  "support chat completions or the request options. Run `/model` and choose a "
-                  "chat/text model.")
+        detail = (f"Groq rejected the API key or account access (HTTP {status}). Replace it with a fresh GroqCloud API key in `/setup` "
+                  "and confirm account/model access. Niji will not display the saved key.")
+    elif status == 401:
+        detail = "HTTP 401: API key is missing, invalid, or revoked. Run `/setup` and enter a key for this provider; retry only after updating it."
+    elif status == 403:
+        detail = "HTTP 403: key/account lacks permission for this model or feature. Check provider eligibility/region, then use `/model` for an allowed model. Re-entering the same key usually will not help."
+    elif status in (400, 422):
+        detail = "The provider rejected the request (HTTP %s). This is usually an unsupported model/request option. Choose a chat/text model with `/model`; do not auto-retry the same request." % status
+    elif status == 413:
+        detail = "Request too large (HTTP 413). Run `/compact` to shrink chat context, then retry with a smaller task or context-window model."
+    elif status == 429 and any(word in lower for word in ("quota", "billing", "credit", "payment", "insufficient_balance")):
+        detail = "Provider quota/credit is exhausted (HTTP 429); waiting/retrying will not fix billing. Check account credits/limits or switch provider with `/model`."
     elif status == 429:
-        detail = "The provider rate limit or quota was reached. Check the account quota and try again."
+        detail = "Rate limit reached (HTTP 429). Niji made at most one bounded retry. Wait for the provider reset, reduce requests, or choose another model/provider with `/model`."
+    elif status in (408, 409) or (status is not None and 500 <= status <= 599):
+        detail = (f"Provider transient failure (HTTP {status}). Niji made at most one bounded retry. "
+                  "Check connection/provider status, then retry once; use `/model` to switch if it persists.")
+    elif any(token in exc.__class__.__name__.lower() for token in
+             ("connectionerror", "apiconnectionerror", "timeouterror", "apitimeouterror", "connecterror", "readtimeout")):
+        detail = ("Network/DNS/timeout error while contacting the model. The failed prompt was not kept as a dangling chat turn. "
+                  "Check internet with `/doctor`, then retry once; don't keep retrying while offline.")
     else:
-        detail = str(exc)
+        detail = f"Request failed ({exc.__class__.__name__}). The interactive session stays open. Run `/doctor`, then `/setup` or `/model` if needed."
+        if message and not api_key:
+            detail += "\nProvider detail: " + message.replace("\n", " ")[:180]
     console.print(Panel(Text(detail), title="Request failed — chat is still open",
                         border_style="red"))
 
@@ -564,6 +512,17 @@ def _interactive_chat(agent, provider, quiet=False):
         if user == "/activity":
             _show_activity(agent)
             continue
+        if user == "/limits":
+            table = Table(title="Execution limits", show_header=False)
+            table.add_column("Limit", style="cyan")
+            table.add_column("Value", style="white")
+            table.add_row("Turns per request", str(agent.max_turns))
+            table.add_row("Tool calls per request", f"{agent._request_tool_calls}/{agent.max_tool_calls}")
+            table.add_row("Tool calls per model turn", str(agent.max_tool_calls_per_turn))
+            table.add_row("Shell command timeout", "max 120 seconds")
+            table.add_row("Provider retry", "one retry, transient errors only")
+            Console().print(table)
+            continue
         if user == "/cost":
             console.print(agent.cost_line())
             continue
@@ -598,7 +557,8 @@ def _interactive_chat(agent, provider, quiet=False):
                 new_provider = run_setup()
                 agent.provider_cfg = new_provider
                 agent.client = OpenAI(api_key=new_provider["api_key"],
-                                      base_url=new_provider["base_url"])
+                                      base_url=new_provider["base_url"],
+                                      timeout=120, max_retries=0)
                 agent.model = new_provider["model"]
                 agent.provider_name = new_provider["provider"]
                 provider.update(new_provider)
@@ -667,7 +627,12 @@ def main():
     p.add_argument("--model", help="Override model name")
     p.add_argument("--api-key", help="Override API key")
     p.add_argument("--ask", action="store_true", help="Ask before shell, file-write, network, and MCP actions")
-    p.add_argument("--max-turns", type=int, default=60)
+    p.add_argument("--max-turns", type=int, default=20,
+                   help="Maximum model turns per user request (1-100; default 20)")
+    p.add_argument("--max-tool-calls", type=int, default=30,
+                   help="Maximum tool executions per user request (default 30; hard cap 100)")
+    p.add_argument("--max-tool-calls-per-turn", type=int, default=6,
+                   help="Maximum tools executed from one model response (default 6; hard cap 20)")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--resume", help="Resume a saved session id (see: niji sessions)")
     p.add_argument("--continue", dest="cont", action="store_true",

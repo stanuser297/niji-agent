@@ -1,4 +1,5 @@
 import json
+import random
 import threading
 import time
 import uuid
@@ -16,6 +17,9 @@ PARALLEL_SAFE_TOOLS = {
     "read_file", "list_files", "grep", "glob", "read_image",
     "web_fetch", "todo_read", "memory_read",
 }
+DEFAULT_MAX_TURNS = 20
+DEFAULT_MAX_TOOL_CALLS = 30
+DEFAULT_MAX_TOOL_CALLS_PER_TURN = 6
 
 SYSTEM_PROMPT = (
     "You are Niji, an autonomous senior software engineer running in the user's terminal.\n"
@@ -38,15 +42,24 @@ SYSTEM_PROMPT = (
 
 class Agent:
     def __init__(self, provider_cfg: dict, approval: str = "auto",
-                 max_turns: int = 60, verbose: bool = True,
-                 depth: int = 0, mcp_clients=None, allowed_tools=None):
+                 max_turns: int = DEFAULT_MAX_TURNS, verbose: bool = True,
+                 depth: int = 0, mcp_clients=None, allowed_tools=None,
+                 max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
+                 max_tool_calls_per_turn: int = DEFAULT_MAX_TOOL_CALLS_PER_TURN):
         self.provider_cfg = provider_cfg
+        # Disable the SDK's implicit retries so the agent's bounded policy is the
+        # only retry layer; use a finite request timeout for stalled providers.
         self.client = OpenAI(api_key=provider_cfg["api_key"],
-                             base_url=provider_cfg["base_url"])
+                             base_url=provider_cfg["base_url"],
+                             timeout=120, max_retries=0)
         self.model = provider_cfg["model"]
         self.provider_name = provider_cfg["provider"]
         self.approval = approval
-        self.max_turns = max_turns
+        self.max_turns = max(1, min(int(max_turns), 100))
+        self.max_tool_calls = max(1, min(int(max_tool_calls), 100))
+        self.max_tool_calls_per_turn = max(
+            1, min(int(max_tool_calls_per_turn), self.max_tool_calls, 20))
+        self._request_tool_calls = 0
         self.verbose = verbose
         self.depth = depth
         self.mcp_clients = mcp_clients or []
@@ -116,10 +129,16 @@ class Agent:
                 pass
 
     def chat(self, user_text: str) -> str:
+        self._request_tool_calls = 0
         self.messages.append({"role": "user", "content": user_text})
         try:
             return self._loop()
         except Exception as exc:
+            # If the provider failed before returning an assistant/tool message,
+            # discard this unsent user turn so the next prompt remains valid.
+            if (self.messages and self.messages[-1].get("role") == "user"
+                    and self.messages[-1].get("content") == user_text):
+                self.messages.pop()
             self._record_activity("ERROR", f"Request failed ({exc.__class__.__name__})")
             raise
         finally:
@@ -157,16 +176,29 @@ class Agent:
                 self._record_activity("DONE", "Response complete")
                 return text or "[done]"
 
-            self._record_activity("PLAN", f"Executing {len(tool_calls)} tool call(s)")
-            if (len(tool_calls) > 1 and self.approval != "ask"
-                    and all(tc["name"] in PARALLEL_SAFE_TOOLS for tc in tool_calls)):
-                # Parallelize only read-only operations; mutations may depend on one another.
-                with ThreadPoolExecutor(max_workers=min(8, len(tool_calls))) as ex:
-                    results = list(ex.map(self._execute, tool_calls))
-            else:
-                results = [self._execute(tc) for tc in tool_calls]
+            allowed_count = min(self.max_tool_calls_per_turn, len(tool_calls),
+                                self.max_tool_calls - self._request_tool_calls)
+            executable = tool_calls[:allowed_count]
+            deferred = tool_calls[allowed_count:]
+            self._record_activity("PLAN", f"Executing {len(executable)} of {len(tool_calls)} requested tool call(s)")
 
-            for tc, result in zip(tool_calls, results):
+            results = []
+            if (len(executable) > 1 and self.approval != "ask"
+                    and all(tc["name"] in PARALLEL_SAFE_TOOLS for tc in executable)):
+                # Parallelize only read-only operations; mutations may depend on one another.
+                with ThreadPoolExecutor(max_workers=min(4, len(executable))) as ex:
+                    results = list(ex.map(self._execute, executable))
+            else:
+                results = [self._execute(tc) for tc in executable]
+            self._request_tool_calls += len(executable)
+
+            for index, tc in enumerate(tool_calls):
+                if index < len(executable):
+                    result = results[index]
+                else:
+                    result = ("[not executed: per-request tool-call limit reached] "
+                              "Review the completed tool results and ask the user to continue if more work is needed.")
+                    self._record_activity("LIMIT", f"Skipped {tc['name']} at the per-request tool-call limit")
                 self.messages.append({"role": "tool",
                                       "tool_call_id": tc["id"],
                                       "content": result})
@@ -176,7 +208,19 @@ class Agent:
             if compacted and self.verbose:
                 self._print("\n[niji] context compacted (old messages summarized)")
 
-        return f"[stopped: max turns ({self.max_turns}) reached]"
+            if deferred and self._request_tool_calls >= self.max_tool_calls:
+                notice = (f"Execution paused at the safety limit of {self.max_tool_calls} tool calls "
+                          "for this request. Completed actions are retained; review the activity feed, "
+                          "then ask Niji to continue if appropriate.")
+                self._record_activity("LIMIT", notice)
+                self._print(f"\n[yellow][niji] {notice}[/]")
+                return notice
+
+        notice = (f"Execution paused at the turn limit ({self.max_turns}). "
+                  "Completed actions are retained; review the results and ask Niji to continue.")
+        self._record_activity("LIMIT", notice)
+        self._print(f"\n[yellow][niji] {notice}[/]")
+        return notice
 
     # ---------------- LLM call ----------------
 
@@ -237,22 +281,52 @@ class Agent:
             } for t in tool_calls]
         return msg, text, tool_calls
 
+    @staticmethod
+    def _retry_after(exc):
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", {}) or {}
+        value = headers.get("retry-after") or headers.get("Retry-After")
+        if not value:
+            return None
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            try:
+                from email.utils import parsedate_to_datetime
+                return max(0.0, (parsedate_to_datetime(value) - datetime.now().astimezone()).total_seconds())
+            except Exception:
+                return None
+
     def _api_call(self, **kwargs):
-        delay = 2
-        for attempt in range(4):
+        # One bounded retry only for transient transport/rate/server failures.
+        # SDK retries are disabled on the client, avoiding nested retries.
+        for attempt in range(2):
             try:
                 return self.client.chat.completions.create(**kwargs)
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
                 status = getattr(exc, "status_code", None)
-                # Do not waste retries on deterministic client errors (e.g. wrong model/404).
-                if status and 400 <= status < 500 and status not in (408, 409, 429):
+                body = str(getattr(exc, "body", "") or exc).lower()
+                quota_error = status == 429 and any(
+                    word in body for word in ("quota", "billing", "credit", "payment", "insufficient_balance"))
+                transient_status = status in (408, 409, 429) or (status is not None and 500 <= status <= 599)
+                kind = exc.__class__.__name__.lower()
+                transport_error = any(token in kind for token in
+                                      ("apiconnectionerror", "apitimeouterror", "connecterror", "readtimeout"))
+                if (attempt == 1 or quota_error
+                        or not (transient_status or transport_error)):
                     raise
-                if attempt == 3:
+
+                retry_after = self._retry_after(exc)
+                # Never retry sooner than the provider's explicit delay. If it is
+                # long, return control instead of keeping a mobile terminal stuck.
+                if retry_after is not None and retry_after > 6:
+                    self._record_activity("ERROR", f"Provider asked to retry after {retry_after:.0f}s; deferred")
                     raise
+                delay = (retry_after if retry_after is not None else 1.0) + random.uniform(0.05, 0.25)
+                self._record_activity("RETRY", f"Transient provider error; one retry in {delay:.1f}s")
                 time.sleep(delay)
-                delay *= 2
 
     # ---------------- tools ----------------
 

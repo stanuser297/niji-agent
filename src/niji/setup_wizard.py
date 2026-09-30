@@ -9,6 +9,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
 
+from .terminal_picker import arrow_select
+
 console = Console()
 
 WIZARD_PROVIDERS = [
@@ -63,7 +65,8 @@ def test_connection(provider_cfg: dict):
     try:
         from openai import OpenAI
         client = OpenAI(api_key=provider_cfg["api_key"],
-                        base_url=provider_cfg["base_url"], timeout=25)
+                        base_url=provider_cfg["base_url"], timeout=25,
+                        max_retries=0)
     except Exception as e:
         return False, str(e)[:300]
 
@@ -161,7 +164,8 @@ def _wizard_custom_provider():
 def _connection_guidance(provider_cfg: dict, message: str) -> str:
     """Turn common provider failures into actionable, provider-aware guidance."""
     text = message.lower()
-    status = next((code for code in (400, 401, 403, 404, 429) if str(code) in text), None)
+    status = next((code for code in (400, 401, 403, 404, 408, 409, 413, 422, 429,
+                                     500, 502, 503, 504) if str(code) in text), None)
     nvidia = "nvidia.com" in provider_cfg.get("base_url", "")
     groq = (provider_cfg.get("provider") == "groq"
             or "api.groq.com" in provider_cfg.get("base_url", ""))
@@ -198,8 +202,14 @@ def _connection_guidance(provider_cfg: dict, message: str) -> str:
         return ("The provider rejected this chat request (HTTP 400). The catalog can include models "
                 "that are not chat-capable or require different request options. Choose a text/chat "
                 "model; if you knowingly want to try this model, the picker can apply it unverified.")
+    if status == 429 and any(word in text for word in ("quota", "billing", "credit", "payment")):
+        return "Provider credits/quota are exhausted (HTTP 429); retrying will not fix billing. Check account credits or choose another provider."
     if status == 429:
-        return "The provider quota or rate limit was reached (HTTP 429). Check billing/quota and retry later."
+        return "Provider rate limit reached (HTTP 429). Wait for the provider reset, then run `niji setup` again; do not rapidly retry."
+    if status in (408, 409, 500, 502, 503, 504):
+        return f"Provider temporarily failed the connection test (HTTP {status}). Check internet/provider status and retry setup later; saved settings remain unchanged."
+    if status == 413:
+        return "Provider says this request is too large (HTTP 413). Check model/context requirements or choose a different model."
     return "The connection test failed. Check network/DNS, API base URL, and model name."
 
 
@@ -221,17 +231,17 @@ def run_setup(default_model: str | None = None,
     default_name = (provider_name if provider_name in provider_names
                     else configured_name if configured_name in provider_names
                     else "openrouter")
-    default_choice = str(provider_names.index(default_name) + 1)
-    console.print("[bold]Choose a provider:[/]")
-    for i, (_, label) in enumerate(WIZARD_PROVIDERS, 1):
-        console.print(f"  {i}) {label}")
-    console.print("  10) Custom (any OpenAI-compatible endpoint)")
-    choice = Prompt.ask("> ", choices=[str(i) for i in range(1, 11)],
-                        default=default_choice)
+    choices = [(name, label) for name, label in WIZARD_PROVIDERS]
+    choices.append(("custom", "Custom (any OpenAI-compatible endpoint)"))
+    default_index = next((i for i, item in enumerate(choices)
+                          if item[0] == default_name), 0)
+    choice = arrow_select("Choose a provider", choices, default_index)
+    if choice is None:
+        raise SystemExit("Setup cancelled; existing settings were left unchanged.")
 
     custom = None
     key = None
-    if choice == "10":
+    if choice == "custom":
         name, custom = _wizard_custom_provider()
         provider_cfg = {
             "provider": name,
@@ -240,7 +250,7 @@ def run_setup(default_model: str | None = None,
             "model": custom["model"],
         }
     else:
-        name = provider_names[int(choice) - 1]
+        name = choice
         preset = PRESETS[name]
         stored_key = (cfg.get("api_keys", {}).get(name)
                       or cfg.get("custom_providers", {}).get(name, {}).get("api_key"))

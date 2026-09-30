@@ -14,6 +14,7 @@ def bash(command: str, cwd: str | None = None, timeout: int = 120) -> str:
     from ..safety import check_command, subprocess_environment
     check_command(command)
     try:
+        timeout = max(1, min(int(timeout), 120))
         p = subprocess.run(command, shell=True, cwd=cwd or os.getcwd(),
                            capture_output=True, text=True, timeout=timeout,
                            env=subprocess_environment())
@@ -26,6 +27,8 @@ def bash(command: str, cwd: str | None = None, timeout: int = 120) -> str:
 
 
 def read_file(path: str, offset: int = 0, limit: int = 400) -> str:
+    offset = max(0, int(offset))
+    limit = max(1, min(int(limit), 1000))
     p = Path(path)
     if not p.is_file():
         return f"[error] not a file: {path}"
@@ -103,6 +106,7 @@ def glob(pattern: str, path: str = ".") -> str:
 
 
 def web_fetch(url: str, max_chars: int = 15000) -> str:
+    max_chars = max(500, min(int(max_chars), 15000))
     import html
     import ipaddress
     import re

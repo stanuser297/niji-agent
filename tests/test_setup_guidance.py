@@ -71,13 +71,16 @@ class ConnectionGuidanceTests(unittest.TestCase):
             stack.enter_context(patch("niji.setup_wizard.test_connection", side_effect=[
                 (False, "Error code: 403 - Authorization failed"),
                 (True, "chat endpoint OK")]))
+            picker = stack.enter_context(patch("niji.setup_wizard.arrow_select", return_value="nvidia"))
             stack.enter_context(patch("niji.setup_wizard.Prompt.ask",
-                                      side_effect=["9", "z-ai/glm-5.3-flash", "y"]))
+                                      side_effect=["z-ai/glm-5.3-flash", "y"]))
             stack.enter_context(patch("niji.setup_wizard.console",
                                       Console(file=output, width=72, color_system=None)))
             result = run_setup()
         self.assertEqual(result["api_key"], "accepted-key")
         self.assertEqual(cfg["api_keys"]["nvidia"], "accepted-key")
+        self.assertEqual(picker.call_args.args[1][-1][0], "custom")
+        self.assertEqual(picker.call_args.args[2], 8)
         save.assert_called_once_with(cfg)
         self.assertIn("Niji-Agent", output.getvalue())
         self.assertIn("Connected", output.getvalue())
@@ -94,8 +97,9 @@ class ConnectionGuidanceTests(unittest.TestCase):
             stack.enter_context(patch("niji.setup_wizard._ask_key", return_value="rejected-key"))
             stack.enter_context(patch("niji.setup_wizard.test_connection", return_value=(
                 False, "Error code: 403 - Authorization failed")))
+            stack.enter_context(patch("niji.setup_wizard.arrow_select", return_value="nvidia"))
             stack.enter_context(patch("niji.setup_wizard.Prompt.ask",
-                                      side_effect=["9", "z-ai/glm-5.3-flash", "n"]))
+                                      side_effect=["z-ai/glm-5.3-flash", "n"]))
             stack.enter_context(patch("niji.setup_wizard.console",
                                       Console(file=io.StringIO(), width=72, color_system=None)))
             with self.assertRaises(SystemExit):

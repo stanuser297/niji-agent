@@ -198,7 +198,8 @@ def _system_panel(agent):
     rows.add_row("Mode", mode)
     rows.add_row("Uptime", _format_uptime(agent))
     rows.add_row("MCP", f"{len(getattr(agent, 'mcp_clients', []))} connected")
-    rows.add_row("Turns", str(usage.get("turns", 0)))
+    rows.add_row("Turns", f"{usage.get('turns', 0)} total · max {getattr(agent, 'max_turns', 20)}/request")
+    rows.add_row("Tool budget", f"{getattr(agent, '_request_tool_calls', 0)}/{getattr(agent, 'max_tool_calls', 30)} this request")
     rows.add_row("Tokens", f"{usage.get('prompt_tokens', 0) + usage.get('completion_tokens', 0):,}")
     return Panel(rows, title="[bold bright_cyan]SYSTEM STATUS[/]", border_style="cyan",
                  padding=(0, 1))
@@ -224,7 +225,7 @@ def _quick_commands():
     commands = [("/help", "Show help"), ("/tools", "List tools"), ("/status", "Agent status"),
                 ("/model", "Browse/switch models"), ("/models", "List model catalogs"),
                 ("/approval", "Toggle tool confirmations"), ("/activity", "Execution activity feed"),
-                ("/setup", "Provider setup"), ("/providers", "Providers"),
+                ("/limits", "Execution budgets"), ("/setup", "Provider setup"), ("/providers", "Providers"),
                 ("/doctor", "Diagnostics"), ("/sessions", "Sessions"),
                 ("/clear", "Redraw"), ("/exit", "Quit Niji")]
     grid = Table.grid(padding=(0, 1))

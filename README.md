@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.5.1
+# Niji Agent 🌈 — v2.6.0
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -16,10 +16,20 @@ Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, ent
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
 
+## What's new in 2.6.0
+
+- Provider setup and `/model` use an unbuffered terminal-byte picker that handles CSI and SS3 arrow sequences used by Android/Termux terminals; `j/k`, Page Up/Down, Enter and Esc/q are supported. Non-interactive terminals fall back to typing the provider/model name.
+- Provider failures now give recovery steps: correct bad model/routes (400/404), replace credentials (401), check permissions (403), compact oversized context (413), and distinguish rate limiting from exhausted quota (429).
+- SDK hidden retries are disabled. Niji performs at most one retry for transient connection/timeout/rate/server errors, adds jitter, respects short `Retry-After` hints, and defers rather than retrying early after long provider delays. Invalid-key/model/permission errors and quota/billing failures are not blindly retried.
+- Bounded execution defaults: 20 model turns, 30 tool calls per user request, at most 6 tools per model turn; subagents get tighter caps. Shell commands are capped at 120 seconds, file reads at 1,000 lines, and fetched page output at 15,000 characters. `/limits` shows the active budgets; `--max-turns`, `--max-tool-calls`, and `--max-tool-calls-per-turn` can lower or raise them within hard caps.
+- Failed initial provider prompts are removed from saved chat history so a corrected retry does not append a malformed consecutive user message; completed tool actions are retained and reported if a later model request fails.
+- Live activity now shows retry/limit events in the dashboard and `/activity` feed.
+
+Research references: [OpenAI API error codes](https://developers.openai.com/api/docs/guides/error-codes), [rate limits and retry guidance](https://developers.openai.com/api/docs/guides/rate-limits), [OpenAI Python SDK retry settings](https://github.com/openai/openai-python#retries), and [Python terminal cbreak mode](https://docs.python.org/3/library/tty.html).
+
 ## What's new in 2.5.1
 
-- Provider/model menus are arrow-key navigable (↑/↓, Enter, q/Esc); no numeric choice entry is required
-- Model activation retries newer/older completion-limit parameters, gives a clear chat-test result, and permits an explicit unverified switch only for non-auth/non-404 probe failures
+- Model activation probes the selected chat model and applies it to the active session only when accepted (or after explicit confirmation for a non-auth probe failure)
 - Live phase feed reports thinking, tool start/completion, errors and response completion; `/activity` shows the recent event history
 
 ## What's new in 2.5.0
@@ -59,6 +69,7 @@ For other systems, the installer is also available as `install.sh`. It installs 
 niji                                      # interactive chat
 niji "Find and fix the bug in this project" # one-shot task
 niji --ask "Review the project and suggest fixes" # confirm side effects
+niji --max-turns 12 --max-tool-calls 20       # set lower per-request budgets
 niji --continue                           # resume latest session
 niji sessions                             # list saved sessions
 niji setup                                # run provider setup again
@@ -70,7 +81,9 @@ niji providers add                        # add a custom provider
 niji providers use openrouter             # switch default provider
 ```
 
-Interactive slash commands: `/help`, `/model` (browse/switch provider and model with arrows), `/models`, `/approval [ask|auto]`, `/activity`, `/status`, `/tools`, `/setup`, `/doctor`, `/cost`, `/compact`, `/memory`, `/sessions`, `/clear`, `/exit`.
+Interactive slash commands: `/help`, `/model` (browse/switch provider and model with arrows), `/models`, `/approval [ask|auto]`, `/activity`, `/limits`, `/status`, `/tools`, `/setup`, `/doctor`, `/cost`, `/compact`, `/memory`, `/sessions`, `/clear`, `/exit`.
+
+The request budgets reset for each new user prompt. Defaults are capped at 20 model turns, 30 executed tools, and 6 tools from any one model response; hard limits prevent configuration above 100 turns / 100 tools / 20 tools per response. These are cost/loop guardrails, not an OS sandbox: commands still run with your account's permissions. Use `--ask` for confirmations, inspect commands before approving, and keep backups for important files.
 
 Model discovery uses each connected provider's compatible models endpoint when available. Some providers hide catalogs or require manual model IDs; the picker explains that and keeps manual entry available. No API keys are shown in catalog output.
 
