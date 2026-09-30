@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.8.0
+# Niji Agent 🌈 — v2.8.1
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -15,6 +15,13 @@ niji
 Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, enter its API key (visible input is the Termux-friendly default; hidden entry is optional), and choose a model. The key is saved locally in `~/.niji/config.json` with private file permissions—no `export` command is needed. Ollama can be used without an API key.
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
+
+## What's new in 2.8.1
+
+- HTTP 413 now triggers one bounded, offline context compaction attempt and one retry. It keeps the active user request, summarizes earlier turns without another API call, trims oversized old tool results, and never retries the same oversized request unchanged.
+- Forced `/compact` now actually compacts short transcripts when older turns exist, and starts at a user-turn boundary so it does not leave orphan tool results.
+- `/context` shows an approximate message-size breakdown to help diagnose context errors; the chat footer now shows estimated current context separately from cumulative tokens used.
+- Model switching labels distinguish the active session model from a model merely saved for that provider. A rejected 401/403 now explicitly says the switch did not occur and names the model still active.
 
 ## What's new in 2.8.0
 
@@ -122,7 +129,7 @@ niji providers add                        # add a custom provider
 niji providers use openrouter             # switch default provider
 ```
 
-Interactive slash commands: `/help`, `/model` (browse/switch provider and model with arrows), `/models`, `/approval [ask|auto]`, `/activity`, `/limits`, `/status`, `/tools`, `/setup`, `/doctor`, `/cost`, `/compact`, `/memory [show|add <note>|clear]`, `/undo`, `/sessions [search words]`, `/clear`, `/exit`.
+Interactive slash commands: `/help`, `/model` (browse/switch provider and model with arrows), `/models`, `/approval [ask|auto]`, `/activity`, `/limits`, `/context`, `/status`, `/tools`, `/setup`, `/doctor`, `/cost`, `/compact`, `/memory [show|add <note>|clear]`, `/undo`, `/sessions [search words]`, `/clear`, `/exit`.
 
 The request budgets reset for each new user prompt. Defaults are capped at 20 model turns, 30 executed tools, and 6 tools from any one model response; hard limits prevent configuration above 100 turns / 100 tools / 20 tools per response. These are cost/loop guardrails, not an OS sandbox: commands still run with your account's permissions. Use `--ask` for confirmations, inspect commands before approving, and keep backups for important files.
 

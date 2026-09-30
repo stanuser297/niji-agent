@@ -12,7 +12,7 @@ from pathlib import Path
 
 from openai import OpenAI
 
-from .compaction import maybe_compact
+from .compaction import estimate_tokens, maybe_compact
 from .config import MEMORY_FILE, SESSION_DIR
 from .tools import CORE_SCHEMAS, SUBAGENT_TOOLS, dispatch
 
@@ -309,20 +309,42 @@ class Agent:
 
     # ---------------- LLM call ----------------
 
+    def _request_stream(self, kwargs):
+        try:
+            return self._api_call(**kwargs)
+        except Exception as exc:
+            if self._usage_supported and "stream_options" in str(exc):
+                self._usage_supported = False
+                retry_kwargs = dict(kwargs)
+                retry_kwargs.pop("stream_options", None)
+                return self._api_call(**retry_kwargs)
+            raise
+
     def _chat(self):
         kwargs = dict(model=self.model, messages=self.messages,
                       tools=self.tool_schemas, stream=True)
         if self._usage_supported:
             kwargs["stream_options"] = {"include_usage": True}
         try:
-            stream = self._api_call(**kwargs)
-        except Exception as e:
-            if self._usage_supported and "stream_options" in str(e):
-                self._usage_supported = False
-                kwargs.pop("stream_options", None)
-                stream = self._api_call(**kwargs)
-            else:
+            stream = self._request_stream(kwargs)
+        except Exception as exc:
+            if getattr(exc, "status_code", None) != 413:
                 raise
+            before = estimate_tokens(self.messages)
+            compacted, changed = maybe_compact(
+                self.messages, self.client, self.model,
+                max_tokens=8000, keep_recent=6, force=True, summarize=False)
+            if not changed:
+                self._record_activity("ERROR", "Context overflow; no older turns were available to compact")
+                raise
+            self.messages = compacted
+            kwargs["messages"] = self.messages
+            after = estimate_tokens(self.messages)
+            self._record_activity(
+                "COMPACT", f"HTTP 413: trimmed context estimate from ~{before:,} to ~{after:,} tokens; retrying once")
+            if self.verbose:
+                self._print(f"\n[niji] request was too large; compacted older context (~{before:,} → ~{after:,} estimated tokens), retrying once")
+            stream = self._request_stream(kwargs)
 
         text_parts, tool_acc = [], {}
         for chunk in stream:

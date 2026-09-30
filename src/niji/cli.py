@@ -54,6 +54,8 @@ def _activity_notice(event):
         console.print(f"[bold yellow]⏸ {message}[/]")
     elif level == "PLAN":
         console.print(f"[bold cyan]⚙ {message}[/]")
+    elif level == "COMPACT":
+        console.print(f"[bold yellow]↘ {message}[/]")
     elif level == "TOOL":
         console.print(f"[bold cyan]⚒ {message}[/]")
     elif level == "TOOL_DONE":
@@ -178,7 +180,12 @@ def _activate_model(agent, provider, name, model_id):
                               title="Model chat check did not pass", border_style="yellow"))
         match = re.search(r"\b(401|403|404)\b", message)
         if match:
-            Console().print("[dim]This model/key was explicitly rejected; the current model stays active.[/]")
+            current = f"{agent.provider_name}/{agent.model}"
+            Console().print(f"[bold yellow]Model was NOT switched. Niji is still using {current}.[/]")
+            if match.group(1) in ("401", "403"):
+                Console().print("[dim]Fix/re-enter the selected provider key or confirm model access with `/setup`, then try `/model` again.[/]")
+            else:
+                Console().print("[dim]Choose a valid model ID in `/model`, then try again.[/]")
             return False
         apply_anyway = Prompt.ask(
             "Switch to this model without a successful chat test?",
@@ -252,8 +259,15 @@ def _interactive_model_picker(agent, provider, provider_name=None, requested_mod
 
     model_ids, catalog_message = fetch_provider_models(provider_cfg)
     if requested_model is None and model_ids:
-        choices = [(model_id, model_id + (" · current" if model_id == provider_cfg.get("model") else ""))
-                   for model_id in model_ids]
+        choices = []
+        for model_id in model_ids:
+            if name == agent.provider_name and model_id == agent.model:
+                marker = " · active session model"
+            elif model_id == provider_cfg.get("model"):
+                marker = " · saved for this provider"
+            else:
+                marker = ""
+            choices.append((model_id, model_id + marker))
         choices.append(("__manual__", "Enter a model ID manually…"))
         selected = next((i for i, model_id in enumerate(model_ids)
                          if model_id == provider_cfg.get("model")), 0)
@@ -394,6 +408,33 @@ def _render_home(agent, provider, quiet=False):
     render_home(agent, provider, quiet=quiet)
 
 
+def _show_context(agent):
+    from .compaction import estimate_tokens
+    messages = list(getattr(agent, "messages", []) or [])
+    table = Table(title="Prompt context estimate", show_header=True, header_style="bold cyan")
+    table.add_column("Role", style="green")
+    table.add_column("Msgs", justify="right")
+    table.add_column("Chars", justify="right")
+    table.add_column("≈ Tokens", justify="right")
+    totals = {}
+    for message in messages:
+        role = str(message.get("role", "other"))
+        content = message.get("content") or ""
+        chars = len(str(content))
+        if message.get("tool_calls"):
+            chars += len(json.dumps(message["tool_calls"], default=str))
+        row = totals.setdefault(role, [0, 0])
+        row[0] += 1
+        row[1] += chars
+    for role, (count, chars) in sorted(totals.items()):
+        table.add_row(role, str(count), f"{chars:,}", f"~{chars // 4:,}")
+    table.add_row("TOTAL", str(len(messages)),
+                  f"{sum(row[1] for row in totals.values()):,}",
+                  f"~{estimate_tokens(messages):,}")
+    Console().print(table)
+    Console().print("[dim]Approximation from message text only; provider tokenizers, tool schemas, and request overhead differ.[/]")
+
+
 def _show_activity(agent):
     table = Table(title="Niji activity feed", show_header=True, header_style="bold cyan")
     table.add_column("Time", style="dim", no_wrap=True)
@@ -419,6 +460,7 @@ def _show_help():
         ("/tools", "List built-in and connected MCP tools"),
         ("/activity", "Show recent thinking/execution phases and tool outcomes"),
         ("/limits", "Show turn/tool-call limits for this request"),
+        ("/context", "Show approximate prompt size and message breakdown for 413 debugging"),
         ("/model", "Browse providers and their available models; switch for this session"),
         ("/models", "List model catalogs for configured providers"),
         ("/approval", "Toggle auto/ask confirmation mode for tool execution"),
@@ -476,7 +518,9 @@ def _show_provider_error(provider, exc):
     elif status in (400, 422):
         detail = "The provider rejected the request (HTTP %s). This is usually an unsupported model/request option. Choose a chat/text model with `/model`; do not auto-retry the same request." % status
     elif status == 413:
-        detail = "Request too large (HTTP 413). Run `/compact` to shrink chat context, then retry with a smaller task or context-window model."
+        detail = ("Request too large (HTTP 413). Niji now tries one bounded automatic trim of older chat context. "
+                  "If this still appears, run `/compact`, shorten the current prompt or large pasted output, "
+                  "or switch to a model with a larger context window. A single oversized current message cannot be compacted away.")
     elif status == 429 and any(word in lower for word in ("quota", "billing", "credit", "payment", "insufficient_balance")):
         detail = "Provider quota/credit is exhausted (HTTP 429); waiting/retrying will not fix billing. Check account credits/limits or switch provider with `/model`."
     elif status == 429:
@@ -569,6 +613,9 @@ def _interactive_chat(agent, provider, quiet=False):
             table.add_row("Shell command timeout", "max 120 seconds")
             table.add_row("Provider retry", "one retry, transient errors only")
             Console().print(table)
+            continue
+        if user == "/context":
+            _show_context(agent)
             continue
         if user == "/cost":
             console.print(agent.cost_line())

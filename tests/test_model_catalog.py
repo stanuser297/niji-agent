@@ -114,6 +114,31 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual(cfg["provider"], "openai")
         save.assert_called_once_with(cfg)
 
+    def test_auth_rejected_model_switch_explains_current_model_stays_active(self):
+        cfg = {"api_keys": {"nvidia": "saved-key"}, "models": {},
+               "custom_providers": {}}
+        provider_cfg = {"provider": "nvidia", "base_url": "https://example.test/v1",
+                        "api_key": "saved-key", "model": "z-ai/glm-5.3-flash"}
+        class Agent:
+            model = "openai/gpt-oss-120b"
+            provider_name = "groq"
+        agent = Agent()
+        provider = {"provider": "groq", "model": "openai/gpt-oss-120b"}
+        output = io.StringIO()
+        with ExitStack() as stack:
+            stack.enter_context(patch("niji.cli.resolve_provider", return_value=provider_cfg))
+            stack.enter_context(patch("niji.setup_wizard.test_connection",
+                                      return_value=(False, "HTTP 403 Authorization failed")))
+            stack.enter_context(patch("niji.cli.Console",
+                                      return_value=Console(file=output, color_system=None)))
+            save = stack.enter_context(patch("niji.cli.save_config"))
+            applied = _activate_model(agent, provider, "nvidia", "z-ai/glm-5.3-flash")
+        self.assertFalse(applied)
+        self.assertIn("Model was NOT switched", output.getvalue())
+        self.assertIn("groq/openai/gpt-oss-120b", output.getvalue())
+        self.assertIn("/setup", output.getvalue())
+        save.assert_not_called()
+
     def test_arrow_menu_fallback_uses_provider_name_not_an_index(self):
         fake_stdin = types.SimpleNamespace(isatty=lambda: False)
         fake_stdout = types.SimpleNamespace(isatty=lambda: False)

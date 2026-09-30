@@ -203,6 +203,16 @@ class ProviderErrorGuidanceTests(unittest.TestCase):
         self.assertIn("billing", text)
         self.assertNotIn("sekrit", text)
 
+    def test_413_guides_bounded_auto_compaction_and_prompt_reduction(self):
+        output = __import__("io").StringIO()
+        error = FakeStatusError(413, "too large")
+        with patch("niji.cli.Console", return_value=Console(file=output, color_system=None, stderr=True)):
+            _show_provider_error({"provider": "test", "api_key": "secret"}, error)
+        text = output.getvalue()
+        self.assertIn("automatic trim", text)
+        self.assertIn("/compact", text)
+        self.assertNotIn("secret", text)
+
     def test_404_guides_model_change_without_blind_retry(self):
         output = __import__("io").StringIO()
         error = FakeStatusError(404, "model not found")

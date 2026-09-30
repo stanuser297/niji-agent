@@ -9,6 +9,8 @@ from rich.console import Console
 from rich.prompt import Prompt
 from wcwidth import wcswidth
 
+from .compaction import estimate_tokens
+
 _history = []
 
 # Niji identity: cyan and violet with a small warm amber highlight.
@@ -120,8 +122,10 @@ def _visible_input(value, cursor, cells):
 def _fields(agent, provider):
     usage = getattr(agent, "usage", {}) or {}
     tokens = int(usage.get("prompt_tokens", 0) or 0) + int(usage.get("completion_tokens", 0) or 0)
-    messages = len(getattr(agent, "messages", []))
-    context = f"{tokens:,} tok" if tokens else f"{messages} msgs"
+    conversation = getattr(agent, "messages", []) or []
+    messages = len(conversation)
+    context_size = estimate_tokens(conversation)
+    context = f"~{context_size:,} tok" if context_size else f"{messages} msgs"
     tools = sum((getattr(agent, "tool_usage", {}) or {}).values())
     seconds = getattr(agent, "request_seconds", None)
     if seconds is None:

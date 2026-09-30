@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from rich.console import Console
 
-from niji.cli import _interactive_chat
+from niji.cli import _interactive_chat, _show_context
 
 
 class FakeAgent:
@@ -20,6 +20,21 @@ class FakeAgent:
 
 
 class InteractiveChatTests(unittest.TestCase):
+    def test_context_command_shows_approximate_breakdown_without_message_contents(self):
+        output = io.StringIO()
+        console = Console(file=output, force_terminal=False, color_system=None)
+        agent = type("Agent", (), {"messages": [
+            {"role": "system", "content": "private text"},
+            {"role": "user", "content": "user prompt"},
+        ]})()
+        with patch("niji.cli.Console", return_value=console):
+            _show_context(agent)
+        text = output.getvalue()
+        self.assertIn("Approximation", text)
+        self.assertIn("system", text)
+        self.assertIn("user", text)
+        self.assertNotIn("private text", text)
+
     def test_user_message_is_written_above_pinned_composer(self):
         output = io.StringIO()
         console = Console(file=output, force_terminal=False, color_system=None)

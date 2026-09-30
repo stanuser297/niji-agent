@@ -52,6 +52,12 @@ class ChatPromptTests(unittest.TestCase):
         self.assertTrue(rendered.endswith(f"\x1b[{panel_top + 1};10H"))
         self.assertNotIn("\x1b[1A", rendered)
 
+    def test_context_field_is_estimated_from_messages_not_cumulative_usage(self):
+        self.agent.messages = [{"role": "user", "content": "x" * 4000}]
+        fields = dict(_fields(self.agent, self.provider))
+        self.assertEqual(fields["CONTEXT"], "~1,000 tok")
+        self.assertEqual(fields["TOKENS"], "1,555")
+
     def test_brand_input_and_footer_fit_narrow_and_wide_terminals(self):
         for width in (48, 56, 80, 120, 180):
             with self.subTest(width=width):
