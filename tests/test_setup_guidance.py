@@ -1,13 +1,35 @@
 import io
 import unittest
+from contextlib import ExitStack
 from unittest.mock import patch
 
 from rich.console import Console
 
-from niji.setup_wizard import _connection_guidance, run_setup
+from niji.setup_wizard import _connection_guidance, _read_secret, run_setup
 
 
 class ConnectionGuidanceTests(unittest.TestCase):
+    def test_hidden_key_entry_does_not_echo_key(self):
+        output = io.StringIO()
+        with ExitStack() as stack:
+            stack.enter_context(patch("niji.setup_wizard.getpass.getpass", return_value="nvapi-secret"))
+            stack.enter_context(patch("niji.setup_wizard.console", Console(file=output, color_system=None)))
+            value = _read_secret("API key")
+        self.assertEqual(value, "nvapi-secret")
+        self.assertNotIn("nvapi-secret", output.getvalue())
+        self.assertIn("long-press", output.getvalue())
+
+    def test_empty_hidden_paste_offers_opt_in_visible_retry(self):
+        output = io.StringIO()
+        with ExitStack() as stack:
+            stack.enter_context(patch("niji.setup_wizard.getpass.getpass", return_value=""))
+            prompt = stack.enter_context(patch(
+                "niji.setup_wizard.Prompt.ask", side_effect=["y", "nvapi-visible"]))
+            stack.enter_context(patch("niji.setup_wizard.console", Console(file=output, color_system=None)))
+            value = _read_secret("API key")
+        self.assertEqual(value, "nvapi-visible")
+        self.assertIn("will show on screen", prompt.call_args_list[0].args[0])
+
     def test_nvidia_403_is_identified_as_auth_not_model_typo(self):
         hint = _connection_guidance(
             {"base_url": "https://integrate.api.nvidia.com/v1"},
@@ -39,16 +61,19 @@ class ConnectionGuidanceTests(unittest.TestCase):
         output = io.StringIO()
         provider_result = {"provider": "nvidia", "base_url": "https://integrate.api.nvidia.com/v1",
                            "api_key": "accepted-key", "model": "z-ai/glm-5.3-flash"}
-        with patch("niji.config.load_config", return_value=cfg), \
-             patch("niji.config.resolve_provider", return_value=provider_result), \
-             patch("niji.config.save_config") as save, \
-             patch("niji.setup_wizard._ask_key", return_value="rejected-key"), \
-             patch("niji.setup_wizard._read_replacement_key", return_value="accepted-key"), \
-             patch("niji.setup_wizard.test_connection", side_effect=[
-                 (False, "Error code: 403 - Authorization failed"),
-                 (True, "chat endpoint OK")]), \
-             patch("niji.setup_wizard.Prompt.ask", side_effect=["9", "z-ai/glm-5.3-flash", "y"]), \
-             patch("niji.setup_wizard.console", Console(file=output, width=72, color_system=None)):
+        with ExitStack() as stack:
+            stack.enter_context(patch("niji.config.load_config", return_value=cfg))
+            stack.enter_context(patch("niji.config.resolve_provider", return_value=provider_result))
+            save = stack.enter_context(patch("niji.config.save_config"))
+            stack.enter_context(patch("niji.setup_wizard._ask_key", return_value="rejected-key"))
+            stack.enter_context(patch("niji.setup_wizard._read_replacement_key", return_value="accepted-key"))
+            stack.enter_context(patch("niji.setup_wizard.test_connection", side_effect=[
+                (False, "Error code: 403 - Authorization failed"),
+                (True, "chat endpoint OK")]))
+            stack.enter_context(patch("niji.setup_wizard.Prompt.ask",
+                                      side_effect=["9", "z-ai/glm-5.3-flash", "y"]))
+            stack.enter_context(patch("niji.setup_wizard.console",
+                                      Console(file=output, width=72, color_system=None)))
             result = run_setup()
         self.assertEqual(result["api_key"], "accepted-key")
         self.assertEqual(cfg["api_keys"]["nvidia"], "accepted-key")
@@ -59,16 +84,19 @@ class ConnectionGuidanceTests(unittest.TestCase):
     def test_failed_authorization_keeps_saved_key_unchanged(self):
         cfg = {"provider": "nvidia", "api_keys": {"nvidia": "rejected-key"},
                "models": {"nvidia": "z-ai/glm-5.3-flash"}}
-        with patch("niji.config.load_config", return_value=cfg), \
-             patch("niji.config.resolve_provider", return_value={
-                 "provider": "nvidia", "base_url": "https://integrate.api.nvidia.com/v1",
-                 "api_key": "rejected-key", "model": "z-ai/glm-5.3-flash"}), \
-             patch("niji.config.save_config") as save, \
-             patch("niji.setup_wizard._ask_key", return_value="rejected-key"), \
-             patch("niji.setup_wizard.test_connection", return_value=(
-                 False, "Error code: 403 - Authorization failed")), \
-             patch("niji.setup_wizard.Prompt.ask", side_effect=["9", "z-ai/glm-5.3-flash", "n"]), \
-             patch("niji.setup_wizard.console", Console(file=io.StringIO(), width=72, color_system=None)):
+        with ExitStack() as stack:
+            stack.enter_context(patch("niji.config.load_config", return_value=cfg))
+            stack.enter_context(patch("niji.config.resolve_provider", return_value={
+                "provider": "nvidia", "base_url": "https://integrate.api.nvidia.com/v1",
+                "api_key": "rejected-key", "model": "z-ai/glm-5.3-flash"}))
+            save = stack.enter_context(patch("niji.config.save_config"))
+            stack.enter_context(patch("niji.setup_wizard._ask_key", return_value="rejected-key"))
+            stack.enter_context(patch("niji.setup_wizard.test_connection", return_value=(
+                False, "Error code: 403 - Authorization failed")))
+            stack.enter_context(patch("niji.setup_wizard.Prompt.ask",
+                                      side_effect=["9", "z-ai/glm-5.3-flash", "n"]))
+            stack.enter_context(patch("niji.setup_wizard.console",
+                                      Console(file=io.StringIO(), width=72, color_system=None)))
             with self.assertRaises(SystemExit):
                 run_setup()
         save.assert_not_called()

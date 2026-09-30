@@ -2,6 +2,7 @@
 import getpass
 import os
 import re
+import warnings
 from urllib.parse import urlparse
 
 from rich.console import Console
@@ -76,6 +77,33 @@ def test_connection(provider_cfg: dict):
         return False, str(e)[:300]
 
 
+def _read_secret(label: str, allow_blank: bool = False):
+    """Read a secret safely, explaining hidden paste and offering an opt-in fallback."""
+    console.print("[dim]Key input is hidden; no letters or dots will appear. On Android, "
+                  "long-press the terminal and choose Paste, then press Enter.[/]")
+    warnings_seen = []
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", getpass.GetPassWarning)
+            raw = getpass.getpass(label + ": ")
+            warnings_seen = caught
+    except Exception:
+        raw = ""
+    if warnings_seen:
+        console.print("[yellow]This terminal cannot hide password input; it may have been echoed.[/]")
+    raw = raw.strip()
+    if raw:
+        return raw
+    if allow_blank:
+        retry_text = "No key was received. If you meant to paste one, retry with visible input?"
+    else:
+        retry_text = "No key was received. Retry once with visible input?"
+    retry = Prompt.ask(retry_text + " The key will show on screen", choices=["y", "n"], default="n")
+    if retry == "y":
+        return Prompt.ask("API key (visible on screen)").strip() or None
+    return None
+
+
 def _ask_key(provider_name: str, env_key: str | None, stored_key: str | None = None):
     if not env_key:
         return None
@@ -90,11 +118,7 @@ def _ask_key(provider_name: str, env_key: str | None, stored_key: str | None = N
                          choices=["y", "n"], default="y")
         if use == "y":
             return stored_key
-    try:
-        raw = getpass.getpass(f"Paste your {provider_name} API key (input hidden): ")
-    except Exception:
-        raw = input(f"Paste your {provider_name} API key: ")
-    return raw.strip() or None
+    return _read_secret(f"Paste your {provider_name} API key (hidden)")
 
 
 def _wizard_custom_provider():
@@ -107,10 +131,7 @@ def _wizard_custom_provider():
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise SystemExit("Base URL must start with http:// or https:// and include a host.")
     model = Prompt.ask("Default model", default="default").strip()
-    try:
-        key = getpass.getpass("API key (Enter to skip): ").strip() or None
-    except Exception:
-        key = input("API key (Enter to skip): ").strip() or None
+    key = _read_secret("API key (optional for local/no-auth endpoints)", allow_blank=True)
     return name, {"base_url": base_url, "model": model, "api_key": key}
 
 
@@ -138,10 +159,7 @@ def _connection_guidance(provider_cfg: dict, message: str) -> str:
 
 
 def _read_replacement_key(provider_name: str) -> str:
-    try:
-        return getpass.getpass(f"Paste the replacement {provider_name} API key (input hidden): ").strip()
-    except Exception:
-        return input(f"Paste the replacement {provider_name} API key: ").strip()
+    return _read_secret(f"Paste the replacement {provider_name} API key (hidden)") or ""
 
 
 def run_setup(default_model: str | None = None,
