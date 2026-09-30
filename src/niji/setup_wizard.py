@@ -8,8 +8,6 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
 
-from . import __version__
-
 console = Console()
 
 WIZARD_PROVIDERS = [
@@ -24,10 +22,6 @@ WIZARD_PROVIDERS = [
     ("nvidia", "NVIDIA NIM (GLM 5.3 Flash and more)"),
 ]
 
-BANNER = (
-    f"[bold cyan]niji-agent[/] [dim]v{__version__}[/] — provider-agnostic coding agent\n"
-    "[dim]MCP connectors • subagents • memory • planning • diagnostics[/]"
-)
 
 
 def needs_setup(provider_name: str | None = None, api_key: str | None = None) -> bool:
@@ -120,11 +114,42 @@ def _wizard_custom_provider():
     return name, {"base_url": base_url, "model": model, "api_key": key}
 
 
+def _connection_guidance(provider_cfg: dict, message: str) -> str:
+    """Turn common provider failures into actionable, provider-aware guidance."""
+    text = message.lower()
+    status = next((code for code in (401, 403, 404, 429) if str(code) in text), None)
+    nvidia = "nvidia.com" in provider_cfg.get("base_url", "")
+    if status in (401, 403):
+        if nvidia:
+            return ("NVIDIA denied this key or its access (HTTP %s). This is an authorization issue, "
+                    "not a Niji branding problem; a wrong model usually returns 404. Choose `n` to "
+                    "replace the saved key with an NVIDIA NIM API key, and check that your NVIDIA "
+                    "account is allowed to use this model. The key is never shown on screen." % status)
+        return (f"The provider denied this API key or its account access (HTTP {status}). "
+                "Replace it with a key for this provider and confirm the account has API access.")
+    if status == 404 and nvidia:
+        return ("NVIDIA could not find this model or route (HTTP 404). For GLM 5.3 Flash the model "
+                "ID is `z-ai/glm-5.3-flash` (dots, not hyphens).")
+    if status == 404:
+        return "The provider could not find this model or API route (HTTP 404). Check the base URL and exact model ID."
+    if status == 429:
+        return "The provider quota or rate limit was reached (HTTP 429). Check billing/quota and retry later."
+    return "The connection test failed. Check network/DNS, API base URL, and model name."
+
+
+def _read_replacement_key(provider_name: str) -> str:
+    try:
+        return getpass.getpass(f"Paste the replacement {provider_name} API key (input hidden): ").strip()
+    except Exception:
+        return input(f"Paste the replacement {provider_name} API key: ").strip()
+
+
 def run_setup(default_model: str | None = None,
               provider_name: str | None = None) -> dict:
     from .config import PRESETS, load_config, resolve_provider, save_config
+    from .ui import render_setup_banner
 
-    console.print(Panel.fit(BANNER, border_style="cyan"))
+    render_setup_banner(console)
     console.print("[bold]Welcome! Let's configure a provider.[/]\n")
     cfg = load_config()
     provider_names = [name for name, _ in WIZARD_PROVIDERS]
@@ -140,12 +165,16 @@ def run_setup(default_model: str | None = None,
     choice = Prompt.ask("> ", choices=[str(i) for i in range(1, 11)],
                         default=default_choice)
 
+    custom = None
+    key = None
     if choice == "10":
         name, custom = _wizard_custom_provider()
-        cfg.setdefault("custom_providers", {})[name] = custom
-        cfg["provider"] = name
-        save_config(cfg)
-        provider_cfg = resolve_provider(name, model=custom["model"])
+        provider_cfg = {
+            "provider": name,
+            "base_url": custom["base_url"],
+            "api_key": custom.get("api_key") or "custom",
+            "model": custom["model"],
+        }
     else:
         name = provider_names[int(choice) - 1]
         preset = PRESETS[name]
@@ -158,24 +187,45 @@ def run_setup(default_model: str | None = None,
             raise SystemExit("No API key entered. Run 'niji setup' again when ready.")
         default_m = default_model or cfg.get("models", {}).get(name) or preset["model"]
         model = Prompt.ask("Default model", default=default_m).strip()
-        if key:
-            cfg.setdefault("api_keys", {})[name] = key
-        # A named preset supersedes an older custom-provider entry of the same name.
-        cfg.setdefault("custom_providers", {}).pop(name, None)
-        cfg["provider"] = name
-        cfg.setdefault("models", {})[name] = model
-        save_config(cfg)
-        provider_cfg = resolve_provider(name, model=model)
+        provider_cfg = resolve_provider(name, model=model, api_key=key)
 
     with console.status("[cyan]Testing provider connection...[/]"):
         ok, msg = test_connection(provider_cfg)
-    if ok:
-        console.print(f"[green]✓ Connected[/] — {provider_cfg['provider']}/"
-                      f"{provider_cfg['model']} ({msg})")
-    else:
-        console.print(f"[red]Connection test failed:[/] {msg}")
-        if "nvidia.com" in provider_cfg.get("base_url", "") and "404" in msg:
-            console.print("[yellow]NVIDIA GLM 5.3 Flash model ID: z-ai/glm-5.3-flash (dots, not hyphens).[/]")
-        console.print("Check the key/model/network, then run: niji setup")
+
+    if not ok and choice != "10" and preset.get("env_key") and any(
+            code in msg for code in ("401", "403")):
+        console.print(Panel(_connection_guidance(provider_cfg, msg),
+                            title="[bold yellow]Key or provider access denied[/]",
+                            border_style="yellow"))
+        replace = Prompt.ask("Replace the saved key and test again? (input stays hidden)",
+                             choices=["y", "n"], default="y")
+        if replace == "y":
+            replacement = _read_replacement_key(name)
+            if replacement:
+                key = replacement
+                provider_cfg = resolve_provider(name, model=provider_cfg["model"],
+                                                api_key=key)
+                with console.status("[cyan]Retrying provider connection...[/]"):
+                    ok, msg = test_connection(provider_cfg)
+
+    if not ok:
+        console.print(Panel(_connection_guidance(provider_cfg, msg),
+                            title="[bold red]Niji setup needs attention[/]",
+                            border_style="red"))
+        console.print("Your existing saved settings were not overwritten by this failed test.")
+        console.print("When ready, run: niji setup")
         raise SystemExit("Provider is not ready; chat was not started.")
+
+    if custom is not None:
+        cfg.setdefault("custom_providers", {})[name] = custom
+        cfg["provider"] = name
+    else:
+        if key:
+            cfg.setdefault("api_keys", {})[name] = key
+        cfg.setdefault("custom_providers", {}).pop(name, None)
+        cfg["provider"] = name
+        cfg.setdefault("models", {})[name] = provider_cfg["model"]
+    save_config(cfg)
+    console.print(f"[green]✓ Connected[/] — {provider_cfg['provider']}/"
+                  f"{provider_cfg['model']} ({msg})")
     return provider_cfg

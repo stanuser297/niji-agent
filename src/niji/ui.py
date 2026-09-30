@@ -53,6 +53,14 @@ def _status_panel(agent, provider, width: int) -> Panel:
                  border_style="bright_blue", padding=(1, 2))
 
 
+def render_setup_banner(console=None):
+    """Show the Niji identity before setup or connection checks begin."""
+    console = console or Console()
+    console.print(_brand_panel())
+    console.print(Text("First, connect your AI provider. The API key is stored locally.",
+                       style="dim"))
+
+
 def render_home(agent, provider, quiet=False, console=None):
     """Render Niji's branded home screen, stacking panels on narrow terminals."""
     if quiet:

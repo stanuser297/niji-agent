@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.2.0
+# Niji Agent 🌈 — v2.2.1
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -15,6 +15,12 @@ niji
 Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, enter its API key (hidden while typing), and choose a model. The key is saved locally in `~/.niji/config.json` with private file permissions—no `export` command is needed. Ollama can be used without an API key.
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
+
+## What's new in 2.2.1
+
+- Branded Niji dashboard is visible during setup too, including provider-test failures
+- NVIDIA 401/403 failures explain that authorization/key access was denied and offer a hidden-key replacement retry
+- Failed connection tests do not overwrite working saved provider settings
 
 ## What's new in 2.0
 

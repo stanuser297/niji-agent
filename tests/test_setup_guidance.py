@@ -1,0 +1,79 @@
+import io
+import unittest
+from unittest.mock import patch
+
+from rich.console import Console
+
+from niji.setup_wizard import _connection_guidance, run_setup
+
+
+class ConnectionGuidanceTests(unittest.TestCase):
+    def test_nvidia_403_is_identified_as_auth_not_model_typo(self):
+        hint = _connection_guidance(
+            {"base_url": "https://integrate.api.nvidia.com/v1"},
+            "Error code: 403 - {'detail': 'Authorization failed'}",
+        )
+        self.assertIn("authorization", hint.lower())
+        self.assertIn("not a Niji branding problem", hint)
+        self.assertIn("NVIDIA NIM API key", hint)
+        self.assertIn("wrong model usually returns 404", hint)
+
+    def test_nvidia_404_recommends_exact_glm_model(self):
+        hint = _connection_guidance(
+            {"base_url": "https://integrate.api.nvidia.com/v1"},
+            "Error code: 404 - model not found",
+        )
+        self.assertIn("z-ai/glm-5.3-flash", hint)
+
+    def test_other_provider_auth_failure_is_actionable(self):
+        hint = _connection_guidance(
+            {"base_url": "https://api.openai.com/v1"},
+            "Error code: 401 - Unauthorized",
+        )
+        self.assertIn("denied", hint.lower())
+        self.assertIn("replace", hint.lower())
+
+    def test_setup_offers_hidden_key_retry_and_saves_only_valid_key(self):
+        cfg = {"provider": "nvidia", "api_keys": {"nvidia": "rejected-key"},
+               "models": {"nvidia": "z-ai/glm-5.3-flash"}}
+        output = io.StringIO()
+        provider_result = {"provider": "nvidia", "base_url": "https://integrate.api.nvidia.com/v1",
+                           "api_key": "accepted-key", "model": "z-ai/glm-5.3-flash"}
+        with patch("niji.config.load_config", return_value=cfg), \
+             patch("niji.config.resolve_provider", return_value=provider_result), \
+             patch("niji.config.save_config") as save, \
+             patch("niji.setup_wizard._ask_key", return_value="rejected-key"), \
+             patch("niji.setup_wizard._read_replacement_key", return_value="accepted-key"), \
+             patch("niji.setup_wizard.test_connection", side_effect=[
+                 (False, "Error code: 403 - Authorization failed"),
+                 (True, "chat endpoint OK")]), \
+             patch("niji.setup_wizard.Prompt.ask", side_effect=["9", "z-ai/glm-5.3-flash", "y"]), \
+             patch("niji.setup_wizard.console", Console(file=output, width=72, color_system=None)):
+            result = run_setup()
+        self.assertEqual(result["api_key"], "accepted-key")
+        self.assertEqual(cfg["api_keys"]["nvidia"], "accepted-key")
+        save.assert_called_once_with(cfg)
+        self.assertIn("N I J I", output.getvalue())
+        self.assertIn("Connected", output.getvalue())
+
+    def test_failed_authorization_keeps_saved_key_unchanged(self):
+        cfg = {"provider": "nvidia", "api_keys": {"nvidia": "rejected-key"},
+               "models": {"nvidia": "z-ai/glm-5.3-flash"}}
+        with patch("niji.config.load_config", return_value=cfg), \
+             patch("niji.config.resolve_provider", return_value={
+                 "provider": "nvidia", "base_url": "https://integrate.api.nvidia.com/v1",
+                 "api_key": "rejected-key", "model": "z-ai/glm-5.3-flash"}), \
+             patch("niji.config.save_config") as save, \
+             patch("niji.setup_wizard._ask_key", return_value="rejected-key"), \
+             patch("niji.setup_wizard.test_connection", return_value=(
+                 False, "Error code: 403 - Authorization failed")), \
+             patch("niji.setup_wizard.Prompt.ask", side_effect=["9", "z-ai/glm-5.3-flash", "n"]), \
+             patch("niji.setup_wizard.console", Console(file=io.StringIO(), width=72, color_system=None)):
+            with self.assertRaises(SystemExit):
+                run_setup()
+        save.assert_not_called()
+        self.assertEqual(cfg["api_keys"]["nvidia"], "rejected-key")
+
+
+if __name__ == "__main__":
+    unittest.main()
