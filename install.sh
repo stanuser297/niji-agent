@@ -17,7 +17,14 @@ if ! command -v git >/dev/null 2>&1; then
     exit 1
 fi
 
+# Remove an older install first, then install the current branch with its pinned dependencies.
+"$PYTHON" -m pip uninstall -y niji-agent >/dev/null 2>&1 || true
 "$PYTHON" -m pip install --upgrade --force-reinstall --no-cache-dir "$REPO"
-"$PYTHON" -c 'from importlib.metadata import version; print("Installed niji-agent", version("niji-agent"))'
+"$PYTHON" -c 'import niji, niji.setup_wizard; from importlib.metadata import version; v=version("niji-agent"); assert v == "2.0.0", f"expected 2.0.0, got {v}"; print("Installed niji-agent", v, "from", niji.__file__)'
 
-echo "Installation complete. Start the first-run setup with: niji"
+echo "Installation complete. Launching niji setup/chat..."
+if [ -r /dev/tty ]; then
+    "$PYTHON" -m niji </dev/tty
+else
+    echo "No interactive terminal detected. Run: niji"
+fi
