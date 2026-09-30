@@ -110,6 +110,18 @@ class ChatPromptTests(unittest.TestCase):
     def test_interactive_composer_handles_bracketed_clipboard_paste(self):
         self._run_pty_prompt([b"\x1b[200~hello world\x1b[201~", b"\r"], "RESULT='hello world'")
 
+    def test_cursor_editing_inserts_at_middle_of_message(self):
+        self._run_pty_prompt([b"helo", b"\x1b[D", b"l\r"], "RESULT='hello'")
+
+    def test_backspace_removes_previous_character_after_cursor_move(self):
+        self._run_pty_prompt([b"hello", b"\x1b[D", b"\x7f\r"], "RESULT='helo'")
+
+    def test_delete_removes_next_character_after_cursor_move(self):
+        self._run_pty_prompt([b"hello", b"\x1b[D", b"\x1b[3~\r"], "RESULT='hell'")
+
+    def test_backspace_removes_whole_emoji_cluster(self):
+        self._run_pty_prompt(["A😀B".encode(), b"\x1b[D", b"\x7f\r"], "RESULT='AB'")
+
     def test_control_d_exits_cleanly_from_empty_prompt(self):
         self._run_pty_prompt([b"\x04"], "RESULT=None")
 

@@ -575,7 +575,11 @@ def _interactive_chat(agent, provider, quiet=False):
             continue
         request_started = time.monotonic()
         try:
-            console.print("\n[bold green]niji ❯[/]")
+            # Keep each user turn in the scrollback above the pinned composer;
+            # the editor itself is intentionally cleared for the next prompt.
+            console.print()
+            console.print(Text.assemble(("you ❯ ", "bold cyan"), (user, "white")))
+            console.print(Text("niji ❯", style="bold magenta"))
             agent.chat(user)
             if not quiet:
                 console.print(f"[dim]{agent.cost_line()}[/]")

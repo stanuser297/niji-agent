@@ -4,6 +4,7 @@ import select
 import shutil
 import sys
 import time
+import unicodedata
 from rich.console import Console
 from rich.prompt import Prompt
 from wcwidth import wcswidth
@@ -37,6 +38,83 @@ def _clip(value, cells):
             break
         out += char
     return out + "…"
+
+
+def _is_grapheme_extend(char):
+    code = ord(char)
+    return (unicodedata.category(char).startswith("M") or char == "\u200d"
+            or 0xFE00 <= code <= 0xFE0F or 0xE0100 <= code <= 0xE01EF
+            or 0x1F3FB <= code <= 0x1F3FF or 0xE0020 <= code <= 0xE007F)
+
+
+def _grapheme_boundaries(value):
+    """Approximate Unicode grapheme boundaries for reliable terminal editing."""
+    if not value:
+        return [0]
+    boundaries = [0]
+    regional_run = 1 if 0x1F1E6 <= ord(value[0]) <= 0x1F1FF else 0
+    for index in range(1, len(value)):
+        previous, current = value[index - 1], value[index]
+        previous_name = unicodedata.name(previous, "")
+        is_regional = 0x1F1E6 <= ord(current) <= 0x1F1FF
+        join = (_is_grapheme_extend(current) or previous == "\u200d"
+                or "VIRAMA" in previous_name or "HALANT" in previous_name)
+        if 0x1F1E6 <= ord(previous) <= 0x1F1FF and is_regional:
+            join = regional_run % 2 == 1
+        if not join:
+            boundaries.append(index)
+        if is_regional:
+            regional_run = regional_run + 1 if 0x1F1E6 <= ord(previous) <= 0x1F1FF else 1
+        else:
+            regional_run = 0
+    boundaries.append(len(value))
+    return boundaries
+
+
+def _previous_boundary(value, cursor):
+    previous = 0
+    for boundary in _grapheme_boundaries(value):
+        if boundary >= cursor:
+            return previous
+        previous = boundary
+    return previous
+
+
+def _next_boundary(value, cursor):
+    for boundary in _grapheme_boundaries(value):
+        if boundary > cursor:
+            return boundary
+    return len(value)
+
+
+def _visible_input(value, cursor, cells):
+    """Build a cell-width-safe viewport while keeping the caret visible."""
+    bounds = _grapheme_boundaries(value)
+    cursor = min(max(cursor, 0), len(value))
+    left = cursor
+    while left > 0:
+        previous = _previous_boundary(value, left)
+        prefix_width = wcswidth(value[previous:cursor])
+        indicator_width = 1 if previous > 0 else 0
+        if prefix_width + indicator_width > cells:
+            break
+        left = previous
+    leading = "…" if left > 0 else ""
+    before_cursor = value[left:cursor]
+    display = leading + before_cursor
+    right = cursor
+    while right < len(value):
+        next_pos = _next_boundary(value, right)
+        part = value[right:next_pos]
+        remaining = value[next_pos:]
+        reserve = 1 if remaining else 0
+        if wcswidth(display + part) + reserve > cells:
+            break
+        display += part
+        right = next_pos
+    if right < len(value) and wcswidth(display + "…") <= cells:
+        display += "…"
+    return display, wcswidth(leading + before_cursor)
 
 
 def _fields(agent, provider):
@@ -136,18 +214,9 @@ def _prompt_lines(agent, provider, value, cursor, width, enabled=True):
     available = max(1, inner - wcswidth(prefix) - 1)
     placeholder = "Ask anything… (type your message here)"
     if value:
-        # Keep the caret visible when editing long requests by scrolling the input viewport.
-        start = max(0, cursor - available + 1)
-        if start and start < len(value):
-            start -= 1
-        visible_value = value[start:start + available]
-        visible_cursor = cursor - start
-        if start:
-            visible_value = "…" + visible_value[1:]
-            visible_cursor = max(0, visible_cursor)
-        visible_value = _clip(visible_value, available)
+        visible_value, visible_cursor = _visible_input(value, cursor, available)
         input_text = _paint(visible_value, _WHITE, enabled)
-        cursor_column = wcswidth(prefix) + max(0, min(visible_cursor, wcswidth(visible_value)))
+        cursor_column = wcswidth(prefix) + visible_cursor
     else:
         input_text = _paint(_clip(placeholder, available), _DIM, enabled)
         cursor_column = wcswidth(prefix)
@@ -304,9 +373,9 @@ def read_chat_prompt(agent, provider):
             if key == "\x1b":
                 action, pasted = _read_escape(fd)
                 if action == "LEFT":
-                    cursor = max(0, cursor - 1)
+                    cursor = _previous_boundary(buffer, cursor)
                 elif action == "RIGHT":
-                    cursor = min(len(buffer), cursor + 1)
+                    cursor = _next_boundary(buffer, cursor)
                 elif action == "HOME":
                     cursor = 0
                 elif action == "END":
@@ -341,8 +410,9 @@ def read_chat_prompt(agent, provider):
                 break
             elif key in ("\x7f", "\b"):
                 if cursor:
-                    buffer = buffer[:cursor - 1] + buffer[cursor:]
-                    cursor -= 1
+                    previous = _previous_boundary(buffer, cursor)
+                    buffer = buffer[:previous] + buffer[cursor:]
+                    cursor = previous
             elif key == "\x03":
                 raise KeyboardInterrupt
             elif key == "\x04":
@@ -352,7 +422,8 @@ def read_chat_prompt(agent, provider):
                     sys.stdout.flush()
                     break
                 if cursor < len(buffer):
-                    buffer = buffer[:cursor] + buffer[cursor + 1:]
+                    next_cursor = _next_boundary(buffer, cursor)
+                    buffer = buffer[:cursor] + buffer[next_cursor:]
             elif key == "\x01":
                 cursor = 0
             elif key == "\x05":
