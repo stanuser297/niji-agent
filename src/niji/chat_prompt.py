@@ -1,0 +1,370 @@
+"""Niji-branded, inline terminal chat composer and live session details bar."""
+import os
+import select
+import shutil
+import sys
+import time
+from rich.console import Console
+from rich.prompt import Prompt
+from wcwidth import wcswidth
+
+_history = []
+
+# Niji identity: cyan and violet with a small warm amber highlight.
+_CYAN = "\x1b[96m"
+_BLUE = "\x1b[94m"
+_VIOLET = "\x1b[95m"
+_AMBER = "\x1b[93m"
+_WHITE = "\x1b[97m"
+_DIM = "\x1b[2;37m"
+_RESET = "\x1b[0m"
+
+
+def _paint(value, color, enabled):
+    return f"{color}{value}{_RESET}" if enabled else value
+
+
+def _clip(value, cells):
+    """Clip a string to terminal cells, reserving the last cell for an ellipsis."""
+    value = str(value)
+    if wcswidth(value) <= cells:
+        return value
+    if cells <= 0:
+        return ""
+    out = ""
+    for char in value:
+        if wcswidth(out + char + "…") > cells:
+            break
+        out += char
+    return out + "…"
+
+
+def _fields(agent, provider):
+    usage = getattr(agent, "usage", {}) or {}
+    tokens = int(usage.get("prompt_tokens", 0) or 0) + int(usage.get("completion_tokens", 0) or 0)
+    messages = len(getattr(agent, "messages", []))
+    context = f"{tokens:,} tok" if tokens else f"{messages} msgs"
+    tools = sum((getattr(agent, "tool_usage", {}) or {}).values())
+    seconds = getattr(agent, "request_seconds", None)
+    if seconds is None:
+        started = getattr(agent, "started_at", None)
+        seconds = max(0, int(time.monotonic() - started)) if started else 0
+    seconds = max(0, int(seconds))
+    duration = f"{seconds // 60}m{seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
+    return [
+        ("MODEL", provider.get("model", getattr(agent, "model", "default"))),
+        ("PROVIDER", provider.get("provider", getattr(agent, "provider_name", "unknown"))),
+        ("CONTEXT", context),
+        ("AGENT", "Niji-Agent"),
+        ("RUNTIME", f"Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"),
+        ("TOKENS", f"{tokens:,}"),
+        ("TOOLS", str(tools)),
+        ("TIME", duration),
+    ]
+
+
+def _status_rows(agent, provider, width, enabled=True):
+    """Wrap the exact screenshot-inspired session fields for narrow Termux screens."""
+    inner = max(18, width - 2)
+    groups = []
+    current = []
+    current_width = 0
+    for label, value in _fields(agent, provider):
+        label_width = len(label)
+        allowance = max(5, inner - label_width - 5)
+        value = _clip(value, min(allowance, 32))
+        part_width = label_width + 1 + wcswidth(value)
+        candidate_width = current_width + (5 if current else 0) + part_width
+        if current and candidate_width > inner:
+            groups.append(current)
+            current, current_width = [], 0
+            candidate_width = part_width
+        current.append((label, value))
+        current_width = candidate_width
+    if current:
+        groups.append(current)
+
+    rows = []
+    for group in groups:
+        pieces = []
+        for label, value in group:
+            pieces.append(f"{_paint(label, _AMBER, enabled)} {_paint(value, _WHITE, enabled)}")
+        rows.append("  ·  ".join(pieces))
+    return rows
+
+
+def _frame(title, contents, width, enabled=True):
+    """Build a one-cell-safe rounded frame; `contents` may include ANSI colors."""
+    width = max(24, width)
+    inner = width - 2
+    title_text = f" {title} "
+    top_fill = max(0, inner - wcswidth(title_text) - 1)
+    top = "╭" + "─" + title_text + "─" * top_fill + "╮"
+    lines = [_paint(top, _CYAN, enabled)]
+    for content in contents:
+        visible = wcswidth(_strip_ansi(content))
+        room = inner
+        if visible > room:
+            # Clip plain text when possible; colored fragments are pre-sized by callers.
+            content = _clip(_strip_ansi(content), room)
+            visible = wcswidth(content)
+        line = "│" + content + " " * max(0, room - visible) + "│"
+        lines.append(_paint("│", _CYAN, enabled) + line[1:-1] + _paint("│", _CYAN, enabled))
+    bottom = "╰" + "─" * inner + "╯"
+    lines.append(_paint(bottom, _CYAN, enabled))
+    return lines
+
+
+def _strip_ansi(value):
+    # Generated styles use only SGR sequences, so a tiny parser avoids another dependency.
+    out = []
+    skip = False
+    for char in value:
+        if char == "\x1b":
+            skip = True
+        elif skip and char == "m":
+            skip = False
+        elif not skip:
+            out.append(char)
+    return "".join(out)
+
+
+def _prompt_lines(agent, provider, value, cursor, width, enabled=True):
+    width = max(24, width - 1)  # avoid terminal autowrap in the rightmost cell
+    inner = width - 2
+    prefix = " ❯ "
+    available = max(1, inner - wcswidth(prefix) - 1)
+    placeholder = "Ask anything… (type your message here)"
+    if value:
+        # Keep the caret visible when editing long requests by scrolling the input viewport.
+        start = max(0, cursor - available + 1)
+        if start and start < len(value):
+            start -= 1
+        visible_value = value[start:start + available]
+        visible_cursor = cursor - start
+        if start:
+            visible_value = "…" + visible_value[1:]
+            visible_cursor = max(0, visible_cursor)
+        visible_value = _clip(visible_value, available)
+        input_text = _paint(visible_value, _WHITE, enabled)
+        cursor_column = wcswidth(prefix) + max(0, min(visible_cursor, wcswidth(visible_value)))
+    else:
+        input_text = _paint(_clip(placeholder, available), _DIM, enabled)
+        cursor_column = wcswidth(prefix)
+    input_row = prefix + input_text + " "
+    rows = _frame("✧  NIJI  ·  CHAT", [input_row], width, enabled)
+    status_rows = _status_rows(agent, provider, width, enabled)
+    rows.extend(_frame("SESSION DETAILS", status_rows, width, enabled))
+    return rows, cursor_column, len(status_rows)
+
+
+def _write_prompt_frame(agent, provider, value, cursor, width, enabled=True, initial=False):
+    rows, cursor_column, status_count = _prompt_lines(agent, provider, value, cursor, width, enabled)
+    if not initial:
+        # Cursor starts on the input row: go to the frame top, then redraw in place.
+        sys.stdout.write("\x1b[1A\r")
+    sys.stdout.write("\r" + "\n".join(rows) + "\n")
+    # Return to the editable row, then position the caret after the prompt / current text.
+    sys.stdout.write(f"\x1b[{status_count + 2}A\r\x1b[{5 + cursor_column}G")
+    sys.stdout.flush()
+    return status_count
+
+
+def _read_char(fd):
+    first = os.read(fd, 1)
+    if not first:
+        return ""
+    lead = first[0]
+    size = 1 if lead < 0x80 else (2 if lead & 0xE0 == 0xC0 else 3 if lead & 0xF0 == 0xE0 else 4)
+    data = bytearray(first)
+    for _ in range(size - 1):
+        if not select.select([fd], [], [], 0.2)[0]:
+            break
+        data.extend(os.read(fd, 1))
+    return bytes(data).decode("utf-8", errors="replace")
+
+
+def _read_escape(fd):
+    """Read a CSI/SS3 key or bracketed-paste body from the controlling terminal."""
+    if not select.select([fd], [], [], 0.15)[0]:
+        return "ESC", ""
+    first = os.read(fd, 1)
+    if first not in (b"[", b"O"):
+        return "ESC", ""
+    prefix = first.decode("ascii")
+    sequence = ""
+    deadline = time.monotonic() + 0.2
+    while time.monotonic() < deadline:
+        if not select.select([fd], [], [], 0.04)[0]:
+            continue
+        byte = os.read(fd, 1)
+        if not byte:
+            break
+        char = byte.decode("ascii", errors="ignore")
+        sequence += char
+        if prefix == "[" and char and "@" <= char <= "~":
+            break
+        if prefix == "O":
+            break
+    if sequence == "200~":
+        pasted = bytearray()
+        marker = b"\x1b[201~"
+        tail = bytearray()
+        deadline = time.monotonic() + 2.0
+        while len(pasted) < 65536 and time.monotonic() < deadline:
+            if not select.select([fd], [], [], 0.1)[0]:
+                if pasted:
+                    break
+                continue
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            tail.extend(chunk)
+            position = tail.find(marker)
+            if position >= 0:
+                pasted.extend(tail[:position])
+                break
+            keep = min(len(tail), len(marker) - 1)
+            if len(tail) > keep:
+                pasted.extend(tail[:-keep])
+                del tail[:-keep]
+        return "PASTE", bytes(pasted).decode("utf-8", errors="replace").replace("\r", " ").replace("\n", " ")
+    final = sequence[-1:] if sequence else ""
+    if final == "A":
+        return "UP", ""
+    if final == "B":
+        return "DOWN", ""
+    if final == "C":
+        return "RIGHT", ""
+    if final == "D":
+        return "LEFT", ""
+    if final in ("H", "~") and (final == "H" or sequence.startswith("1~")):
+        return "HOME", ""
+    if final in ("F", "~") and (final == "F" or sequence.startswith("4~")):
+        return "END", ""
+    if final == "~" and sequence.startswith("3~"):
+        return "DELETE", ""
+    return "OTHER", ""
+
+
+def read_chat_prompt(agent, provider):
+    """Read one editable chat line inside a Niji frame with a live metrics footer."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        Console().print("[dim]Session: " + " · ".join(f"{k} {v}" for k, v in _fields(agent, provider)) + "[/]")
+        return Prompt.ask("you ❯").strip()
+    try:
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        previous = termios.tcgetattr(fd)
+    except (ImportError, OSError, AttributeError, ValueError):
+        return Prompt.ask("you ❯").strip()
+
+    width = max(24, shutil.get_terminal_size((80, 24)).columns)
+    enabled = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+    buffer = ""
+    cursor = 0
+    history_index = len(_history)
+    saved_current = ""
+    footer_count = 0
+    try:
+        tty.setcbreak(fd, termios.TCSANOW)
+        mode = termios.tcgetattr(fd)
+        mode[3] &= ~termios.ECHO
+        termios.tcsetattr(fd, termios.TCSANOW, mode)
+        sys.stdout.write("\x1b[?2004h")  # bracketed paste: safe multiline clipboard handling
+        sys.stdout.flush()
+        footer_count = _write_prompt_frame(agent, provider, buffer, cursor, width, enabled, initial=True)
+        while True:
+            key = _read_char(fd)
+            if not key:
+                result = None
+                sys.stdout.write(f"\x1b[{footer_count + 1}B\r\n")
+                sys.stdout.flush()
+                break
+            if key == "\x1b":
+                action, pasted = _read_escape(fd)
+                if action == "LEFT":
+                    cursor = max(0, cursor - 1)
+                elif action == "RIGHT":
+                    cursor = min(len(buffer), cursor + 1)
+                elif action == "HOME":
+                    cursor = 0
+                elif action == "END":
+                    cursor = len(buffer)
+                elif action == "DELETE" and cursor < len(buffer):
+                    buffer = buffer[:cursor] + buffer[cursor + 1:]
+                elif action == "UP" and _history:
+                    if history_index == len(_history):
+                        saved_current = buffer
+                    history_index = max(0, history_index - 1)
+                    buffer, cursor = _history[history_index], len(_history[history_index])
+                elif action == "DOWN":
+                    history_index = min(len(_history), history_index + 1)
+                    buffer = saved_current if history_index == len(_history) else _history[history_index]
+                    cursor = len(buffer)
+                elif action == "PASTE":
+                    buffer = buffer[:cursor] + pasted + buffer[cursor:]
+                    cursor += len(pasted)
+                elif action == "ESC":
+                    pass
+            elif key in ("\r", "\n"):
+                result = buffer.strip()
+                if result:
+                    _history.append(result)
+                rows, _, footer_count = _prompt_lines(agent, provider, buffer, cursor, width, enabled)
+                sys.stdout.write("\x1b[1A\r" + "\r" + "\n".join(rows) + "\r\n")
+                sys.stdout.flush()
+                break
+            elif key in ("\x7f", "\b"):
+                if cursor:
+                    buffer = buffer[:cursor - 1] + buffer[cursor:]
+                    cursor -= 1
+            elif key == "\x03":
+                raise KeyboardInterrupt
+            elif key == "\x04":
+                if not buffer:
+                    result = None
+                    sys.stdout.write(f"\x1b[{footer_count + 1}B\r\n")
+                    sys.stdout.flush()
+                    break
+                if cursor < len(buffer):
+                    buffer = buffer[:cursor] + buffer[cursor + 1:]
+            elif key == "\x01":
+                cursor = 0
+            elif key == "\x05":
+                cursor = len(buffer)
+            elif key == "\x15":
+                buffer = buffer[cursor:]
+                cursor = 0
+            elif key == "\x0b":
+                buffer = buffer[:cursor]
+            elif key == "\x17":
+                start = cursor
+                while start and buffer[start - 1].isspace():
+                    start -= 1
+                while start and not buffer[start - 1].isspace():
+                    start -= 1
+                buffer = buffer[:start] + buffer[cursor:]
+                cursor = start
+            elif key == "\x0c":
+                sys.stdout.write("\x1b[2J\x1b[H")
+            elif key.isprintable():
+                buffer = buffer[:cursor] + key + buffer[cursor:]
+                cursor += len(key)
+            else:
+                continue
+            width = max(24, shutil.get_terminal_size((80, 24)).columns)
+            footer_count = _write_prompt_frame(agent, provider, buffer, cursor, width, enabled)
+    except KeyboardInterrupt:
+        sys.stdout.write(f"\x1b[{footer_count + 1}B\r\n")
+        sys.stdout.flush()
+        raise
+    finally:
+        try:
+            sys.stdout.write("\x1b[?2004l")
+            sys.stdout.flush()
+            termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+        except OSError:
+            pass
+    return result

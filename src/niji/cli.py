@@ -2,6 +2,7 @@ import argparse
 import json
 import re
 import sys
+import time
 from pathlib import Path
 
 from rich.console import Console
@@ -457,13 +458,19 @@ def _show_provider_error(provider, exc):
 
 def _interactive_chat(agent, provider, quiet=False):
     console = Console()
-    _render_home(agent, provider, quiet)
+    # Keep the live chat composer as the primary screen; the full command-center
+    # dashboard remains available on demand with /status.
     while True:
         try:
-            user = Prompt.ask("\n[bold cyan]you ❯[/]").strip()
+            from .chat_prompt import read_chat_prompt
+            user = read_chat_prompt(agent, provider)
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]Niji saved. See you next time.[/]")
             break
+        if user is None:
+            console.print("[dim]Niji saved. See you next time.[/]")
+            break
+        user = user.strip()
         if not user:
             continue
         if user.lower() in ("/exit", "exit", "quit", "/quit"):
@@ -539,7 +546,6 @@ def _interactive_chat(agent, provider, quiet=False):
             continue
         if user == "/clear":
             console.clear()
-            _render_home(agent, provider, quiet)
             continue
         if user == "/providers":
             _cmd_providers(["niji", "providers"])
@@ -567,6 +573,7 @@ def _interactive_chat(agent, provider, quiet=False):
             except SystemExit as exc:
                 console.print(f"[yellow]{exc}[/]")
             continue
+        request_started = time.monotonic()
         try:
             console.print("\n[bold green]niji ❯[/]")
             agent.chat(user)
@@ -576,6 +583,8 @@ def _interactive_chat(agent, provider, quiet=False):
             console.print("\n[yellow]Request interrupted.[/]")
         except Exception as exc:
             _show_provider_error(provider, exc)
+        finally:
+            agent.request_seconds = max(0, int(time.monotonic() - request_started))
 
 
 # ---------------- main ----------------
