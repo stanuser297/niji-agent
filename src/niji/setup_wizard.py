@@ -78,29 +78,41 @@ def test_connection(provider_cfg: dict):
 
 
 def _read_secret(label: str, allow_blank: bool = False):
-    """Read a secret safely, explaining hidden paste and offering an opt-in fallback."""
-    console.print("[dim]Key input is hidden; no letters or dots will appear. On Android, "
-                  "long-press the terminal and choose Paste, then press Enter.[/]")
+    """Prompt for a key; visible input is the default for reliable Termux paste."""
+    console.print("[yellow]Key-entry mode: [1] hidden  [2] visible (recommended for Termux).[/]")
+    mode = Prompt.ask("Choose key-entry mode", choices=["1", "2"], default="2")
+    if mode == "2":
+        console.print("[yellow]Visible mode: the key appears on screen while entering. "
+                      "Use only if nobody else can see your terminal.[/]")
+        value = Prompt.ask(label + " (visible)").strip()
+        if value:
+            return value
+        if allow_blank:
+            return None
+        retry = Prompt.ask("No key received. Try entering it again?", choices=["y", "n"], default="y")
+        if retry == "y":
+            return Prompt.ask(label + " (visible)").strip() or None
+        return None
+
+    console.print("[dim]Hidden mode: no letters or dots will appear. Android users can long-press "
+                  "the terminal and choose Paste, then press Enter.[/]")
     warnings_seen = []
     try:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", getpass.GetPassWarning)
-            raw = getpass.getpass(label + ": ")
+            raw = getpass.getpass(label + " (hidden): ")
             warnings_seen = caught
     except Exception:
         raw = ""
     if warnings_seen:
-        console.print("[yellow]This terminal cannot hide password input; it may have been echoed.[/]")
+        console.print("[yellow]This terminal could not hide password input; it may have been echoed.[/]")
     raw = raw.strip()
-    if raw:
-        return raw
-    if allow_blank:
-        retry_text = "No key was received. If you meant to paste one, retry with visible input?"
-    else:
-        retry_text = "No key was received. Retry once with visible input?"
-    retry = Prompt.ask(retry_text + " The key will show on screen", choices=["y", "n"], default="n")
+    if raw or allow_blank:
+        return raw or None
+    retry = Prompt.ask("No key received. Retry with visible input? The key will show on screen",
+                       choices=["y", "n"], default="y")
     if retry == "y":
-        return Prompt.ask("API key (visible on screen)").strip() or None
+        return Prompt.ask(label + " (visible)").strip() or None
     return None
 
 
@@ -145,7 +157,8 @@ def _connection_guidance(provider_cfg: dict, message: str) -> str:
             return ("NVIDIA denied this key or its access (HTTP %s). This is an authorization issue, "
                     "not a Niji branding problem; a wrong model usually returns 404. Choose `n` to "
                     "replace the saved key with an NVIDIA NIM API key, and check that your NVIDIA "
-                    "account is allowed to use this model. The key is never shown on screen." % status)
+                    "account is allowed to use this model. Hidden input is available; visible mode "
+                    "shows the key as you type." % status)
         return (f"The provider denied this API key or its account access (HTTP {status}). "
                 "Replace it with a key for this provider and confirm the account has API access.")
     if status == 404 and nvidia:

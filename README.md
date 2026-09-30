@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.2.2
+# Niji Agent 🌈 — v2.2.3
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -16,10 +16,10 @@ Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, ent
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
 
-## What's new in 2.2.2
+## What's new in 2.2.3
 
-- Explains that API-key input is hidden and how to paste it on Android/Termux
-- If hidden input receives nothing, offers an explicit visible-input retry
+- API-key entry defaults to normal visible typing for reliable Android/Termux input; hidden entry remains available
+- Clearly warns before a key is displayed, and allows a retry if the visible field is left blank
 - Branded setup screen and provider-aware NVIDIA 401/403 diagnostics
 - A failed connection test does not overwrite saved provider settings
 

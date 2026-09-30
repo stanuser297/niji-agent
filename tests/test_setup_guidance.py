@@ -9,26 +9,26 @@ from niji.setup_wizard import _connection_guidance, _read_secret, run_setup
 
 
 class ConnectionGuidanceTests(unittest.TestCase):
-    def test_hidden_key_entry_does_not_echo_key(self):
+    def test_visible_key_entry_is_default_and_accepts_text(self):
         output = io.StringIO()
         with ExitStack() as stack:
+            prompt = stack.enter_context(patch(
+                "niji.setup_wizard.Prompt.ask", side_effect=["2", "nvapi-visible"]))
+            stack.enter_context(patch("niji.setup_wizard.console", Console(file=output, color_system=None)))
+            value = _read_secret("API key")
+        self.assertEqual(value, "nvapi-visible")
+        self.assertIn("visible mode", output.getvalue().lower())
+        self.assertIn("API key (visible)", prompt.call_args_list[1].args[0])
+
+    def test_hidden_mode_can_be_selected(self):
+        output = io.StringIO()
+        with ExitStack() as stack:
+            stack.enter_context(patch("niji.setup_wizard.Prompt.ask", return_value="1"))
             stack.enter_context(patch("niji.setup_wizard.getpass.getpass", return_value="nvapi-secret"))
             stack.enter_context(patch("niji.setup_wizard.console", Console(file=output, color_system=None)))
             value = _read_secret("API key")
         self.assertEqual(value, "nvapi-secret")
         self.assertNotIn("nvapi-secret", output.getvalue())
-        self.assertIn("long-press", output.getvalue())
-
-    def test_empty_hidden_paste_offers_opt_in_visible_retry(self):
-        output = io.StringIO()
-        with ExitStack() as stack:
-            stack.enter_context(patch("niji.setup_wizard.getpass.getpass", return_value=""))
-            prompt = stack.enter_context(patch(
-                "niji.setup_wizard.Prompt.ask", side_effect=["y", "nvapi-visible"]))
-            stack.enter_context(patch("niji.setup_wizard.console", Console(file=output, color_system=None)))
-            value = _read_secret("API key")
-        self.assertEqual(value, "nvapi-visible")
-        self.assertIn("will show on screen", prompt.call_args_list[0].args[0])
 
     def test_nvidia_403_is_identified_as_auth_not_model_typo(self):
         hint = _connection_guidance(
