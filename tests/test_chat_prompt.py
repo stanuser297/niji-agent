@@ -66,6 +66,8 @@ class ChatPromptTests(unittest.TestCase):
         if pid == 0:
             root = Path(__file__).resolve().parents[1]
             sys.path.insert(0, str(root / "src"))
+            import termios
+            original_attrs = termios.tcgetattr(sys.stdin.fileno())
             from niji.chat_prompt import read_chat_prompt
             class Agent:
                 started_at = time.monotonic()
@@ -74,6 +76,8 @@ class ChatPromptTests(unittest.TestCase):
                 tool_usage = {"bash": 1}
             value = read_chat_prompt(Agent(), {"provider": "groq", "model": "test-model"})
             print("RESULT=" + repr(value), flush=True)
+            restored = termios.tcgetattr(sys.stdin.fileno()) == original_attrs
+            print("TERMIOS_RESTORED=" + str(restored), flush=True)
             os._exit(0)
 
         output = bytearray()
@@ -88,7 +92,8 @@ class ChatPromptTests(unittest.TestCase):
                 os.write(fd, chunk)
                 time.sleep(0.15)
             deadline = time.monotonic() + 10
-            while time.monotonic() < deadline and b"RESULT=" not in output:
+            while time.monotonic() < deadline and (
+                    b"RESULT=" not in output or b"TERMIOS_RESTORED=" not in output):
                 ready, _, _ = select.select([fd], [], [], 0.2)
                 if ready:
                     try:
@@ -97,6 +102,7 @@ class ChatPromptTests(unittest.TestCase):
                         break
             self.assertIn(expected.encode(), output)
             self.assertIn(b"MODEL", output)
+            self.assertIn(b"TERMIOS_RESTORED=True", output)
         finally:
             try:
                 os.close(fd)

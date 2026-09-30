@@ -343,7 +343,7 @@ def read_chat_prompt(agent, provider):
         import termios
         import tty
         fd = sys.stdin.fileno()
-        previous = termios.tcgetattr(fd)
+        original_settings = termios.tcgetattr(fd)
     except (ImportError, OSError, AttributeError, ValueError):
         return Prompt.ask("you ❯").strip()
 
@@ -411,9 +411,9 @@ def read_chat_prompt(agent, provider):
                 break
             elif key in ("\x7f", "\b"):
                 if cursor:
-                    previous = _previous_boundary(buffer, cursor)
-                    buffer = buffer[:previous] + buffer[cursor:]
-                    cursor = previous
+                    previous_cursor = _previous_boundary(buffer, cursor)
+                    buffer = buffer[:previous_cursor] + buffer[cursor:]
+                    cursor = previous_cursor
             elif key == "\x03":
                 raise KeyboardInterrupt
             elif key == "\x04":
@@ -460,7 +460,7 @@ def read_chat_prompt(agent, provider):
         try:
             sys.stdout.write("\x1b[?2004l")
             sys.stdout.flush()
-            termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+            termios.tcsetattr(fd, termios.TCSADRAIN, original_settings)
         except OSError:
             pass
     return result
