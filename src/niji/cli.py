@@ -10,6 +10,7 @@ from rich.table import Table
 from rich.text import Text
 
 from . import __version__
+from .ui import render_home
 from .config import (CONFIG_DIR, CONFIG_FILE, MCP_FILE, PRESETS, SESSION_DIR,
                      load_config, load_mcp_servers, resolve_provider,
                      save_config)
@@ -162,30 +163,7 @@ def _list_sessions():
 
 
 def _render_home(agent, provider, quiet=False):
-    if quiet:
-        return
-    console = Console()
-    title = Text.assemble(("🌙  NIJI AGENT", "bold cyan"),
-                          (f"   v{__version__}", "dim"))
-    details = Table.grid(padding=(0, 1))
-    details.add_column(style="bold cyan", no_wrap=True)
-    details.add_column()
-    details.add_row("Provider", Text(str(provider.get("provider", "unknown"))))
-    details.add_row("Model", Text(str(provider.get("model", "default"))))
-    details.add_row("Workspace", Text(str(Path.cwd())))
-    details.add_row("Session", Text(str(agent.session_id)))
-    details.add_row("Mode", Text("Confirm side effects" if agent.approval == "ask" else "Auto"))
-    details.add_row("MCP", Text(f"{len(agent.mcp_clients)} connector(s)"))
-    console.print(Panel.fit(details, title=title, border_style="cyan", padding=(1, 2)))
-
-    names = [schema.get("function", {}).get("name", "tool")
-             for schema in agent.tool_schemas]
-    visible = names[:10]
-    tool_text = Text(", ".join(visible))
-    if len(names) > len(visible):
-        tool_text.append(f"  +{len(names) - len(visible)} more", style="dim")
-    console.print(Panel(tool_text, title=f"Ready • {len(names)} tools", border_style="blue"))
-    console.print("[dim]Type a task in plain language, or use /help for commands.[/]")
+    render_home(agent, provider, quiet=quiet)
 
 
 def _show_help():

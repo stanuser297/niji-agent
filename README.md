@@ -1,4 +1,4 @@
-# niji-agent 🌙 — v2.1.0
+# Niji Agent 🌈 — v2.2.0
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -19,7 +19,8 @@ For other systems, the installer is also available as `install.sh`. It installs 
 ## What's new in 2.0
 
 - First-run provider setup with connection test and model selection
-- Branded Rich terminal home screen, live chat controls, and `/help`, `/status`, `/tools`, `/setup`, `/doctor`, and `/clear` commands
+- Original Niji terminal identity: a responsive cyan/violet/amber dashboard, custom ribbon mark, session overview, active-tools panel, and mobile-friendly stacked layout
+- Live chat controls and `/help`, `/status`, `/tools`, `/setup`, `/doctor`, and `/clear` commands
 - NVIDIA NIM preset with the verified GLM model ID `z-ai/glm-5.3-flash`
 - Add, list, switch, and remove custom OpenAI-compatible providers
 - `niji doctor` checks the saved provider and connector configuration

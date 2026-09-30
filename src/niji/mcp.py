@@ -9,6 +9,7 @@ import queue
 import subprocess
 import threading
 
+from . import __version__
 from .safety import subprocess_environment
 
 
@@ -38,7 +39,7 @@ class MCPServer:
         self._request("initialize", {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
-            "clientInfo": {"name": "niji-agent", "version": "2.1.0"},
+            "clientInfo": {"name": "niji-agent", "version": __version__},
         }, timeout=timeout)
         self._notify("notifications/initialized", {})
         try:
