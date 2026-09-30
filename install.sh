@@ -8,23 +8,78 @@ if command -v python3 >/dev/null 2>&1; then
 elif command -v python >/dev/null 2>&1; then
     PYTHON="${PYTHON:-python}"
 else
-    echo "Python 3.10+ is required. On Termux, run: pkg install python git" >&2
-    exit 1
+    PYTHON="python3"
 fi
 
-if ! command -v git >/dev/null 2>&1; then
-    echo "Git is required to install from GitHub. On Termux, run: pkg install git" >&2
-    exit 1
+uid=$(id -u 2>/dev/null || echo 1)
+is_termux=0
+python_path=$(command -v "$PYTHON" 2>/dev/null || true)
+if [ -n "${PREFIX:-}" ] && [ -x "$PREFIX/bin/pkg" ]; then
+    case "$python_path" in
+        "$PREFIX"/*) is_termux=1 ;;
+    esac
 fi
 
-# Remove an older install first, then install the current branch with its pinned dependencies.
-"$PYTHON" -m pip uninstall -y niji-agent >/dev/null 2>&1 || true
-"$PYTHON" -m pip install --upgrade --force-reinstall --no-cache-dir "$REPO"
-"$PYTHON" -c 'import niji, niji.setup_wizard; from importlib.metadata import version; v=version("niji-agent"); assert v == "2.0.0", f"expected 2.0.0, got {v}"; print("Installed niji-agent", v, "from", niji.__file__)'
+# Bootstrap native tools for the current OS. Debian/proot uses apt; Termux
+# requires pkg as the unprivileged Termux app user.
+needs_bootstrap=0
+command -v git >/dev/null 2>&1 || needs_bootstrap=1
+venv_probe=$(mktemp -d 2>/dev/null || echo "${TMPDIR:-/tmp}/niji-venv-probe-$$")
+if ! "$PYTHON" -m venv "$venv_probe/venv" >/dev/null 2>&1; then
+    needs_bootstrap=1
+fi
+rm -rf "$venv_probe"
+
+if [ "$needs_bootstrap" -eq 1 ]; then
+    if [ "$is_termux" -eq 1 ]; then
+        if [ "$uid" -eq 0 ]; then
+            echo "Termux pkg cannot run as root. Exit the root shell and run this installer as the normal Termux user." >&2
+            exit 1
+        fi
+        pkg install -y python git curl
+    elif command -v apt-get >/dev/null 2>&1; then
+        if [ "$uid" -eq 0 ]; then
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv python3-pip git curl
+        elif command -v sudo >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv python3-pip git curl
+        else
+            echo "Need root/sudo to install prerequisites: python3-venv, python3-pip, git, curl" >&2
+            exit 1
+        fi
+    else
+        echo "Install Python 3.10+, venv/pip, Git, and curl with your OS package manager, then rerun this command." >&2
+        exit 1
+    fi
+fi
+
+"$PYTHON" -c 'import sys; assert sys.version_info >= (3, 10), "Python 3.10+ is required"'
+
+# Prefer an isolated venv. This also avoids Debian's externally-managed Python restriction.
+if [ "$is_termux" -eq 1 ]; then
+    APP_DIR="$PREFIX/var/lib/niji-agent"
+    BIN_DIR="$PREFIX/bin"
+elif [ "$uid" -eq 0 ]; then
+    APP_DIR="/opt/niji-agent"
+    BIN_DIR="/usr/local/bin"
+else
+    APP_DIR="${HOME}/.local/share/niji-agent"
+    BIN_DIR="${HOME}/.local/bin"
+fi
+VENV="$APP_DIR/venv"
+mkdir -p "$APP_DIR" "$BIN_DIR"
+"$PYTHON" -m venv --clear "$VENV"
+"$VENV/bin/python" -m pip install --upgrade pip
+"$VENV/bin/python" -m pip install --no-cache-dir "$REPO"
+"$VENV/bin/python" -c 'import niji, niji.setup_wizard; from importlib.metadata import version; v=version("niji-agent"); assert v == "2.0.0", f"expected 2.0.0, got {v}"; print("Installed niji-agent", v, "from", niji.__file__)'
+
+printf '%s\n' '#!/bin/sh' "exec \"$VENV/bin/niji\" \"\$@\"" > "$BIN_DIR/niji"
+chmod 755 "$BIN_DIR/niji"
 
 echo "Installation complete. Launching niji setup/chat..."
 if [ -r /dev/tty ]; then
-    "$PYTHON" -m niji </dev/tty
+    "$VENV/bin/python" -m niji </dev/tty
 else
-    echo "No interactive terminal detected. Run: niji"
+    echo "No interactive terminal detected. Run: $BIN_DIR/niji"
 fi
