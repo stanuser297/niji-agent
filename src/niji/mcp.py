@@ -5,10 +5,11 @@ Config lives in ~/.niji/mcp.json:
     {"servers": {"github": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"]}}}
 """
 import json
-import os
 import queue
 import subprocess
 import threading
+
+from .safety import subprocess_environment
 
 
 class MCPServer:
@@ -26,8 +27,8 @@ class MCPServer:
     # ---------- lifecycle ----------
 
     def start(self, timeout=20):
-        env = os.environ.copy()
-        env.update(self.env)
+        # Credentials needed by a connector belong in its explicit mcp.json env.
+        env = subprocess_environment(self.env)
         self.proc = subprocess.Popen(
             [self.command, *self.args],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -37,7 +38,7 @@ class MCPServer:
         self._request("initialize", {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
-            "clientInfo": {"name": "niji-agent", "version": "0.2.0"},
+            "clientInfo": {"name": "niji-agent", "version": "2.0.0"},
         }, timeout=timeout)
         self._notify("notifications/initialized", {})
         try:

@@ -11,11 +11,12 @@ def _truncate(s: str) -> str:
 
 
 def bash(command: str, cwd: str | None = None, timeout: int = 120) -> str:
-    from ..safety import check_command
+    from ..safety import check_command, subprocess_environment
     check_command(command)
     try:
         p = subprocess.run(command, shell=True, cwd=cwd or os.getcwd(),
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, timeout=timeout,
+                           env=subprocess_environment())
         out = _truncate(((p.stdout or "") + (p.stderr or "")).strip())
         return out or f"[exit code {p.returncode}, no output]"
     except subprocess.TimeoutExpired:
@@ -103,9 +104,25 @@ def glob(pattern: str, path: str = ".") -> str:
 
 def web_fetch(url: str, max_chars: int = 15000) -> str:
     import html
+    import ipaddress
     import re
     import urllib.request
-    req = urllib.request.Request(url, headers={"User-Agent": "niji-agent/0.2"})
+    from urllib.parse import urlsplit
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return "[error] only http:// and https:// URLs are allowed"
+    if parsed.username or parsed.password:
+        return "[error] URLs containing embedded credentials are not allowed"
+    host = parsed.hostname.lower()
+    if host == "localhost" or host.endswith((".localhost", ".local")):
+        return "[error] local/private hosts are not allowed"
+    try:
+        address = ipaddress.ip_address(host)
+        if not address.is_global:
+            return "[error] local/private IP addresses are not allowed"
+    except ValueError:
+        pass
+    req = urllib.request.Request(url, headers={"User-Agent": "niji-agent/2.0"})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             raw = r.read(500_000)

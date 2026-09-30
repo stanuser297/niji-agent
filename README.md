@@ -1,95 +1,65 @@
-# niji-agent 🌙
+# niji-agent 🌙 — v2.0.0
 
-**Provider-agnostic autonomous coding agent** — kisi bhi LLM provider par chalta hai,
-aur features mein kisi bhi "Hermes-style" harness se aage.
+A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
-## Feature comparison
+## Install on Termux
 
-| Feature | Typical harness | **niji-agent** |
-|---|---|---|
-| Provider-agnostic (OpenAI-compatible) | ✅ | ✅ (8 presets + custom via `NIJI_BASE_URL`) |
-| Tools (bash/files/search) | ✅ | ✅ (9 built-in) |
-| **MCP connectors** (GitHub, Postgres, filesystem, Slack...) | ❌ | ✅ — koi bhi MCP server |
-| **Subagents** (fresh context for subtasks, depth-limited) | ❌/partial | ✅ |
-| **Task planning** (todos) | ❌ | ✅ |
-| **Long-term memory** (across sessions) | ❌ | ✅ `~/.niji/MEMORY.md` |
-| **Session save/resume** | ❌ | ✅ `niji sessions`, `niji --continue` |
-| **Parallel tool execution** | ❌ | ✅ |
-| Auto-retry (rate limits) | ❌ | ✅ exponential backoff |
-| Streaming + token/cost tracking | partial | ✅ `/cost` |
-| Context compaction | ✅ | ✅ (force with `/compact`) |
-| Safety denylist + `--ask` approval | ✅ | ✅ |
-| Web fetch | ❌ | ✅ `web_fetch` |
-| Image reading (vision) | ❌ | ✅ `read_image` |
+Install prerequisites and the latest public release directly from GitHub:
 
-## Install
-
-```bash
-cd niji-agent
-pip install .
-```
-
-## Setup
-
-First launch pe `niji` setup wizard kholta hai: provider choose karo, API key paste karo, phir chat start ho jaati hai. Key `~/.niji/config.json` mein locally save hoti hai; environment variable export karna zaroori nahi. Config file private permissions ke saath save hoti hai.
-
-```bash
+```sh
+pkg install curl git python -y
+curl -fsSL https://raw.githubusercontent.com/stanuser297/niji-agent/main/install.sh | sh
 niji
-# Local Ollama ke liye pehle: ollama pull llama3.1
 ```
 
-Non-interactive setup ya existing config ke liye manual commands bhi available hain:
+Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, enter its API key (hidden while typing), and choose a model. The key is saved locally in `~/.niji/config.json` with private file permissions—no `export` command is needed. Ollama can be used without an API key.
 
-```bash
-niji config set-key openrouter sk-or-...
-niji config set-default openrouter
-```
+For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
+
+## What's new in 2.0
+
+- First-run provider setup with connection test and model selection
+- Add, list, switch, and remove custom OpenAI-compatible providers
+- `niji doctor` checks the saved provider and connector configuration
+- Keeps task planning, subagents, MCP tools, persistent memory, resumable sessions, streaming, token counts, and context compaction
+- More restrictive local permissions for saved config/session/memory data; child processes do not inherit common API-key/token environment variables by default
+- `--ask` now requests confirmation for shell, file-write, network-fetch, and MCP actions; parallel execution is limited to read-only calls
 
 ## Use
 
-```bash
-niji "project mein bug fix karke tests run kar"
-niji --provider anthropic --model claude-sonnet-4-5 "add logging to src/"
-niji --ask "setup the dev environment"        # har command pe approval
-niji                                          # interactive chat
-niji --continue                               # pichli session resume
-niji sessions                                 # saved sessions list
+```sh
+niji                                      # interactive chat
+niji "Find and fix the bug in this project" # one-shot task
+niji --ask "Review the project and suggest fixes" # confirm side effects
+niji --continue                           # resume latest session
+niji sessions                             # list saved sessions
+niji setup                                # run provider setup again
+niji doctor                               # diagnose setup
+niji providers                            # list available providers
+niji providers add                        # add a custom provider
+niji providers use openrouter             # switch default provider
 ```
 
-Chat mein slash commands: `/model` `/cost` `/compact` `/memory` `/help`
+Interactive slash commands: `/help`, `/model`, `/cost`, `/compact`, `/memory`, `/exit`.
 
-## MCP connectors (jaise Claude Code ke)
+Use the tool only in directories where you trust it to read and modify files. It runs with your operating-system account's permissions; it is not a sandbox. MCP servers are separate programs, so only configure servers you trust. `--ask` adds confirmations, but does not turn the operating system into a sandbox.
 
-`~/.niji/mcp.json` banao:
+## MCP connectors
+
+Create `~/.niji/mcp.json`. Put connector-specific credentials in that server's `env` object; common credential variables from the parent environment are not inherited by default.
 
 ```json
 {
   "servers": {
-    "github": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"],
-               "env": {"GITHUB_TOKEN": "ghp_..."}},
-    "pg": {"command": "uvx", "args": ["mcp-server-postgres", "postgresql://localhost/db"]}
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {"GITHUB_TOKEN": "your-token"}
+    }
   }
 }
 ```
 
-Har MCP tool automatically model ko mil jata hai as `github__create_issue` style calls.
-Ek server crash ho to baaki sab chalte rehte hain. `--no-mcp` se skip.
-
-## Architecture
-
-```
-niji/
-├── cli.py         # terminal UI: one-shot, chat, sessions, resume, slash commands
-├── agent.py       # agentic loop: streaming, parallel tools, retries, subagents, usage
-├── mcp.py         # MCP stdio client (connectors)
-├── config.py      # provider presets, ~/.niji/config.json, mcp.json loader
-├── safety.py      # always-on command denylist
-├── compaction.py  # context management
-└── tools/
-    ├── builtin.py   # bash, read/write/edit file, list, grep, glob, web_fetch, read_image
-    └── stateful.py  # todos (plan), task (subagents), memory_read/write
-```
-
 ## License
 
-MIT
+MIT. See `LICENSE`.

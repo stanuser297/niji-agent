@@ -18,6 +18,7 @@ def todo_write(todos: list, activeForm: str = "", ctx: dict = None) -> str:
 def task(prompt: str, ctx: dict = None) -> str:
     """Spawn a subagent with a fresh context window."""
     from ..agent import Agent
+    from . import SUBAGENT_TOOLS
     ctx = ctx or {}
     parent = ctx.get("agent")
     depth = ctx.get("depth", 0)
@@ -32,7 +33,7 @@ def task(prompt: str, ctx: dict = None) -> str:
         verbose=False,
         depth=depth + 1,
         mcp_clients=[],
-        allowed_tools=None,          # core tools minus task (see Agent)
+        allowed_tools=SUBAGENT_TOOLS,
     )
     result = sub.chat(prompt)
     return "[subagent report]\n" + str(result)[:12000]
@@ -47,7 +48,12 @@ def memory_read() -> str:
 
 def memory_write(note: str) -> str:
     from ..config import MEMORY_FILE
-    MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with open(MEMORY_FILE, "a") as f:
         f.write(note.rstrip() + "\n")
+    try:
+        MEMORY_FILE.parent.chmod(0o700)
+        MEMORY_FILE.chmod(0o600)
+    except OSError:
+        pass
     return "[ok] saved to long-term memory"

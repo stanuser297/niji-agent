@@ -40,8 +40,18 @@ def load_config():
 
 
 def save_config(cfg):
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        CONFIG_DIR.chmod(0o700)
+    except OSError:
+        pass
+    temp_file = CONFIG_FILE.with_suffix(".json.tmp")
+    temp_file.write_text(json.dumps(cfg, indent=2))
+    try:
+        temp_file.chmod(0o600)
+    except OSError:
+        pass
+    temp_file.replace(CONFIG_FILE)
     try:
         CONFIG_FILE.chmod(0o600)
     except OSError:
@@ -63,10 +73,28 @@ def load_mcp_servers(path=None):
 
 def resolve_provider(name=None, model=None, api_key=None):
     cfg = load_config()
-    name = (name or os.environ.get("NIJI_PROVIDER")
-            or cfg.get("provider") or "openrouter")
+    name = name or os.environ.get("NIJI_PROVIDER") or cfg.get("provider")
+    if not name:
+        name = next((provider for provider, settings in PRESETS.items()
+                     if settings.get("env_key") and os.environ.get(settings["env_key"])),
+                    "openrouter")
 
     preset = PRESETS.get(name)
+
+    # custom providers saved via `niji providers add` / setup wizard
+    custom = cfg.get("custom_providers", {}).get(name)
+    if preset is None and custom:
+        env_key = custom.get("env_key")
+        return {
+            "provider": name,
+            "base_url": custom["base_url"],
+            "api_key": (api_key or custom.get("api_key")
+                        or cfg.get("api_keys", {}).get(name)
+                        or (env_key and os.environ.get(env_key))
+                        or os.environ.get("NIJI_API_KEY") or "custom"),
+            "model": (model or os.environ.get("NIJI_MODEL")
+                      or custom.get("model") or "default"),
+        }
 
     # custom provider via env: NIJI_BASE_URL works with ANY name
     custom_base = os.environ.get("NIJI_BASE_URL")
@@ -86,10 +114,11 @@ def resolve_provider(name=None, model=None, api_key=None):
             f"Unknown provider '{name}'. Options: {known}\n"
             f"Or set NIJI_BASE_URL env var to use any OpenAI-compatible endpoint.")
 
+    # Explicit CLI credentials win, then saved wizard config, then environment fallbacks.
     key = (api_key
+           or cfg.get("api_keys", {}).get(name)
            or (preset["env_key"] and os.environ.get(preset["env_key"]))
-           or os.environ.get("NIJI_API_KEY")
-           or cfg.get("api_keys", {}).get(name))
+           or os.environ.get("NIJI_API_KEY"))
     if preset["env_key"] and not key:
         raise SystemExit(
             f"API key missing for '{name}'. Either:\n"

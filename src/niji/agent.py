@@ -11,6 +11,11 @@ from .compaction import maybe_compact
 from .config import MEMORY_FILE, SESSION_DIR
 from .tools import CORE_SCHEMAS, SUBAGENT_TOOLS, dispatch
 
+PARALLEL_SAFE_TOOLS = {
+    "read_file", "list_files", "grep", "glob", "read_image",
+    "web_fetch", "todo_read", "memory_read",
+}
+
 SYSTEM_PROMPT = (
     "You are Niji, an autonomous senior software engineer running in the user's terminal.\n"
     "Capabilities: read/write/edit files, run shell commands, search code, fetch web pages, "
@@ -88,9 +93,17 @@ class Agent:
 
     def _save_session(self):
         try:
-            SESSION_DIR.mkdir(parents=True, exist_ok=True)
-            (SESSION_DIR / f"{self.session_id}.json").write_text(
-                json.dumps(self.messages, default=str, indent=1))
+            SESSION_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                SESSION_DIR.chmod(0o700)
+            except OSError:
+                pass
+            session_file = SESSION_DIR / f"{self.session_id}.json"
+            session_file.write_text(json.dumps(self.messages, default=str, indent=1))
+            try:
+                session_file.chmod(0o600)
+            except OSError:
+                pass
         except Exception:
             pass
 
@@ -105,8 +118,9 @@ class Agent:
             if not tool_calls:
                 return text or "[done]"
 
-            if len(tool_calls) > 1 and self.approval != "ask":
-                # parallel tool execution for independent calls
+            if (len(tool_calls) > 1 and self.approval != "ask"
+                    and all(tc["name"] in PARALLEL_SAFE_TOOLS for tc in tool_calls)):
+                # Parallelize only read-only operations; mutations may depend on one another.
                 with ThreadPoolExecutor(max_workers=min(8, len(tool_calls))) as ex:
                     results = list(ex.map(self._execute, tool_calls))
             else:
@@ -203,8 +217,12 @@ class Agent:
         if self.verbose:
             self._print(f"\n[tool] {name} {json.dumps(args, default=str)[:250]}")
 
-        if name == "bash" and self.approval == "ask":
-            print(f"\n$ {args.get('command', '')}")
+        if self.approval == "ask" and name not in {
+                "read_file", "list_files", "grep", "glob", "read_image",
+                "todo_read", "todo_write", "memory_read"}:
+            preview = (args.get("command") if name == "bash"
+                       else json.dumps(args, default=str)[:300])
+            print(f"\nApprove {name}: {preview}")
             if input("Approve? [y/N] ").strip().lower() != "y":
                 return "[denied by user]"
 
