@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.2.3
+# Niji Agent 🌈 — v2.4.0
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -12,16 +12,16 @@ curl -fsSL https://raw.githubusercontent.com/stanuser297/niji-agent/main/install
 niji
 ```
 
-Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, enter its API key (hidden while typing), and choose a model. The key is saved locally in `~/.niji/config.json` with private file permissions—no `export` command is needed. Ollama can be used without an API key.
+Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, enter its API key (visible input is the Termux-friendly default; hidden entry is optional), and choose a model. The key is saved locally in `~/.niji/config.json` with private file permissions—no `export` command is needed. Ollama can be used without an API key.
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
 
-## What's new in 2.2.3
+## What's new in 2.4.0
 
-- API-key entry defaults to normal visible typing for reliable Android/Termux input; hidden entry remains available
-- Clearly warns before a key is displayed, and allows a retry if the visible field is left blank
-- Branded setup screen and provider-aware NVIDIA 401/403 diagnostics
-- A failed connection test does not overwrite saved provider settings
+- Screenshot-inspired command-center dashboard: agent profile, actual tool catalog and per-session tool use, recent activity, live session status, and quick commands
+- Niji's own cyan/blue identity and original wordmark; wide side-by-side panels and mobile stacked layout
+- Tool calls, uptime, and task activity are real session metrics; unavailable Skills/CPU/RAM statistics are not fabricated
+- API-key input defaults to visible typing for reliable Termux use, with optional hidden mode
 
 ## What's new in 2.0
 

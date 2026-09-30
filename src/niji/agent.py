@@ -1,4 +1,5 @@
 import json
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -51,7 +52,12 @@ class Agent:
         self.allowed_tools = allowed_tools
         self.todos = {"items": []}
         self.session_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        self.started_at = time.monotonic()
         self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "turns": 0}
+        self.tool_usage = {}
+        self.activity = [{"time": datetime.now().strftime("%H:%M:%S"),
+                          "level": "INFO", "message": "Provider configuration loaded"}]
+        self._activity_lock = threading.Lock()
         self._usage_supported = True
 
         memory_note = ""
@@ -69,6 +75,8 @@ class Agent:
                 f"depth={depth}. Tools: core + "
                 f"{len(self.mcp_clients)} MCP connector(s).]"},
         ]
+        self._record_activity("INFO", f"Loaded {len(self.tool_schemas)} active tools")
+        self._record_activity("READY", "Niji session ready")
 
     # ---------------- public API ----------------
 
@@ -80,6 +88,12 @@ class Agent:
         for c in self.mcp_clients:
             base.extend(c.to_openai_tools())
         return base
+
+    def _record_activity(self, level: str, message: str):
+        with self._activity_lock:
+            self.activity.append({"time": datetime.now().strftime("%H:%M:%S"),
+                                  "level": level, "message": message})
+            self.activity = self.activity[-24:]
 
     def chat(self, user_text: str) -> str:
         self.messages.append({"role": "user", "content": user_text})
@@ -218,6 +232,11 @@ class Agent:
 
     def _execute(self, tc: dict):
         name, args = tc["name"], tc["args"]
+        with self._activity_lock:
+            self.tool_usage[name] = self.tool_usage.get(name, 0) + 1
+            self.activity.append({"time": datetime.now().strftime("%H:%M:%S"),
+                                  "level": "TOOL", "message": f"Tool call: {name}"})
+            self.activity = self.activity[-24:]
         if self.verbose:
             self._print(f"\n[tool] {name} {json.dumps(args, default=str)[:250]}")
 
