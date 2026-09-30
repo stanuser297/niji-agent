@@ -159,15 +159,32 @@ def _prompt_lines(agent, provider, value, cursor, width, enabled=True):
 
 
 def _write_prompt_frame(agent, provider, value, cursor, width, enabled=True, initial=False):
+    """Draw the composer and details into a fixed bottom panel.
+
+    Model output uses the terminal's scrolling region above this panel, so long
+    replies scroll without pushing the input or session details off-screen.
+    Absolute cursor positioning also prevents a new frame being appended for
+    every keystroke (the old relative cursor math drifted on multi-row panels).
+    """
     rows, cursor_column, status_count = _prompt_lines(agent, provider, value, cursor, width, enabled)
-    if not initial:
-        # Cursor starts on the input row: go to the frame top, then redraw in place.
-        sys.stdout.write("\x1b[1A\r")
-    sys.stdout.write("\r" + "\n".join(rows) + "\n")
-    # Return to the editable row, then position the caret after the prompt / current text.
-    sys.stdout.write(f"\x1b[{status_count + 2}A\r\x1b[{5 + cursor_column}G")
+    height = max(8, shutil.get_terminal_size((80, 24)).lines)
+    panel_top = max(1, height - len(rows) + 1)
+    content_bottom = max(1, panel_top - 1)
+    # Keep the scrolling region above the fixed composer/details panel.
+    sys.stdout.write(f"\x1b[1;{content_bottom}r")
+    for offset, row in enumerate(rows):
+        sys.stdout.write(f"\x1b[{panel_top + offset};1H\x1b[2K{row}")
+    # Input row is the second row of the first frame; col 5 follows `│ ❯ `.
+    sys.stdout.write(f"\x1b[{panel_top + 1};{5 + cursor_column}H")
     sys.stdout.flush()
-    return status_count
+    return status_count, content_bottom, panel_top
+
+
+def reset_chat_layout():
+    """Restore normal full-screen scrolling when leaving the interactive chat."""
+    if sys.stdout.isatty():
+        sys.stdout.write("\x1b[r\x1b[?2004l\r\n")
+        sys.stdout.flush()
 
 
 def _read_char(fd):
@@ -267,6 +284,7 @@ def read_chat_prompt(agent, provider):
     history_index = len(_history)
     saved_current = ""
     footer_count = 0
+    content_bottom = 1
     try:
         tty.setcbreak(fd, termios.TCSANOW)
         mode = termios.tcgetattr(fd)
@@ -274,12 +292,13 @@ def read_chat_prompt(agent, provider):
         termios.tcsetattr(fd, termios.TCSANOW, mode)
         sys.stdout.write("\x1b[?2004h")  # bracketed paste: safe multiline clipboard handling
         sys.stdout.flush()
-        footer_count = _write_prompt_frame(agent, provider, buffer, cursor, width, enabled, initial=True)
+        footer_count, content_bottom, _ = _write_prompt_frame(
+            agent, provider, buffer, cursor, width, enabled, initial=True)
         while True:
             key = _read_char(fd)
             if not key:
                 result = None
-                sys.stdout.write(f"\x1b[{footer_count + 1}B\r\n")
+                sys.stdout.write(f"\x1b[{content_bottom};1H\x1b[2K")
                 sys.stdout.flush()
                 break
             if key == "\x1b":
@@ -312,8 +331,12 @@ def read_chat_prompt(agent, provider):
                 result = buffer.strip()
                 if result:
                     _history.append(result)
-                rows, _, footer_count = _prompt_lines(agent, provider, buffer, cursor, width, enabled)
-                sys.stdout.write("\x1b[1A\r" + "\r" + "\n".join(rows) + "\r\n")
+                width = max(24, shutil.get_terminal_size((80, 24)).columns)
+                footer_count, content_bottom, _ = _write_prompt_frame(
+                    agent, provider, buffer, cursor, width, enabled)
+                # Leave the caret at the last scrollable content row. Model output
+                # then renders above the fixed input/details panel.
+                sys.stdout.write(f"\x1b[{content_bottom};1H\x1b[2K")
                 sys.stdout.flush()
                 break
             elif key in ("\x7f", "\b"):
@@ -325,7 +348,7 @@ def read_chat_prompt(agent, provider):
             elif key == "\x04":
                 if not buffer:
                     result = None
-                    sys.stdout.write(f"\x1b[{footer_count + 1}B\r\n")
+                    sys.stdout.write(f"\x1b[{content_bottom};1H\x1b[2K")
                     sys.stdout.flush()
                     break
                 if cursor < len(buffer):
@@ -355,9 +378,10 @@ def read_chat_prompt(agent, provider):
             else:
                 continue
             width = max(24, shutil.get_terminal_size((80, 24)).columns)
-            footer_count = _write_prompt_frame(agent, provider, buffer, cursor, width, enabled)
+            footer_count, content_bottom, _ = _write_prompt_frame(
+                agent, provider, buffer, cursor, width, enabled)
     except KeyboardInterrupt:
-        sys.stdout.write(f"\x1b[{footer_count + 1}B\r\n")
+        sys.stdout.write(f"\x1b[{content_bottom};1H\x1b[2K")
         sys.stdout.flush()
         raise
     finally:

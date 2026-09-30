@@ -586,6 +586,11 @@ def _interactive_chat(agent, provider, quiet=False):
         finally:
             agent.request_seconds = max(0, int(time.monotonic() - request_started))
 
+    # The chat composer reserves a bottom scroll panel; restore normal terminal
+    # scrolling once the interactive loop exits.
+    from .chat_prompt import reset_chat_layout
+    reset_chat_layout()
+
 
 # ---------------- main ----------------
 

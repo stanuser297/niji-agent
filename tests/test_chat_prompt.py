@@ -5,8 +5,10 @@ import sys
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+from io import StringIO
 
-from niji.chat_prompt import _fields, _prompt_lines, _strip_ansi
+from niji.chat_prompt import _fields, _prompt_lines, _strip_ansi, _write_prompt_frame
 
 
 class DummyAgent:
@@ -31,6 +33,21 @@ class ChatPromptTests(unittest.TestCase):
                          "AGENT", "Niji-Agent", "RUNTIME", "Python", "TOKENS",
                          "1,555", "TOOLS", "5", "TIME"):
             self.assertIn(expected, rendered)
+
+    def test_composer_uses_absolute_redraw_and_reserves_bottom_scrolling_panel(self):
+        output = StringIO()
+        with patch("niji.chat_prompt.sys.stdout", output), \
+             patch("niji.chat_prompt.shutil.get_terminal_size", return_value=os.terminal_size((80, 24))):
+            status_count, content_bottom, panel_top = _write_prompt_frame(
+                self.agent, self.provider, "hello", 5, 80, enabled=False)
+            _write_prompt_frame(self.agent, self.provider, "hello!", 6, 80,
+                                enabled=False, initial=False)
+        rendered = output.getvalue()
+        self.assertEqual(panel_top, 24 - (status_count + 5) + 1)
+        self.assertEqual(content_bottom, panel_top - 1)
+        self.assertIn(f"\x1b[1;{content_bottom}r", rendered)
+        self.assertIn(f"\x1b[{panel_top};1H\x1b[2K", rendered)
+        self.assertNotIn("\x1b[1A", rendered)
 
     def test_brand_input_and_footer_fit_narrow_and_wide_terminals(self):
         for width in (48, 56, 80, 120, 180):
