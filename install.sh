@@ -76,7 +76,7 @@ if ! "$VENV/bin/python" -m pip install --retries 10 --timeout 60 --no-cache-dir 
     echo "If your network blocks PyPI, rerun with a trusted mirror via PIP_INDEX_URL." >&2
     exit 1
 fi
-"$VENV/bin/python" -c 'import niji, niji.setup_wizard; from importlib.metadata import version; v=version("niji-agent"); assert v == "2.7.0", f"expected 2.7.0, got {v}"; print("Installed niji-agent", v, "from", niji.__file__)'
+"$VENV/bin/python" -c 'import niji, niji.setup_wizard; from niji.chat_prompt import read_chat_prompt; from importlib.metadata import version; v=version("niji-agent"); assert v == "2.7.1", f"expected 2.7.1, got {v}"; print("Installed niji-agent", v, "from", niji.__file__)'
 
 printf '%s\n' '#!/bin/sh' "exec \"$VENV/bin/niji\" \"\$@\"" > "$BIN_DIR/niji"
 chmod 755 "$BIN_DIR/niji"
