@@ -243,8 +243,9 @@ def _write_prompt_frame(agent, provider, value, cursor, width, enabled=True, ini
     sys.stdout.write(f"\x1b[1;{content_bottom}r")
     for offset, row in enumerate(rows):
         sys.stdout.write(f"\x1b[{panel_top + offset};1H\x1b[2K{row}")
-    # Input row is the second row of the first frame; col 5 follows `│ ❯ `.
-    sys.stdout.write(f"\x1b[{panel_top + 1};{5 + cursor_column}H")
+    # `cursor_column` already includes the ` ❯ ` prefix; add only the left
+    # frame border (col 1) to reach the actual terminal column.
+    sys.stdout.write(f"\x1b[{panel_top + 1};{2 + cursor_column}H")
     sys.stdout.flush()
     return status_count, content_bottom, panel_top
 

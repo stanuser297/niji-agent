@@ -39,14 +39,17 @@ class ChatPromptTests(unittest.TestCase):
         with patch("niji.chat_prompt.sys.stdout", output), \
              patch("niji.chat_prompt.shutil.get_terminal_size", return_value=os.terminal_size((80, 24))):
             status_count, content_bottom, panel_top = _write_prompt_frame(
-                self.agent, self.provider, "hello", 5, 80, enabled=False)
-            _write_prompt_frame(self.agent, self.provider, "hello!", 6, 80,
+                self.agent, self.provider, "", 0, 80, enabled=False)
+            _write_prompt_frame(self.agent, self.provider, "hello", 5, 80,
                                 enabled=False, initial=False)
         rendered = output.getvalue()
         self.assertEqual(panel_top, 24 - (status_count + 5) + 1)
         self.assertEqual(content_bottom, panel_top - 1)
         self.assertIn(f"\x1b[1;{content_bottom}r", rendered)
         self.assertIn(f"\x1b[{panel_top};1H\x1b[2K", rendered)
+        # Placeholder caret begins before the word Ask; typed caret advances by its text width.
+        self.assertIn(f"\x1b[{panel_top + 1};5H", rendered)
+        self.assertTrue(rendered.endswith(f"\x1b[{panel_top + 1};10H"))
         self.assertNotIn("\x1b[1A", rendered)
 
     def test_brand_input_and_footer_fit_narrow_and_wide_terminals(self):
