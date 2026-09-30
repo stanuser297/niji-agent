@@ -38,7 +38,7 @@ class MCPServer:
         self._request("initialize", {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
-            "clientInfo": {"name": "niji-agent", "version": "2.0.0"},
+            "clientInfo": {"name": "niji-agent", "version": "2.0.1"},
         }, timeout=timeout)
         self._notify("notifications/initialized", {})
         try:

@@ -70,9 +70,13 @@ fi
 VENV="$APP_DIR/venv"
 mkdir -p "$APP_DIR" "$BIN_DIR"
 "$PYTHON" -m venv --clear "$VENV"
-"$VENV/bin/python" -m pip install --upgrade pip
-"$VENV/bin/python" -m pip install --no-cache-dir "$REPO"
-"$VENV/bin/python" -c 'import niji, niji.setup_wizard; from importlib.metadata import version; v=version("niji-agent"); assert v == "2.0.0", f"expected 2.0.0, got {v}"; print("Installed niji-agent", v, "from", niji.__file__)'
+if ! "$VENV/bin/python" -m pip install --retries 10 --timeout 60 --no-cache-dir "$REPO"; then
+    echo "Could not download Python packages. This is a network/DNS issue, not an API-key problem." >&2
+    echo "Check: getent hosts files.pythonhosted.org" >&2
+    echo "If your network blocks PyPI, rerun with a trusted mirror via PIP_INDEX_URL." >&2
+    exit 1
+fi
+"$VENV/bin/python" -c 'import niji, niji.setup_wizard; from importlib.metadata import version; v=version("niji-agent"); assert v == "2.0.1", f"expected 2.0.1, got {v}"; print("Installed niji-agent", v, "from", niji.__file__)'
 
 printf '%s\n' '#!/bin/sh' "exec \"$VENV/bin/niji\" \"\$@\"" > "$BIN_DIR/niji"
 chmod 755 "$BIN_DIR/niji"

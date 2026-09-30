@@ -1,4 +1,4 @@
-# niji-agent 🌙 — v2.0.0
+# niji-agent 🌙 — v2.0.1
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
