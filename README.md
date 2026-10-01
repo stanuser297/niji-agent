@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.17.0
+# Niji Agent 🌈 — v2.18.0
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -15,6 +15,13 @@ niji
 Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, enter its API key (visible input is the Termux-friendly default; hidden entry is optional), and choose a model. The key is saved locally in `~/.niji/config.json` with private file permissions—no `export` command is needed. Ollama can be used without an API key.
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
+
+## What's new in 2.18.0
+
+- Removed the Chat/Ready strip from the chat page to keep more room for conversation.
+- Added the requested composer toolbar: bounded non-secret text/code file attachments, a public GitHub repository reference helper, a read-only Low/locked provider indicator, and optional browser speech dictation.
+- Kept Send/Stop behavior and mobile-friendly layout; unsupported microphone browsers show a clear message. Private GitHub repositories are not authenticated by this helper.
+- Added regression checks for the new controls and hidden chat header.
 
 ## What's new in 2.17.0
 
