@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.9.0
+# Niji Agent 🌈 — v2.10.0
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -15,6 +15,13 @@ niji
 Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, enter its API key (visible input is the Termux-friendly default; hidden entry is optional), and choose a model. The key is saved locally in `~/.niji/config.json` with private file permissions—no `export` command is needed. Ollama can be used without an API key.
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
+
+## What's new in 2.10.0
+
+- Added `niji ui`: a polished responsive browser chat/dashboard that serves a token-protected URL on loopback only. It shows provider/model, usage, activity, tools, and recent chat, and runs requests in the background so the browser stays responsive.
+- Tool approvals appear in the browser and wait for an explicit approve/deny action. API keys are never sent to the page; prompts and request bodies are bounded; same-origin checks, a one-time launch token, and localhost-only binding protect the local server.
+- `niji ui --open` can try to open the local page automatically. `niji ui --port 0` selects an available port. `--auto-approve` is an explicit opt-out from per-action approval; do not use it on an untrusted workspace.
+- This interface is reachable only from the same device by default. It is not an internet/public URL or LAN phone-remote-access service.
 
 ## What's new in 2.9.0
 
@@ -137,7 +144,9 @@ Research references: [OpenAI API error codes](https://developers.openai.com/api/
 ## Use
 
 ```sh
-niji                                      # interactive chat
+niji                                      # interactive terminal chat
+niji ui                                   # local browser chat; copy the printed localhost URL
+niji ui --open                            # try to open that URL in a browser
 niji "Find and fix the bug in this project" # one-shot task
 niji --ask "Review the project and suggest fixes" # confirm side effects
 niji --max-turns 100 --max-tool-calls 1000 --max-tool-calls-per-turn 20 # opt-in high tool budget

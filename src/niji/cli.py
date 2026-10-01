@@ -717,10 +717,62 @@ def _interactive_chat(agent, provider, quiet=False):
 
 # ---------------- main ----------------
 
+def _cmd_ui(argv):
+    """Start the private, loopback-only browser UI."""
+    parser = argparse.ArgumentParser(prog="niji ui", description="Run Niji's private localhost browser interface")
+    parser.add_argument("--host", default="127.0.0.1", choices=["127.0.0.1", "localhost"],
+                        help="Loopback interface only (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=8765, help="Local port (default: 8765; 0 picks an available port)")
+    parser.add_argument("--open", action="store_true", help="Try opening the private URL in a browser")
+    parser.add_argument("--auto-approve", action="store_true", help="Allow tool actions without per-action confirmation (not recommended)")
+    parser.add_argument("--provider", help="Provider override")
+    parser.add_argument("--model", help="Model override")
+    parser.add_argument("--api-key", help="API key override")
+    parser.add_argument("--mcp", help="Path to a custom mcp.json")
+    parser.add_argument("--no-mcp", action="store_true", help="Skip MCP connectors")
+    parser.add_argument("--max-turns", type=int, default=20)
+    parser.add_argument("--max-tool-calls", type=int, default=30)
+    parser.add_argument("--max-tool-calls-per-turn", type=int, default=6)
+    args = parser.parse_args(argv)
+
+    from .setup_wizard import needs_setup, run_setup
+    if needs_setup(provider_name=args.provider, api_key=args.api_key):
+        if not sys.stdin.isatty():
+            print("No provider configured. Run: niji setup")
+            return
+        run_setup(provider_name=args.provider)
+        print()
+
+    agent_args = argparse.Namespace(
+        provider=args.provider, model=args.model, api_key=args.api_key,
+        ask=not args.auto_approve, max_turns=args.max_turns,
+        max_tool_calls=args.max_tool_calls,
+        max_tool_calls_per_turn=args.max_tool_calls_per_turn,
+        quiet=True, mcp=args.mcp, no_mcp=args.no_mcp)
+    agent, _provider = _build_agent(agent_args)
+    from .webui import NijiWebUI
+    try:
+        ui = NijiWebUI(agent, host=args.host, port=args.port)
+    except OSError as exc:
+        if args.port == 0:
+            raise
+        print(f"[niji] localhost port {args.port} is unavailable ({exc}); choosing an open port")
+        ui = NijiWebUI(agent, host=args.host, port=0)
+    try:
+        ui.serve_forever(open_browser=args.open)
+    finally:
+        for client in agent.mcp_clients:
+            client.stop()
+
+
 def main():
     argv = sys.argv[1:]
 
     # ---------- subcommands ----------
+    if argv and argv[0] == "ui":
+        _cmd_ui(argv[1:])
+        return
+
     if argv and argv[0] == "providers":
         _cmd_providers(argv)
         return

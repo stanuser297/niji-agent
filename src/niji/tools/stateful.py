@@ -41,6 +41,7 @@ def task(prompt: str, ctx: dict = None) -> str:
     # snapshot stack prevents a child from creating an invisible edit trail.
     sub.file_change_history = parent.file_change_history
     sub._file_change_lock = parent._file_change_lock
+    sub.approval_callback = parent.approval_callback
     sub.activity_callback = lambda event: parent._record_activity(
         event.get("level", "INFO"), "Subagent: " + event.get("message", ""))
     result = sub.chat(prompt)

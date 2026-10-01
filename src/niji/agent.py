@@ -70,6 +70,8 @@ class Agent:
         self.model = provider_cfg["model"]
         self.provider_name = provider_cfg["provider"]
         self.approval = approval
+        # Optional UI callback used by the localhost interface; terminal mode keeps its prompt.
+        self.approval_callback = None
         self.max_turns = max(1, min(int(max_turns), 100))
         self.max_tool_calls = max(1, min(int(max_tool_calls), 1000))
         self.max_tool_calls_per_turn = max(
@@ -458,10 +460,17 @@ class Agent:
         if name == "archive" and args.get("action") == "list":
             no_approval_needed = True
         if self.approval == "ask" and not no_approval_needed:
-            preview = (args.get("command") if name in ("bash", "process_manager")
-                       else json.dumps(args, default=str)[:300])
-            print(f"\nApprove {name}: {preview}")
-            if input("Approve? [y/N] ").strip().lower() != "y":
+            if self.approval_callback is not None:
+                try:
+                    approved = bool(self.approval_callback(name, args))
+                except Exception:
+                    approved = False
+            else:
+                preview = (args.get("command") if name in ("bash", "process_manager")
+                           else json.dumps(args, default=str)[:300])
+                print(f"\nApprove {name}: {preview}")
+                approved = input("Approve? [y/N] ").strip().lower() == "y"
+            if not approved:
                 self._record_activity("DENIED", f"User declined {name}")
                 return "[denied by user]"
 
