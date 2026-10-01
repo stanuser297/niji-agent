@@ -114,6 +114,7 @@ class WebUITests(unittest.TestCase):
         page = response.read().decode()
         self.assertEqual(response.status, 200)
         self.assertIn("NIJI AGENT", page)
+        self.assertNotIn("\\nfunction renderSessions", page)
         self.assertIn(".chatcard{background:transparent;border:0;border-radius:0;box-shadow:none}", page)
         self.assertIn(".message{width:fit-content;max-width:min(88%,840px);border:0;border-radius:0;background:transparent;padding:0;", page)
         self.assertIn(".message.user{align-self:flex-end;background:transparent;border-color:transparent}", page)

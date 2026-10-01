@@ -15,10 +15,10 @@ def todo_write(todos: list, activeForm: str = "", ctx: dict = None) -> str:
     return f"[ok] plan saved: {len(todos)} tasks ({activeForm or 'n/a'})"
 
 
-def task(prompt: str, ctx: dict = None) -> str:
-    """Spawn a subagent with a fresh context window."""
+def task(prompt: str, role: str = "coder", ctx: dict = None) -> str:
+    """Spawn a bounded, role-scoped subagent with a fresh project context."""
     from ..agent import Agent
-    from . import SUBAGENT_TOOLS
+    from . import PLAN_SUBAGENT_TOOLS, READ_ONLY_SUBAGENT_TOOLS, SUBAGENT_TOOLS
     ctx = ctx or {}
     parent = ctx.get("agent")
     depth = ctx.get("depth", 0)
@@ -26,6 +26,17 @@ def task(prompt: str, ctx: dict = None) -> str:
         return "[error] no parent agent"
     if depth >= 2:
         return "[error] subagent depth limit reached (max 2)"
+    roles = {
+        "explore": (READ_ONLY_SUBAGENT_TOOLS,
+                    "Explore only: inspect and report evidence; do not edit files or run commands."),
+        "plan": (PLAN_SUBAGENT_TOOLS,
+                 "Plan only: return steps, risks, and checks; do not edit files or run commands."),
+        "coder": (SUBAGENT_TOOLS,
+                  "Implement only the bounded subtask; inspect the diff and run focused checks."),
+    }
+    if role not in roles:
+        return "[error] role must be explore, plan, or coder"
+    allowed_tools, role_note = roles[role]
     sub = Agent(
         provider_cfg=parent.provider_cfg,
         approval=parent.approval,
@@ -35,7 +46,8 @@ def task(prompt: str, ctx: dict = None) -> str:
         verbose=False,
         depth=depth + 1,
         mcp_clients=[],
-        allowed_tools=SUBAGENT_TOOLS,
+        allowed_tools=allowed_tools,
+        workspace=getattr(parent, "workspace", None),
     )
     # Parent /undo can also reverse a subagent's file changes; the same guarded
     # snapshot stack prevents a child from creating an invisible edit trail.
@@ -44,8 +56,15 @@ def task(prompt: str, ctx: dict = None) -> str:
     sub.approval_callback = parent.approval_callback
     sub.activity_callback = lambda event: parent._record_activity(
         event.get("level", "INFO"), "Subagent: " + event.get("message", ""))
-    result = sub.chat(prompt)
-    return "[subagent report]\n" + str(result)[:12000]
+    result = sub.chat(f"[{role} subtask] {role_note}\n\n{prompt}")
+    return f"[subagent role={role} report]\n" + str(result)[:12000]
+
+
+def skill_read(name: str, ctx: dict = None) -> str:
+    """Load an installed, name-addressed workflow; arbitrary paths are never accepted."""
+    from ..instructions import read_skill
+    agent = (ctx or {}).get("agent")
+    return read_skill(name, getattr(agent, "skills", {}))
 
 
 def memory_read() -> str:

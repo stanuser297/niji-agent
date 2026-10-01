@@ -35,9 +35,8 @@ class FakeStatusError(Exception):
 
 
 def make_agent(**kwargs):
-    fake_openai = types.ModuleType("openai")
-    fake_openai.OpenAI = lambda **options: types.SimpleNamespace(options=options)
-    with patch.dict(sys.modules, {"openai": fake_openai}):
+    fake_client = lambda **options: types.SimpleNamespace(options=options)
+    with patch("niji.agent.OpenAI", side_effect=fake_client):
         return Agent({"provider": "test", "model": "m", "api_key": "k",
                       "base_url": "https://example.test/v1"}, verbose=False, **kwargs)
 

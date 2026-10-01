@@ -24,6 +24,8 @@ from pathlib import Path, PurePosixPath
 
 from ..safety import check_command, subprocess_environment
 from .builtin import _truncate, edit_file
+from .paths import workspace_cwd, workspace_path
+from .subprocess_runner import run_process
 
 MAX_OUTPUT = 12000
 MAX_ARCHIVE_BYTES = 100_000_000
@@ -106,9 +108,9 @@ def web_search(query: str, limit: int = 5) -> str:
     return "\n".join(results) if results else "[no results parsed] Search page may be blocking automated requests; try web_fetch on a known source."
 
 
-def file_search(query: str, path: str = ".", include: str = "*") -> str:
+def file_search(query: str, path: str = ".", include: str = "*", ctx: dict = None) -> str:
     """Search filenames and text content for a literal, case-insensitive query."""
-    base = Path(path)
+    base = workspace_path(path, ctx)
     if not base.is_dir():
         return f"[error] not a directory: {path}"
     term = str(query).strip()
@@ -148,7 +150,7 @@ def apply_patch(path: str, old_text: str, new_text: str, ctx: dict = None) -> st
 _GIT_READ = {"status", "diff", "log", "show", "branch", "rev-parse", "ls-files", "remote", "tag"}
 _GIT_WRITE = {"add", "commit", "switch", "checkout", "restore", "merge", "rebase", "push", "pull", "reset", "stash", "tag"}
 
-def git(args: list[str], cwd: str = ".", timeout: int = 30) -> str:
+def git(args: list[str], cwd: str = ".", timeout: int = 30, ctx: dict = None) -> str:
     """Run a limited Git subcommand. Mutations should be used with --ask."""
     if not args or not isinstance(args, list):
         return "[error] pass args as a list, e.g. [\"status\", \"--short\"]"
@@ -169,16 +171,19 @@ def git(args: list[str], cwd: str = ".", timeout: int = 30) -> str:
         return "[error] tag deletion/creation flags are not permitted by this tool"
     timeout = max(1, min(int(timeout), 60))
     try:
-        proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True,
-                              timeout=timeout, env=subprocess_environment())
-        out = (proc.stdout + proc.stderr).strip()
-        return _truncate(out or f"[exit code {proc.returncode}, no output]")
+        code, out, timed_out, cancelled = run_process(
+            ["git", *args], cwd=workspace_cwd(cwd, ctx), timeout=timeout, env=subprocess_environment(),
+            ctx=ctx, tool_name="git")
+        if cancelled:
+            return "[cancelled by user; inspect repository state before retrying]"
+        if timed_out:
+            return f"[error] git timed out after {timeout}s"
+        out = out.strip()
+        return f"[exit code {code}]\n{_truncate(out or '(no output)')}" if code else (_truncate(out) or "[ok] Git command finished")
     except FileNotFoundError:
         return "[error] git is not installed"
-    except subprocess.TimeoutExpired:
-        return f"[error] git timed out after {timeout}s"
     except Exception as exc:
-        return f"[error] {exc}"
+        return f"[error] {exc.__class__.__name__}: {exc}"
 
 
 _TEST_COMMANDS = {
@@ -189,9 +194,9 @@ _TEST_COMMANDS = {
     "cargo": ["cargo", "test"],
 }
 
-def run_tests(kind: str = "auto", path: str = ".", timeout: int = 120) -> str:
+def run_tests(kind: str = "auto", path: str = ".", timeout: int = 120, ctx: dict = None) -> str:
     """Run a known project test command; never accepts arbitrary shell text."""
-    root = Path(path).resolve()
+    root = workspace_path(path, ctx).resolve()
     if not root.is_dir():
         return f"[error] not a directory: {path}"
     if kind == "auto":
@@ -210,16 +215,19 @@ def run_tests(kind: str = "auto", path: str = ".", timeout: int = 120) -> str:
         return f"[error] {kind} project manifest not found"
     timeout = max(1, min(int(timeout), 120))
     try:
-        proc = subprocess.run(command, cwd=root, capture_output=True, text=True,
-                              timeout=timeout, env=subprocess_environment())
-        result = _truncate((proc.stdout + proc.stderr).strip())
-        return f"[{kind} exit {proc.returncode}]\n{result or '(no output)'}"
+        code, output, timed_out, cancelled = run_process(
+            command, cwd=root, timeout=timeout, env=subprocess_environment(),
+            ctx=ctx, tool_name="run_tests")
+        if cancelled:
+            return "[cancelled by user; inspect test/build side effects before retrying]"
+        if timed_out:
+            return f"[error] tests timed out after {timeout}s\n{_truncate(output.strip())}"
+        result = _truncate(output.strip())
+        return f"[{kind} exit {code}]\n{result or '(no output)'}"
     except FileNotFoundError as exc:
         return f"[error] required executable not found: {exc.filename}"
-    except subprocess.TimeoutExpired:
-        return f"[error] tests timed out after {timeout}s"
     except Exception as exc:
-        return f"[error] {exc}"
+        return f"[error] {exc.__class__.__name__}: {exc}"
 
 
 def _has_module(name: str) -> bool:
@@ -228,7 +236,7 @@ def _has_module(name: str) -> bool:
 
 
 def package_manager(manager: str, action: str, packages: list[str] | None = None,
-                    cwd: str = ".", timeout: int = 120) -> str:
+                    cwd: str = ".", timeout: int = 120, ctx: dict = None) -> str:
     """Inspect or install named packages using a small allowlisted set of managers."""
     packages = packages or []
     if any(p.startswith("-") or not re.fullmatch(r"[-A-Za-z0-9_.@/+:<>=!~*]+", p)
@@ -250,23 +258,26 @@ def package_manager(manager: str, action: str, packages: list[str] | None = None
         cmd = ["bun", "pm", "ls"] if action == "check" else ["bun", "add", *packages]
     timeout = max(1, min(int(timeout), 120))
     try:
-        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                              timeout=timeout, env=subprocess_environment())
-        return _truncate(f"[exit {proc.returncode}]\n{(proc.stdout + proc.stderr).strip()}")
+        code, output, timed_out, cancelled = run_process(
+            cmd, cwd=workspace_cwd(cwd, ctx), timeout=timeout, env=subprocess_environment(),
+            ctx=ctx, tool_name="package_manager")
+        if cancelled:
+            return "[cancelled by user; inspect dependency changes before retrying]"
+        if timed_out:
+            return f"[error] package operation timed out after {timeout}s\n{_truncate(output.strip())}"
+        return _truncate(f"[exit {code}]\n{output.strip() or '(no output)'}")
     except FileNotFoundError as exc:
         return f"[error] {manager} executable not found: {exc.filename}"
-    except subprocess.TimeoutExpired:
-        return f"[error] package operation timed out after {timeout}s"
     except Exception as exc:
-        return f"[error] {exc}"
+        return f"[error] {exc.__class__.__name__}: {exc}"
 
 
-def database(path: str, query: str, max_rows: int = 100) -> str:
+def database(path: str, query: str, max_rows: int = 100, ctx: dict = None) -> str:
     """Read-only SQLite query tool; accepts a single SELECT statement only."""
     sql = query.strip()
     if not re.match(r"(?is)^select\b", sql) or ";" in sql.rstrip(";"):
         return "[blocked] database tool permits a single SELECT query only"
-    p = Path(path).expanduser().resolve()
+    p = workspace_path(path, ctx).resolve()
     if not p.is_file():
         return f"[error] database file not found: {path}"
     max_rows = max(1, min(int(max_rows), 500))
@@ -313,11 +324,11 @@ def http_request(url: str, method: str = "GET", max_chars: int = 8000) -> str:
         return f"[error] request failed: {exc}"
 
 
-def archive(action: str, path: str, destination: str = ".", limit: int = 200) -> str:
+def archive(action: str, path: str, destination: str = ".", limit: int = 200, ctx: dict = None) -> str:
     """List or safely extract ZIP/TAR archives, rejecting traversal and links."""
     if action not in ("list", "extract"):
         return "[error] action must be list or extract"
-    p = Path(path).expanduser()
+    p = workspace_path(path, ctx)
     if not p.is_file():
         return f"[error] archive not found: {path}"
     limit = max(1, min(int(limit), 500))
@@ -328,7 +339,7 @@ def archive(action: str, path: str, destination: str = ".", limit: int = 200) ->
                 if action == "list": return "\n".join(i.filename for i in infos[:limit]) or "[empty archive]"
                 if sum(i.file_size for i in infos) > MAX_ARCHIVE_BYTES:
                     return "[blocked] archive expands beyond the 100 MB extraction limit"
-                root = Path(destination).resolve()
+                root = workspace_path(destination, ctx).resolve()
                 for info in infos:
                     rel = PurePosixPath(info.filename)
                     mode = (info.external_attr >> 16) & 0o170000
@@ -346,7 +357,7 @@ def archive(action: str, path: str, destination: str = ".", limit: int = 200) ->
                 if action == "list": return "\n".join(m.name for m in members[:limit]) or "[empty archive]"
                 if sum(m.size for m in members if m.isfile()) > MAX_ARCHIVE_BYTES:
                     return "[blocked] archive expands beyond the 100 MB extraction limit"
-                root = Path(destination).resolve()
+                root = workspace_path(destination, ctx).resolve()
                 for member in members:
                     target = (root / member.name).resolve()
                     if Path(member.name).is_absolute() or ".." in Path(member.name).parts or not target.is_relative_to(root):
@@ -400,7 +411,7 @@ def _capture_process_output(pipe, log_path: str):
 
 
 def process_manager(action: str, process_id: str = "", command: str = "",
-                    cwd: str = ".", timeout: int = 5) -> str:
+                    cwd: str = ".", timeout: int = 5, ctx: dict = None) -> str:
     """Start/inspect/stop session-owned long-running local processes."""
     if action == "start":
         if not command.strip(): return "[error] command is required"
@@ -410,7 +421,7 @@ def process_manager(action: str, process_id: str = "", command: str = "",
         log_path = log.name
         log.close()
         try:
-            proc = subprocess.Popen(command, shell=True, cwd=cwd, stdout=subprocess.PIPE,
+            proc = subprocess.Popen(command, shell=True, cwd=workspace_cwd(cwd, ctx), stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                     start_new_session=True, env=subprocess_environment())
             process_id = str(proc.pid)

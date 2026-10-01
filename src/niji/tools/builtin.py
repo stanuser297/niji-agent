@@ -2,6 +2,8 @@ import os
 import subprocess
 from pathlib import Path
 
+from .paths import workspace_cwd, workspace_path
+
 MAX_OUTPUT = 20000
 
 def _truncate(s: str) -> str:
@@ -10,26 +12,31 @@ def _truncate(s: str) -> str:
     return s[:MAX_OUTPUT] + f"\n... [truncated {len(s) - MAX_OUTPUT} chars]"
 
 
-def bash(command: str, cwd: str | None = None, timeout: int = 120) -> str:
+def bash(command: str, cwd: str | None = None, timeout: int = 120, ctx: dict = None) -> str:
     from ..safety import check_command, subprocess_environment
+    from .subprocess_runner import run_process
     check_command(command)
     try:
         timeout = max(1, min(int(timeout), 120))
-        p = subprocess.run(command, shell=True, cwd=cwd or os.getcwd(),
-                           capture_output=True, text=True, timeout=timeout,
-                           env=subprocess_environment())
-        out = _truncate(((p.stdout or "") + (p.stderr or "")).strip())
-        return out or f"[exit code {p.returncode}, no output]"
-    except subprocess.TimeoutExpired:
-        return f"[error] timed out after {timeout}s"
+        code, output, timed_out, cancelled = run_process(
+            command, shell=True, cwd=workspace_cwd(cwd, ctx), timeout=timeout,
+            env=subprocess_environment(), ctx=ctx, tool_name="bash")
+        if cancelled:
+            return "[cancelled by user; inspect effects before retrying]"
+        if timed_out:
+            return f"[error] timed out after {timeout}s\n{_truncate(output.strip())}"
+        out = _truncate(output.strip())
+        if code != 0:
+            return f"[exit code {code}]\n{out or '(no output)'}"
+        return out or "[ok] command finished with no output"
     except Exception as e:
-        return f"[error] {e}"
+        return f"[error] {e.__class__.__name__}: {e}"
 
 
-def read_file(path: str, offset: int = 0, limit: int = 400) -> str:
+def read_file(path: str, offset: int = 0, limit: int = 400, ctx: dict = None) -> str:
     offset = max(0, int(offset))
     limit = max(1, min(int(limit), 1000))
-    p = Path(path)
+    p = workspace_path(path, ctx)
     if not p.is_file():
         return f"[error] not a file: {path}"
     try:
@@ -63,7 +70,7 @@ def _record_undo(ctx, p: Path, before, after: bytes, operation, reversible):
 
 
 def write_file(path: str, content: str, ctx: dict = None) -> str:
-    p = Path(path)
+    p = workspace_path(path, ctx)
     existed = p.exists()
     before, reversible = _snapshot_before(p)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -79,7 +86,7 @@ def write_file(path: str, content: str, ctx: dict = None) -> str:
 
 
 def edit_file(path: str, old_text: str, new_text: str, ctx: dict = None) -> str:
-    p = Path(path)
+    p = workspace_path(path, ctx)
     if not p.is_file():
         return f"[error] not a file: {path}"
     before, reversible = _snapshot_before(p)
@@ -100,8 +107,8 @@ def edit_file(path: str, old_text: str, new_text: str, ctx: dict = None) -> str:
     return message
 
 
-def list_files(path: str = ".", depth: int = 2) -> str:
-    base = Path(path)
+def list_files(path: str = ".", depth: int = 2, ctx: dict = None) -> str:
+    base = workspace_path(path, ctx)
     if not base.is_dir():
         return f"[error] not a directory: {path}"
     out = []
@@ -115,9 +122,9 @@ def list_files(path: str = ".", depth: int = 2) -> str:
     return "\n".join(out) or "[empty]"
 
 
-def grep(pattern: str, path: str = ".", include: str = "*") -> str:
+def grep(pattern: str, path: str = ".", include: str = "*", ctx: dict = None) -> str:
     import re
-    base = Path(path)
+    base = workspace_path(path, ctx)
     try:
         rx = re.compile(pattern)
     except re.error as e:
@@ -137,8 +144,8 @@ def grep(pattern: str, path: str = ".", include: str = "*") -> str:
     return "\n".join(matches) or "[no matches]"
 
 
-def glob(pattern: str, path: str = ".") -> str:
-    base = Path(path)
+def glob(pattern: str, path: str = ".", ctx: dict = None) -> str:
+    base = workspace_path(path, ctx)
     hits = [str(p) for p in base.rglob(pattern) if p.is_file()]
     return "\n".join(hits[:200]) or "[no matches]"
 
@@ -180,10 +187,10 @@ def web_fetch(url: str, max_chars: int = 15000) -> str:
     return _truncate(text.strip()[:max_chars])
 
 
-def read_image(path: str):
+def read_image(path: str, ctx: dict = None):
     import base64
     import mimetypes
-    p = Path(path)
+    p = workspace_path(path, ctx)
     if not p.is_file():
         return f"[error] not a file: {path}"
     if p.stat().st_size > 10_000_000:

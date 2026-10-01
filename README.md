@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.21.0
+# Niji Agent 🌈 — v2.22.0
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -15,6 +15,16 @@ niji
 Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, enter its API key (visible input is the Termux-friendly default; hidden entry is optional), and choose a model. The key is saved locally in `~/.niji/config.json` with private file permissions—no `export` command is needed. Ollama can be used without an API key.
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
+
+## What's new in 2.22.0
+
+- Added bounded interoperability with `AGENTS.md`, `CLAUDE.md`, `HERMES.md`, `.cursorrules`, and GitHub Copilot project instructions. Guidance is size-limited, scoped from repository root to the active folder, and explicitly treated as untrusted project context.
+- Added lazy-loaded `SKILL.md` discovery for project and user skill folders, with bounded descriptions and safe named reads. Skills guide workflows but cannot override safety policy or the user's request.
+- Fixed workspace profiles so relative file, search, Git, test, package, database, archive, process, and shell paths resolve against the active workspace in both browser and CLI flows; delegated agents inherit the same workspace.
+- Added scoped, bounded `explore` (read-only), `plan` (read-only plan), and `coder` delegated-agent roles. Tool scopes are enforced at execution time, not only hidden from the model's catalog; recursive delegation remains disabled.
+- Improved cancellation and subprocess cleanup, including terminating leftover child processes that could keep output pipes open after a shell exits. Tool progress remains visible in CLI/browser, and failures/non-zero results are reported as failures rather than successes.
+- Expanded reliability regression coverage for skills/instructions, scoped roles, workspace switching and path resolution, interrupted tool-call history, subprocess cancellation, child-process cleanup, UI polling, and tool error states.
+- Independently applied public workflow patterns from [Hermes prompt assembly](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/developer-guide/prompt-assembly.md), [Codex](https://github.com/openai/codex), [Claude Code's public plugins/examples](https://github.com/anthropics/claude-code), and [Kimi Code's agent docs](https://github.com/MoonshotAI/kimi-code/blob/main/docs/en/customization/agents.md). Kimi's current repository is MIT-licensed; this release does not copy hidden prompts or vendor their code. Kimi's separately documented skills source is in an archived predecessor repo.
 
 ## What's new in 2.21.0
 

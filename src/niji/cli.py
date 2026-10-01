@@ -60,6 +60,8 @@ def _activity_notice(event):
             console.print(f"[bold yellow]↘ {message}[/]")
         elif level == "TOOL":
             console.print(f"[bold cyan]⚒ {message}[/]")
+        elif level == "TOOL_PROGRESS":
+            console.print(f"[dim cyan]↳ {message}[/]")
         elif level == "TOOL_DONE":
             console.print(f"[green]✓ {message}[/]")
         elif level == "CHECKPOINT":
@@ -581,6 +583,7 @@ def _show_help():
         ("/help", "Show this command list"),
         ("/status", "Show provider, model, workspace and usage"),
         ("/tools", "List built-in and connected MCP tools"),
+        ("/skills", "List reusable project and user SKILL.md workflows"),
         ("/activity", "Show recent thinking/execution phases and tool outcomes"),
         ("/limits", "Show turn/tool-call limits for this request"),
         ("/context", "Show approximate prompt size and message breakdown for 413 debugging"),
@@ -723,6 +726,19 @@ def _interactive_chat(agent, provider, quiet=False):
                      for schema in agent.tool_schemas]
             console.print(Panel(Text("\n".join(names) or "No tools available"),
                                 title=f"Available tools ({len(names)})", border_style="blue"))
+            continue
+        if user == "/skills":
+            skills = getattr(agent, "skills", {})
+            table = Table(title=f"Reusable skills ({len(skills)})", show_header=True,
+                          header_style="bold cyan")
+            table.add_column("Name", style="green")
+            table.add_column("Description")
+            for name, meta in sorted(skills.items()):
+                table.add_row(name, meta.get("description", "Reusable workflow"))
+            if not skills:
+                console.print("No SKILL.md files found. Add them under .agents/skills/<name>/SKILL.md or ~/.niji/skills/<name>/SKILL.md.")
+            else:
+                console.print(table)
             continue
         if user == "/activity":
             _show_activity(agent)

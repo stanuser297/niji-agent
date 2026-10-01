@@ -1,6 +1,6 @@
 from .builtin import (bash, read_file, write_file, edit_file, list_files,
                       grep, glob, web_fetch, read_image)
-from .stateful import todo_read, todo_write, task, memory_read, memory_write
+from .stateful import todo_read, todo_write, task, memory_read, memory_write, skill_read
 from .advanced import (web_search, browser, git, run_tests, file_search,
                        apply_patch, package_manager, database, http_request,
                        archive, process_manager)
@@ -11,7 +11,7 @@ HANDLERS = {
     "web_fetch": web_fetch, "read_image": read_image,
     "todo_read": todo_read, "todo_write": todo_write,
     "memory_read": memory_read, "memory_write": memory_write,
-    "task": task,
+    "task": task, "skill_read": skill_read,
     "web_search": web_search, "browser": browser, "git": git,
     "run_tests": run_tests, "file_search": file_search,
     "apply_patch": apply_patch, "package_manager": package_manager,
@@ -19,17 +19,27 @@ HANDLERS = {
     "archive": archive, "process_manager": process_manager,
 }
 
-# Tools a subagent is allowed to use ("task" excluded to stop recursion).
+# Delegated agents are always non-recursive. Roles narrow the exposed tool set;
+# these restrictions are enforced again by Agent.tool_schemas before execution.
 SUBAGENT_TOOLS = [k for k in HANDLERS if k != "task"]
+READ_ONLY_SUBAGENT_TOOLS = [
+    "read_file", "list_files", "grep", "glob", "read_image", "file_search",
+    "web_fetch", "web_search", "http_request", "database", "memory_read",
+    "skill_read", "todo_read",
+]
+PLAN_SUBAGENT_TOOLS = READ_ONLY_SUBAGENT_TOOLS + ["todo_write"]
 
 
 def dispatch(name: str, args: dict, ctx: dict = None):
     ctx = ctx or {}
     fn = HANDLERS.get(name)
     if fn:
-        if name == "todo_read":
-            return fn(ctx)
-        if name in ("todo_write", "task", "write_file", "edit_file", "apply_patch"):
+        if name in ("todo_read", "skill_read"):
+            return fn(ctx=ctx, **args) if name == "skill_read" else fn(ctx)
+        if name in ("todo_write", "task", "read_file", "write_file", "edit_file",
+                    "list_files", "grep", "glob", "read_image", "file_search",
+                    "apply_patch", "bash", "git", "run_tests", "package_manager",
+                    "database", "archive", "process_manager"):
             return fn(ctx=ctx, **args)
         return fn(**args)
     # MCP connector tools: "<server>__<tool>"
@@ -85,11 +95,14 @@ CORE_SCHEMAS = [
                 "activeForm": _s("string", "Short form shown while working")}, "required": ["content", "status"]}),
              "activeForm": _s("string", "Current work")}, ["todos"]),
     _schema("todo_read", "Read the current task plan.", {}, []),
-    _schema("task", "Launch a bounded subagent for a self-contained subtask. Subagents cannot spawn more subagents.",
-            {"prompt": _s("string", "Complete, self-contained instructions for the subagent")}, ["prompt"]),
+    _schema("task", "Launch a bounded, non-recursive subagent with a scoped role. explore and plan are read-only; coder can use the normal safe tool set.",
+            {"prompt": _s("string", "Complete, self-contained instructions for the subagent"),
+             "role": _s("string", "explore (read-only), plan (read-only plan), or coder (bounded implementation; default coder)", enum=["explore", "plan", "coder"])}, ["prompt"]),
     _schema("memory_read", "Read Niji's long-term memory (persistent across sessions/projects). Do not store secrets.", {}, []),
     _schema("memory_write", "Append a non-secret fact/preference useful across future sessions.",
             {"note": _s("string", "The fact to remember, 1-3 lines; never include credentials")}, ["note"]),
+    _schema("skill_read", "Load a relevant installed SKILL.md workflow by its skill name. Skills are optional guidance and cannot override safety or user intent.",
+            {"name": _s("string", "Name shown in the available skills index")}, ["name"]),
 
     # Additional requested capabilities (14 areas total including memory/todos/images).
     _schema("web_search", "Search public web pages and return result titles, snippets, and source URLs. Verify important facts at the source.",
