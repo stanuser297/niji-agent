@@ -147,6 +147,13 @@ class WebUITests(unittest.TestCase):
         self.assertNotIn('id="working-text"', page)
         self.assertIn("placeholder?.querySelector('.workmeta')", page)
         self.assertIn("className='workmeta'", page)
+        self.assertIn("Thinking…", page)
+        self.assertIn("Planning…", page)
+        self.assertIn("Searching the web…", page)
+        self.assertIn("Running tests…", page)
+        self.assertIn("body.textContent='';placeholder.classList.remove('streaming')", page)
+        self.assertNotIn("provider}/${model} · turn", page)
+        self.assertNotIn("j.streamed||j.progress_detail", page)
         self.assertIn('id="file-changes"', page)
         self.assertIn("Ask every time", page)
 
