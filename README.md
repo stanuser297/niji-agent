@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.13.0
+# Niji Agent 🌈 — v2.14.0
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -16,11 +16,18 @@ Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, ent
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
 
+## What's new in 2.14.0
+
+- Replaced the separate full-width progress strip with an inline assistant response card matching the supplied reference: Niji identity and Copy action above a live Thinking/Mapping phase, active model, and turn number.
+- The composer’s Send button becomes Stop while a request is running, then returns to Send when it ends; cancellation status stays in the same assistant card.
+- Scoped progress updates to the active message card so old responses are never overwritten, and corrected the Settings chat-preferences styling selector.
+- Added regression checks for the inline progress card and composer Send/Stop state.
+
 ## What's new in 2.13.0
 
 - Simplified the main workspace to a focused chat: session metrics, activity, file changes, overview, and the tool catalog now live under Settings, with collapsible sections for less clutter.
 - Moved planning mode, chat export, appearance, and interaction preferences into Settings. Theme, Enter-to-send, and plan-first preferences are saved in this browser; Ctrl+, opens Settings and Ctrl+K starts a new thread.
-- Kept live progress and the Stop control visible while Niji is working, while removing secondary panels and controls from beneath the chat composer.
+- Kept live progress and cancellation reachable in the focused chat, while removing secondary panels and controls from beneath the chat composer.
 - Added UI regression checks for the focused chat and consolidated settings.
 
 ## What's new in 2.12.0

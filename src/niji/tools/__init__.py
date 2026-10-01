@@ -75,7 +75,7 @@ CORE_SCHEMAS = [
              "include": _s("string", "Glob filter e.g. *.py (default *)")}, ["pattern"]),
     _schema("glob", "Find files by glob pattern.",
             {"pattern": _s("string", "Glob e.g. **/*.py"), "path": _s("string", "Base directory (default .)")}, ["pattern"]),
-    _schema("web_fetch", "Fetch a public URL and return its text content (HTML stripped).", 
+    _schema("web_fetch", "Fetch a public URL and return its text content (HTML stripped).",
             {"url": _s("string", "Full URL including https://"), "max_chars": _s("integer", "Max chars to return (default 15000)")}, ["url"]),
     _schema("read_image", "Read an image file so a vision model can see it (screenshots, diagrams, photos).",
             {"path": _s("string", "Image file path")}, ["path"]),

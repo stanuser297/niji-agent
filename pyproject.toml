@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "niji-agent"
-version = "2.13.0"
+version = "2.14.0"
 description = "niji-agent — provider-agnostic coding agent CLI with interactive setup, custom providers, diagnostics, MCP connectors, memory, planning and subagents"
 readme = "README.md"
 requires-python = ">=3.10"
