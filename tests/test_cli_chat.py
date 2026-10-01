@@ -35,6 +35,15 @@ class InteractiveChatTests(unittest.TestCase):
         self.assertIn("user", text)
         self.assertNotIn("private text", text)
 
+    def test_exit_resets_the_pinned_terminal_layout(self):
+        agent = FakeAgent()
+        provider = {"provider": "groq", "model": "test-model"}
+        with patch("niji.chat_prompt.read_chat_prompt", return_value="/exit"), \
+             patch("niji.chat_prompt.reset_chat_layout") as reset_layout:
+            _interactive_chat(agent, provider)
+        reset_layout.assert_called_once_with()
+        self.assertEqual(agent.requests, [])
+
     def test_user_message_is_written_above_pinned_composer(self):
         output = io.StringIO()
         console = Console(file=output, force_terminal=False, color_system=None)

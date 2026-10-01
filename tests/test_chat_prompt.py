@@ -8,7 +8,8 @@ from pathlib import Path
 from unittest.mock import patch
 from io import StringIO
 
-from niji.chat_prompt import _fields, _prompt_lines, _strip_ansi, _write_prompt_frame
+from niji.chat_prompt import (_fields, _prompt_lines, _strip_ansi,
+                              _write_prompt_frame, reset_chat_layout)
 
 
 class DummyAgent:
@@ -25,6 +26,22 @@ class ChatPromptTests(unittest.TestCase):
     def setUp(self):
         self.agent = DummyAgent()
         self.provider = {"provider": "groq", "model": "deepseek-v4-pro"}
+
+    def test_reset_chat_layout_restores_terminal_modes_and_clears_visible_screen(self):
+        class TTYBuffer(StringIO):
+            def isatty(self):
+                return True
+
+        output = TTYBuffer()
+        with patch("niji.chat_prompt.sys.stdout", output):
+            reset_chat_layout()
+        rendered = output.getvalue()
+        self.assertIn("\x1b[r", rendered)       # reset scroll margins
+        self.assertIn("\x1b[?2004l", rendered)  # disable bracketed paste
+        self.assertIn("\x1b[?25h", rendered)   # show cursor
+        self.assertIn("\x1b[?7h", rendered)    # restore autowrap
+        self.assertIn("\x1b[2J\x1b[H", rendered)  # clear screen, top-left
+        self.assertNotIn("\x1b[3J", rendered)  # preserve scrollback
 
     def test_footer_contains_screenshot_fields_and_real_session_values(self):
         rows, _, _ = _prompt_lines(self.agent, self.provider, "", 0, 160, enabled=False)

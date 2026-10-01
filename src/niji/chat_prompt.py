@@ -255,9 +255,12 @@ def _write_prompt_frame(agent, provider, value, cursor, width, enabled=True, ini
 
 
 def reset_chat_layout():
-    """Restore normal full-screen scrolling when leaving the interactive chat."""
+    """Remove the pinned chat UI and restore a clean, normal shell terminal."""
     if sys.stdout.isatty():
-        sys.stdout.write("\x1b[r\x1b[?2004l\r\n")
+        # Restore full-screen scrolling and normal terminal modes before clearing
+        # only the visible screen (ED 2 preserves scrollback). Leave the cursor
+        # at the top-left so the parent shell prints a fresh prompt there.
+        sys.stdout.write("\x1b[r\x1b[?2004l\x1b[?25h\x1b[?7h\x1b[0m\x1b[2J\x1b[H")
         sys.stdout.flush()
 
 
