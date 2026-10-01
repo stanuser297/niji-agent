@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import pty
 import select
@@ -173,6 +174,92 @@ class RetryAndBudgetTests(unittest.TestCase):
         with self.assertRaises(FakeStatusError):
             agent._api_call(model="m")
         self.assertEqual(len(calls), 1)
+
+    def test_mcp_connector_failure_is_reported_as_error_not_success(self):
+        agent = make_agent()
+        with patch("niji.agent.dispatch", return_value="[connector error] server unavailable"):
+            result = agent._execute({"name": "demo__lookup", "args": {}})
+        levels = [event["level"] for event in agent.activity]
+        self.assertIn("[connector error]", result)
+        self.assertIn("ERROR", levels)
+        self.assertNotIn("TOOL_DONE", levels)
+
+    def test_non_object_tool_arguments_return_safe_tool_error(self):
+        agent = make_agent()
+        result = agent._execute({"name": "todo_read", "args": ["unexpected"]})
+        self.assertIn("expected a JSON object", result)
+        self.assertEqual(agent.activity[-1]["level"], "ERROR")
+        self.assertNotIn("TOOL_DONE", [event["level"] for event in agent.activity])
+
+    def test_malformed_tool_call_metadata_does_not_crash_execution(self):
+        agent = make_agent()
+        self.assertIn("malformed tool call", agent._execute(None))
+        self.assertIn("no valid name", agent._execute({"args": {}}))
+        self.assertEqual([event["level"] for event in agent.activity[-2:]], ["ERROR", "ERROR"])
+
+    def test_malformed_streamed_tool_json_stays_protocol_valid_and_is_not_executed(self):
+        agent = make_agent()
+        tool_delta = types.SimpleNamespace(
+            index=0, id="call-1",
+            function=types.SimpleNamespace(name="todo_read", arguments="not-json"),
+        )
+        chunk = types.SimpleNamespace(
+            usage=None,
+            choices=[types.SimpleNamespace(delta=types.SimpleNamespace(
+                content=None, tool_calls=[tool_delta]))],
+        )
+        agent._request_stream = lambda kwargs: [chunk]
+        message, _, calls = agent._chat()
+        self.assertTrue(calls[0]["invalid_args"])
+        self.assertEqual(json.loads(message["tool_calls"][0]["function"]["arguments"]), {})
+        result = agent._execute(calls[0])
+        self.assertIn("expected a JSON object", result)
+        self.assertEqual(agent.activity[-1]["level"], "ERROR")
+
+    def test_incomplete_tool_call_ids_names_and_indices_are_rejected(self):
+        cases = [(None, "call-1", "todo_read"), (0, "", "todo_read"), (0, "call-1", "")]
+        for index, call_id, name in cases:
+            with self.subTest(index=index, call_id=call_id, name=name):
+                agent = make_agent()
+                delta = types.SimpleNamespace(
+                    index=index, id=call_id,
+                    function=types.SimpleNamespace(name=name, arguments="{}"),
+                )
+                chunk = types.SimpleNamespace(
+                    usage=None,
+                    choices=[types.SimpleNamespace(delta=types.SimpleNamespace(
+                        content=None, tool_calls=[delta]))],
+                )
+                agent._request_stream = lambda kwargs: [chunk]
+                with self.assertRaises(ValueError):
+                    agent._chat()
+
+    def test_exhausted_tool_budget_still_gets_a_tool_free_final_turn(self):
+        agent = make_agent(max_tool_calls=1, max_tool_calls_per_turn=1)
+        assistant = {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call-1", "name": "todo_read", "args": {}}]}
+        original_chat = agent._chat
+        first = True
+        def next_chat():
+            nonlocal first
+            if first:
+                first = False
+                return assistant, "", assistant["tool_calls"]
+            return original_chat()
+        agent._chat = next_chat
+        seen = []
+        final_chunk = types.SimpleNamespace(
+            usage=None,
+            choices=[types.SimpleNamespace(delta=types.SimpleNamespace(content="done", tool_calls=None))],
+        )
+        def final_stream(kwargs):
+            seen.append(kwargs)
+            return [final_chunk]
+        agent._request_stream = final_stream
+        with patch("niji.agent.maybe_compact", side_effect=lambda messages, *a: (messages, False)):
+            result = agent._loop()
+        self.assertEqual(result, "done")
+        self.assertEqual(seen[0]["tools"], [])
 
     def test_request_tool_cap_prevents_extra_execution(self):
         agent = make_agent(max_tool_calls=1, max_tool_calls_per_turn=1)

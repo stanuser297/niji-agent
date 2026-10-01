@@ -349,8 +349,10 @@ class Agent:
                 "role": "system",
                 "content": "This is a planning-only turn. Return a concise actionable plan and important risks. Do not call tools, edit files, run commands, or claim execution."
             }]
+        tools_exhausted = self._request_tool_calls >= self.max_tool_calls
         kwargs = dict(model=self.model, messages=request_messages,
-                      tools=[] if self.plan_only else self.tool_schemas, stream=True)
+                      tools=[] if self.plan_only or tools_exhausted else self.tool_schemas,
+                      stream=True)
         if self._usage_supported:
             kwargs["stream_options"] = {"include_usage": True}
         try:
@@ -395,32 +397,56 @@ class Agent:
                 if self.verbose:
                     self._write_stream_chunk(d.content)
             for tc in (getattr(d, "tool_calls", None) or []):
-                a = tool_acc.setdefault(tc.index, {"id": "", "name": "", "args": ""})
-                if tc.id:
-                    a["id"] += tc.id
-                if tc.function:
-                    if tc.function.name:
-                        a["name"] += tc.function.name
-                    if tc.function.arguments:
-                        a["args"] += tc.function.arguments
+                index = getattr(tc, "index", None)
+                if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+                    raise ValueError("Provider returned an invalid tool-call index; request was not executed")
+                a = tool_acc.setdefault(index, {"id": "", "name": "", "args": ""})
+                call_id = getattr(tc, "id", None)
+                if call_id is not None:
+                    if not isinstance(call_id, str):
+                        raise ValueError("Provider returned an invalid tool-call id; request was not executed")
+                    a["id"] += call_id
+                function = getattr(tc, "function", None)
+                if function is not None:
+                    function_name = getattr(function, "name", None)
+                    arguments = getattr(function, "arguments", None)
+                    if function_name is not None:
+                        if not isinstance(function_name, str):
+                            raise ValueError("Provider returned an invalid tool name; request was not executed")
+                        a["name"] += function_name
+                    if arguments is not None:
+                        if not isinstance(arguments, str):
+                            raise ValueError("Provider returned invalid tool arguments; request was not executed")
+                        a["args"] += arguments
         if self.verbose:
             self._print("")
 
         text = "".join(text_parts)
         tool_calls = []
+        seen_call_ids = set()
         for i in sorted(tool_acc):
             a = tool_acc[i]
+            if not a["id"].strip() or not a["name"].strip():
+                raise ValueError("Provider returned an incomplete tool call (missing id or name); request was not executed")
+            if a["id"] in seen_call_ids:
+                raise ValueError("Provider returned duplicate tool-call ids; request was not executed")
+            seen_call_ids.add(a["id"])
             try:
                 args = json.loads(a["args"]) if a["args"] else {}
+                invalid_args = not isinstance(args, dict)
             except json.JSONDecodeError:
-                args = {}
-            tool_calls.append({"id": a["id"], "name": a["name"], "args": args})
+                # Keep the assistant/tool protocol structurally valid, while marking
+                # the call so _execute does not mistake malformed JSON for {}.
+                args, invalid_args = {}, True
+            tool_calls.append({"id": a["id"], "name": a["name"],
+                               "args": args, "invalid_args": invalid_args})
 
         msg = {"role": "assistant", "content": text or ""}
         if tool_calls:
             msg["tool_calls"] = [{
                 "id": t["id"], "type": "function",
-                "function": {"name": t["name"], "arguments": json.dumps(t["args"])},
+                "function": {"name": t["name"], "arguments": json.dumps(
+                    t["args"] if isinstance(t["args"], dict) and not t.get("invalid_args") else {})},
             } for t in tool_calls]
         return msg, text, tool_calls
 
@@ -474,7 +500,17 @@ class Agent:
     # ---------------- tools ----------------
 
     def _execute(self, tc: dict):
-        name, args = tc["name"], tc["args"]
+        if not isinstance(tc, dict):
+            self._record_activity("ERROR", "Malformed tool call was not executed")
+            return "[error] malformed tool call"
+        name = tc.get("name")
+        if not isinstance(name, str) or not name:
+            self._record_activity("ERROR", "Tool call has no valid name")
+            return "[error] tool call has no valid name"
+        args = tc.get("args")
+        if tc.get("invalid_args") or not isinstance(args, dict):
+            self._record_activity("ERROR", f"{name} received invalid arguments; expected a JSON object")
+            return "[error] invalid tool arguments; expected a JSON object"
         if self._cancel_event.is_set():
             self._record_activity("STOPPED", "Skipped remaining tool calls after stop request")
             return "[cancelled by user]"
@@ -525,6 +561,7 @@ class Agent:
         if result == "[denied by user]":
             self._record_activity("DENIED", f"User declined {name}")
         elif isinstance(result, str) and (result.startswith("[error]")
+                                           or result.startswith("[connector error]")
                                            or result.startswith("[blocked by safety]")):
             self._record_activity("ERROR", f"{name} did not complete")
         else:

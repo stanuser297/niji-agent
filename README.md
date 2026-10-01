@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.19.0
+# Niji Agent 🌈 — v2.20.0
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -15,6 +15,16 @@ niji
 Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, enter its API key (visible input is the Termux-friendly default; hidden entry is optional), and choose a model. The key is saved locally in `~/.niji/config.json` with private file permissions—no `export` command is needed. Ollama can be used without an API key.
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
+
+## What's new in 2.20.0
+
+- Fixed the browser chat hiding all streamed model text until the request completed; current streamed output now appears under the live activity indicator.
+- Kept active requests attached through temporary job-polling/network errors with capped exponential backoff, a reconnect status, and Stop still available.
+- Classified MCP connector failures as tool errors in both browser activity and CLI output instead of false successful completions.
+- Validated malformed tool-call IDs, indices, names, and arguments; malformed argument JSON now produces a safe tool-level error while preserving valid assistant/tool message structure.
+- Stops offering more tools after the request's tool-call budget is exhausted, while allowing the model one tool-free turn to summarize completed work.
+- Keeps the browser monitor recoverable after unexpected polling/render errors and reports a stop as cancelled when the provider exits by raising during cancellation.
+- Added regression coverage for stream visibility, poll recovery behavior, connector failures, and malformed tool arguments.
 
 ## What's new in 2.19.0
 

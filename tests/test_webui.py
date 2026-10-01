@@ -173,7 +173,13 @@ class WebUITests(unittest.TestCase):
         self.assertIn("Planning…", page)
         self.assertIn("Searching the web…", page)
         self.assertIn("Running tests…", page)
-        self.assertIn("body.textContent='';placeholder.classList.remove('streaming')", page)
+        self.assertIn("body.textContent=j.streamed||''", page)
+        self.assertIn("placeholder.classList.toggle('has-stream',!!j.streamed)", page)
+        self.assertIn("pollFailures++", page)
+        self.assertIn("Math.min(4000,380*Math.pow(2", page)
+        self.assertIn("retrying its status check", page)
+        self.assertIn("setTimeout(()=>watchJob(id,false,planOnly),1000)", page)
+        self.assertIn(".message.live-status.has-stream .msgbody{display:block", page)
         self.assertNotIn("provider}/${model} · turn", page)
         self.assertNotIn("j.streamed||j.progress_detail", page)
         self.assertIn('id="file-changes"', page)
@@ -205,6 +211,23 @@ class WebUITests(unittest.TestCase):
         self.assertEqual(job["response"], "Hello from Niji: hello")
         self.assertEqual(job["streamed"], "Hello from Niji: hello")
         self.assertTrue(job["plan_only"] is False)
+
+    def test_cancelled_provider_exception_is_reported_as_cancelled(self):
+        job_id = "cancelled-error-case"
+        self.ui._jobs[job_id] = {
+            "id": job_id, "status": "running", "response": "", "error": "",
+            "streamed": "partial output", "cancel_requested": True,
+        }
+        self.ui._active_job = job_id
+        self.ui._busy = True
+        def raise_after_cancel(message):
+            raise RuntimeError("provider stream closed during cancellation")
+        self.agent.chat = raise_after_cancel
+        self.ui._run_job(job_id, "stop this")
+        job = self.ui._jobs[job_id]
+        self.assertEqual(job["status"], "cancelled")
+        self.assertEqual(job["response"], "partial output")
+        self.assertEqual(job["error"], "")
 
     def test_streamed_text_is_available_before_completion_and_stop_is_cooperative(self):
         self.agent.pause_stream = True

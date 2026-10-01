@@ -498,7 +498,12 @@ class NijiWebUI:
             safe = safe_terminal_text(message)[:1500]
             with self._lock:
                 job = self._jobs[job_id]
-                job.update(status="error", response="", error=f"{exc.__class__.__name__}: {safe}")
+                if job.get("cancel_requested"):
+                    job.update(status="cancelled",
+                               response=job.get("streamed") or "[Stopped by user]",
+                               error="", progress="Stopped")
+                else:
+                    job.update(status="error", response="", error=f"{exc.__class__.__name__}: {safe}")
         finally:
             try:
                 self.agent.plan_only = previous_plan_only
