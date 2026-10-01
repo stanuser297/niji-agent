@@ -1,3 +1,4 @@
+import io
 import os
 import pty
 import select
@@ -111,8 +112,15 @@ class RetryAndBudgetTests(unittest.TestCase):
         agent = make_agent(max_turns=1000, max_tool_calls=1000,
                            max_tool_calls_per_turn=1000)
         self.assertEqual(agent.max_turns, 100)
-        self.assertEqual(agent.max_tool_calls, 100)
+        self.assertEqual(agent.max_tool_calls, 1000)
         self.assertEqual(agent.max_tool_calls_per_turn, 20)
+
+    def test_stream_output_strips_terminal_control_characters(self):
+        agent = make_agent()
+        output = io.StringIO()
+        with patch("niji.agent.sys.stdout", output):
+            agent._write_stream_chunk("Hello\x1b[2J\x07\nworld")
+        self.assertEqual(output.getvalue(), "Hello[2J\nworld")
 
     def test_deterministic_404_is_not_retried(self):
         agent = make_agent()

@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import random
+import sys
 import tempfile
 import threading
 import time
@@ -15,6 +16,7 @@ from openai import OpenAI
 from .compaction import estimate_tokens, maybe_compact
 from .config import MEMORY_FILE, SESSION_DIR
 from .tools import CORE_SCHEMAS, SUBAGENT_TOOLS, dispatch
+from .terminal import OUTPUT_LOCK, safe_terminal_text
 
 PARALLEL_SAFE_TOOLS = {
     "read_file", "list_files", "grep", "glob", "read_image",
@@ -67,7 +69,7 @@ class Agent:
         self.provider_name = provider_cfg["provider"]
         self.approval = approval
         self.max_turns = max(1, min(int(max_turns), 100))
-        self.max_tool_calls = max(1, min(int(max_tool_calls), 100))
+        self.max_tool_calls = max(1, min(int(max_tool_calls), 1000))
         self.max_tool_calls_per_turn = max(
             1, min(int(max_tool_calls_per_turn), self.max_tool_calls, 20))
         self._request_tool_calls = 0
@@ -357,7 +359,7 @@ class Agent:
             if getattr(d, "content", None):
                 text_parts.append(d.content)
                 if self.verbose:
-                    self._print(d.content, end="")
+                    self._write_stream_chunk(d.content)
             for tc in (getattr(d, "tool_calls", None) or []):
                 a = tool_acc.setdefault(tc.index, {"id": "", "name": "", "args": ""})
                 if tc.id:
@@ -483,9 +485,21 @@ class Agent:
                 f"prompt_tokens={u['prompt_tokens']} "
                 f"completion_tokens={u['completion_tokens']}")
 
+    def _write_stream_chunk(self, value):
+        """Write streamed model text literally, atomically, and without terminal controls."""
+        text = safe_terminal_text(value)
+        if not text:
+            return
+        with OUTPUT_LOCK:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+
     def _print(self, *a, **kw):
-        try:
-            from rich import print as rprint
-            rprint(*a, **kw)
-        except Exception:
-            print(*a, **kw)
+        # Tool workers may report concurrently; serialize all agent output so
+        # progress messages and streamed text cannot interleave mid-frame.
+        with OUTPUT_LOCK:
+            try:
+                from rich import print as rprint
+                rprint(*a, **kw)
+            except Exception:
+                print(*a, **kw)

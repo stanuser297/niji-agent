@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.8.4
+# Niji Agent 🌈 — v2.8.5
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -15,6 +15,11 @@ niji
 Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, enter its API key (visible input is the Termux-friendly default; hidden entry is optional), and choose a model. The key is saved locally in `~/.niji/config.json` with private file permissions—no `export` command is needed. Ollama can be used without an API key.
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
+
+## What's new in 2.8.5
+
+- `--max-tool-calls` CLI budget can now be raised to 1,000 per user request (still opt-in; default remains 30). Model turns and tool calls within each model turn remain separately capped. Connected MCP tools determine which integrations are actually available.
+- Serialized concurrent activity/tool output and streamed model text literally with control characters stripped, preventing tool/status output from flickering or corrupting the pinned chat area.
 
 ## What's new in 2.8.4
 
@@ -129,7 +134,7 @@ Research references: [OpenAI API error codes](https://developers.openai.com/api/
 niji                                      # interactive chat
 niji "Find and fix the bug in this project" # one-shot task
 niji --ask "Review the project and suggest fixes" # confirm side effects
-niji --max-turns 12 --max-tool-calls 20       # set lower per-request budgets
+niji --max-turns 100 --max-tool-calls 1000 --max-tool-calls-per-turn 20 # opt-in high tool budget
 niji --continue                           # resume latest session
 niji sessions                             # list saved sessions
 niji sessions search bug                  # search user prompts in saved sessions
@@ -144,7 +149,7 @@ niji providers use openrouter             # switch default provider
 
 Interactive slash commands: `/help`, `/model` (browse/switch provider and model with arrows), `/models`, `/approval [ask|auto]`, `/activity`, `/limits`, `/context`, `/status`, `/tools`, `/setup`, `/doctor`, `/cost`, `/compact`, `/memory [show|add <note>|clear]`, `/undo`, `/sessions [search words]`, `/clear`, `/exit`.
 
-The request budgets reset for each new user prompt. Defaults are capped at 20 model turns, 30 executed tools, and 6 tools from any one model response; hard limits prevent configuration above 100 turns / 100 tools / 20 tools per response. These are cost/loop guardrails, not an OS sandbox: commands still run with your account's permissions. Use `--ask` for confirmations, inspect commands before approving, and keep backups for important files.
+The request budgets reset for each new user prompt. Defaults are capped at 20 model turns, 30 executed tools, and 6 tools from any one model response; hard limits prevent configuration above 100 turns / 1,000 tools / 20 tools per response. These are cost/loop guardrails, not an OS sandbox: commands still run with your account's permissions. Use `--ask` for confirmations, inspect commands before approving, and keep backups for important files.
 
 Model discovery uses each connected provider's compatible models endpoint when available. Some providers hide catalogs or require manual model IDs; the picker explains that and keeps manual entry available. No API keys are shown in catalog output.
 

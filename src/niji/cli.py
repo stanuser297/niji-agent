@@ -19,6 +19,7 @@ from .config import (CONFIG_DIR, CONFIG_FILE, MCP_FILE, PRESETS, SESSION_DIR,
                      save_config)
 from .model_catalog import (fetch_provider_models, provider_is_configured,
                             provider_names, resolve_catalog_provider)
+from .terminal import OUTPUT_LOCK
 
 
 def _build_agent(args, mcp_path=None):
@@ -45,31 +46,32 @@ def _activity_notice(event):
     """Render concise execution phases, never private model reasoning."""
     level = event.get("level")
     message = event.get("message", "")
-    console = Console()
-    if level == "THINKING":
-        console.print(f"[dim bright_cyan]✧ {message}[/]")
-    elif level == "RETRY":
-        console.print(f"[yellow]↻ {message}[/]")
-    elif level == "LIMIT":
-        console.print(f"[bold yellow]⏸ {message}[/]")
-    elif level == "PLAN":
-        console.print(f"[bold cyan]⚙ {message}[/]")
-    elif level == "COMPACT":
-        console.print(f"[bold yellow]↘ {message}[/]")
-    elif level == "TOOL":
-        console.print(f"[bold cyan]⚒ {message}[/]")
-    elif level == "TOOL_DONE":
-        console.print(f"[green]✓ {message}[/]")
-    elif level == "CHECKPOINT":
-        console.print(f"[dim cyan]↶ {message}[/]")
-    elif level == "UNDO":
-        console.print(f"[bold green]↶ {message}[/]")
-    elif level == "DENIED":
-        console.print(f"[yellow]⊘ {message}[/]")
-    elif level == "ERROR":
-        console.print(f"[bold red]✗ {message}[/]")
-    elif level == "DONE":
-        console.print("[dim green]✓ Response complete[/]")
+    with OUTPUT_LOCK:
+        console = Console()
+        if level == "THINKING":
+            console.print(f"[dim bright_cyan]✧ {message}[/]")
+        elif level == "RETRY":
+            console.print(f"[yellow]↻ {message}[/]")
+        elif level == "LIMIT":
+            console.print(f"[bold yellow]⏸ {message}[/]")
+        elif level == "PLAN":
+            console.print(f"[bold cyan]⚙ {message}[/]")
+        elif level == "COMPACT":
+            console.print(f"[bold yellow]↘ {message}[/]")
+        elif level == "TOOL":
+            console.print(f"[bold cyan]⚒ {message}[/]")
+        elif level == "TOOL_DONE":
+            console.print(f"[green]✓ {message}[/]")
+        elif level == "CHECKPOINT":
+            console.print(f"[dim cyan]↶ {message}[/]")
+        elif level == "UNDO":
+            console.print(f"[bold green]↶ {message}[/]")
+        elif level == "DENIED":
+            console.print(f"[yellow]⊘ {message}[/]")
+        elif level == "ERROR":
+            console.print(f"[bold red]✗ {message}[/]")
+        elif level == "DONE":
+            console.print("[dim green]✓ Response complete[/]")
 
 
 # ---------------- provider management ----------------
@@ -768,7 +770,7 @@ def main():
     p.add_argument("--max-turns", type=int, default=20,
                    help="Maximum model turns per user request (1-100; default 20)")
     p.add_argument("--max-tool-calls", type=int, default=30,
-                   help="Maximum tool executions per user request (default 30; hard cap 100)")
+                   help="Maximum tool executions per user request (default 30; hard cap 1000)")
     p.add_argument("--max-tool-calls-per-turn", type=int, default=6,
                    help="Maximum tools executed from one model response (default 6; hard cap 20)")
     p.add_argument("--quiet", action="store_true")
