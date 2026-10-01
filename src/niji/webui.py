@@ -3,17 +3,23 @@ from __future__ import annotations
 
 import hmac
 import json
+import os
+import platform
+import re
 import secrets
 import threading
 import time
 import uuid
 import webbrowser
+from datetime import datetime
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
 from .compaction import estimate_tokens
 from .terminal import safe_terminal_text
+from .config import SESSION_DIR
 
 _MAX_BODY = 32_000
 _MAX_PROMPT = 20_000
@@ -52,6 +58,10 @@ el('form').addEventListener('submit',e=>{e.preventDefault();send()});el('prompt'
 async function decide(approved){if(!pendingApproval)return;const id=pendingApproval;el('approve').disabled=true;el('deny').disabled=true;try{await api('/api/approvals/'+id,{method:'POST',body:JSON.stringify({approved})});await refresh()}catch(e){setStatus('Approval failed: '+e.message,false)}finally{el('approve').disabled=false;el('deny').disabled=false}}
 el('approve').onclick=()=>decide(true);el('deny').onclick=()=>decide(false);initial();setInterval(refresh,1800);
 </script></body></html>'''
+
+
+# Serve the responsive workspace instead of the original compact chat page.
+from .webui_frontend import PAGE as _PAGE
 
 
 class NijiWebUI:
@@ -152,6 +162,8 @@ class NijiWebUI:
                     self._json(403, {"error": "Not authorized"}); return
                 if parsed.path == "/api/state":
                     self._json(200, ui._state()); return
+                if parsed.path == "/api/sessions":
+                    self._json(200, {"sessions": ui._list_sessions()}); return
                 if parsed.path.startswith("/api/jobs/"):
                     job_id = parsed.path.rsplit("/", 1)[-1]
                     with ui._lock:
@@ -189,7 +201,29 @@ class NijiWebUI:
                         ui._jobs[job_id] = {"id": job_id, "status": "running", "response": "", "error": "", "created": time.time()}
                     threading.Thread(target=ui._run_job, args=(job_id, message.strip()), daemon=True).start()
                     self._json(202, {"id": job_id}); return
-                if parsed.path.startswith("/api/approvals/"):
+                if parsed.path == "/api/session/new":
+                    try:
+                        ui._new_session()
+                    except RuntimeError as exc:
+                        self._json(409, {"error": str(exc)}); return
+                    self._json(200, ui._state()); return
+                if parsed.path.startswith("/api/sessions/"):
+                    session_id = parsed.path.rsplit("/", 1)[-1]
+                    try:
+                        ui._open_session(session_id)
+                    except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as exc:
+                        self._json(400, {"error": str(exc)[:250]}); return
+                    self._json(200, ui._state()); return
+                if parsed.path == "/api/settings":
+                    approval_mode = data.get("approval") if isinstance(data, dict) else None
+                    if approval_mode not in ("ask", "auto"):
+                        self._json(400, {"error": "approval must be ask or auto"}); return
+                    with ui._lock:
+                        if ui._busy:
+                            self._json(409, {"error": "Wait until the current request finishes before changing approval mode"}); return
+                        ui.agent.approval = approval_mode
+                    self._json(200, ui._state()); return
+                if parsed.path.startswith("/api/approvals/"): 
                     approval_id = parsed.path.rsplit("/", 1)[-1]
                     approved = data.get("approved") if isinstance(data, dict) else None
                     if not isinstance(approved, bool):
@@ -265,13 +299,83 @@ class NijiWebUI:
                     for old_id in list(self._jobs)[:-20]:
                         self._jobs.pop(old_id, None)
 
+    def _new_session(self):
+        with self._lock:
+            if self._busy:
+                raise RuntimeError("Wait until the current request finishes before starting a new thread")
+            if hasattr(self.agent, "_save_session"):
+                self.agent._save_session()
+            messages = list(getattr(self.agent, "messages", []))
+            self.agent.messages = messages[:2]
+            self.agent.session_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+            self.agent.usage = {"prompt_tokens": 0, "completion_tokens": 0, "turns": 0}
+            self.agent.tool_usage = {}
+            self.agent._request_tool_calls = 0
+            self.agent.todos = {"items": []}
+            self.agent.file_change_history = []
+            self.agent.started_at = time.monotonic()
+            self.agent.activity = []
+            self.agent._record_activity("READY", "New browser thread started")
+
+    def _open_session(self, session_id: str):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", session_id):
+            raise ValueError("Invalid session id")
+        path = SESSION_DIR / f"{session_id}.json"
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 5_000_000:
+            raise ValueError("Session is missing, unsafe, or too large to open")
+        try:
+            messages = json.loads(path.read_text())
+        except Exception as exc:
+            raise ValueError("Could not read that saved session") from exc
+        if (not isinstance(messages, list) or len(messages) > 2000
+                or any(not isinstance(m, dict) or m.get("role") not in ("system", "user", "assistant", "tool")
+                       for m in messages)):
+            raise ValueError("Saved session has an invalid message structure")
+        with self._lock:
+            if self._busy:
+                raise RuntimeError("Wait until the current request finishes before switching threads")
+            if hasattr(self.agent, "_save_session"):
+                self.agent._save_session()
+            self.agent.resume(messages)
+            self.agent.session_id = session_id
+            self.agent.activity = []
+            self.agent.usage = {"prompt_tokens": 0, "completion_tokens": 0, "turns": 0}
+            self.agent.tool_usage = {}
+            self.agent._request_tool_calls = 0
+            self.agent.file_change_history = []
+            self.agent.started_at = time.monotonic()
+            self.agent._record_activity("READY", f"Opened saved thread {session_id}")
+
+    def _list_sessions(self):
+        results = []
+        try:
+            files = sorted(SESSION_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        except OSError:
+            return results
+        for path in files[:40]:
+            if path.is_symlink() or path.stat().st_size > 5_000_000:
+                continue
+            try:
+                messages = json.loads(path.read_text())
+                if not isinstance(messages, list):
+                    continue
+                title = next((str(m.get("content", "")).strip() for m in messages
+                              if isinstance(m, dict) and m.get("role") == "user"
+                              and m.get("content") and not str(m["content"]).startswith("[Environment:")), "New thread")
+                results.append({"id": path.stem, "title": title[:100],
+                                "updated": datetime.fromtimestamp(path.stat().st_mtime).strftime("%b %d · %H:%M"),
+                                "messages": sum(1 for m in messages if isinstance(m, dict) and m.get("role") in ("user", "assistant"))})
+            except (OSError, ValueError, TypeError):
+                continue
+        return results
+
     def _state(self):
         with self._lock:
             pending = [{"id": a["id"], "tool": a["tool"], "preview": a["preview"]}
                        for a in self._approvals.values()]
             busy, active = self._busy, self._active_job
         with getattr(self.agent, "_activity_lock", threading.RLock()):
-            activity = list(getattr(self.agent, "activity", []))[-24:]
+            activity = list(getattr(self.agent, "activity", []))[-30:]
             usage = dict(getattr(self.agent, "usage", {}))
             tool_usage = dict(getattr(self.agent, "tool_usage", {}))
         provider_cfg = getattr(self.agent, "provider_cfg", {})
@@ -283,14 +387,24 @@ class NijiWebUI:
                     and not msg.get("tool_calls")
                     and not str(content).startswith("[Environment:")):
                 transcript.append({"role": msg["role"], "content": str(content)[:10_000]})
+        readonly = {"read_file", "list_files", "grep", "glob", "read_image", "file_search",
+                    "web_fetch", "web_search", "http_request", "database", "todo_read", "memory_read"}
+        catalog = []
+        for schema in getattr(self.agent, "tool_schemas", []):
+            fn = schema.get("function", {})
+            name = fn.get("name", "tool")
+            catalog.append({"name": name, "description": fn.get("description", "Connected tool"),
+                            "access": "Read-only" if name in readonly else "Confirmation recommended"})
+        uptime = max(0, int(time.monotonic() - getattr(self.agent, "started_at", time.monotonic())))
         return {
             "version": __version__, "provider": getattr(self.agent, "provider_name", provider_cfg.get("provider", "unknown")),
             "model": getattr(self.agent, "model", provider_cfg.get("model", "unknown")),
             "session_id": getattr(self.agent, "session_id", "local"), "approval": getattr(self.agent, "approval", "ask"),
             "busy": busy, "active_job": active, "pending_approvals": pending,
-            "tools": [s.get("function", {}).get("name", "tool") for s in getattr(self.agent, "tool_schemas", [])],
-            "activity": activity, "usage": usage, "tool_usage": tool_usage,
-            "tool_calls": sum(tool_usage.values()),
+            "tools": catalog, "activity": activity, "usage": usage, "tool_usage": tool_usage,
+            "tool_calls": sum(tool_usage.values()), "uptime_seconds": uptime,
+            "runtime": {"python": platform.python_version(), "platform": platform.system(),
+                        "workspace": Path.cwd().name or str(Path.cwd())},
             "context_tokens": estimate_tokens(messages), "transcript": transcript[-80:],
             "limits": {"max_turns": getattr(self.agent, "max_turns", 20),
                        "max_tool_calls": getattr(self.agent, "max_tool_calls", 30),

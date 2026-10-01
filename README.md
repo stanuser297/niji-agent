@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.10.0
+# Niji Agent 🌈 — v2.11.0
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -16,12 +16,17 @@ Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, ent
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
 
+## What's new in 2.11.0
+
+- Rebuilt `niji ui` as a complete responsive workspace inspired by the supplied mobile references: a clear navigation sidebar, chat, recent-thread search, overview, tool catalog, activity timeline, and settings.
+- Start and switch browser threads, inspect detailed tool permissions and runtime/session metrics, search tools, refresh activity, and toggle dark/light appearance. Chat keeps the composer easy to reach on narrow screens and includes starter prompts, copy-response actions, and clear progress states.
+- Browser tool confirmations show the action preview and allow one-time approve/deny. Approval mode can be changed for the current UI session; auto-approval warns first. Provider credentials are never sent to the page.
+- Added regression coverage for dashboard routes, the state schema, new/saved sessions, and approval settings. The UI remains protected by a private launch token and bound to loopback; it is not an internet/public or LAN phone-remote-access service.
+
 ## What's new in 2.10.0
 
-- Added `niji ui`: a polished responsive browser chat/dashboard that serves a token-protected URL on loopback only. It shows provider/model, usage, activity, tools, and recent chat, and runs requests in the background so the browser stays responsive.
-- Tool approvals appear in the browser and wait for an explicit approve/deny action. API keys are never sent to the page; prompts and request bodies are bounded; same-origin checks, a one-time launch token, and localhost-only binding protect the local server.
+- Added `niji ui`: a token-protected browser chat/dashboard on loopback only. It shows provider/model, usage, activity, tools, and recent chat, and runs requests in the background so the browser stays responsive.
 - `niji ui --open` can try to open the local page automatically. `niji ui --port 0` selects an available port. `--auto-approve` is an explicit opt-out from per-action approval; do not use it on an untrusted workspace.
-- This interface is reachable only from the same device by default. It is not an internet/public URL or LAN phone-remote-access service.
 
 ## What's new in 2.9.0
 
