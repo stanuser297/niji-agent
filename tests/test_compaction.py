@@ -81,6 +81,34 @@ class CompactionTests(unittest.TestCase):
         self.assertEqual(text, "")
         self.assertEqual(tools, [])
 
+    def test_plan_only_sends_no_tools_and_does_not_mutate_history(self):
+        agent = self.make_agent()
+        agent.plan_only = True
+        agent.messages = [{"role": "system", "content": "rules"},
+                          {"role": "user", "content": "environment"},
+                          {"role": "user", "content": "fix my bug"}]
+        captured = {}
+        agent.client = types.SimpleNamespace(chat=types.SimpleNamespace(
+            completions=types.SimpleNamespace(create=lambda **kwargs: captured.update(kwargs) or [])))
+        agent._chat()
+        self.assertEqual(captured["tools"], [])
+        self.assertIn("planning-only turn", captured["messages"][-1]["content"])
+        self.assertEqual(agent.messages[-1]["content"], "fix my bug")
+        self.assertEqual(len(agent.messages), 3)
+
+    def test_stream_callback_receives_live_text_chunks(self):
+        agent = self.make_agent()
+        def chunk(text):
+            delta = types.SimpleNamespace(content=text, tool_calls=None)
+            return types.SimpleNamespace(usage=None, choices=[types.SimpleNamespace(delta=delta)])
+        agent.client = types.SimpleNamespace(chat=types.SimpleNamespace(
+            completions=types.SimpleNamespace(create=lambda **kwargs: [chunk("Thinking "), chunk("now")])))
+        received = []
+        agent.stream_callback = received.append
+        _, text, _ = agent._chat()
+        self.assertEqual(text, "Thinking now")
+        self.assertEqual(received, ["Thinking ", "now"])
+
     def test_one_413_retry_only_and_surface_persistent_failure(self):
         agent = self.make_agent()
         agent.messages = [

@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.11.0
+# Niji Agent 🌈 — v2.12.0
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -15,6 +15,14 @@ niji
 Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, enter its API key (visible input is the Termux-friendly default; hidden entry is optional), and choose a model. The key is saved locally in `~/.niji/config.json` with private file permissions—no `export` command is needed. Ollama can be used without an API key.
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
+
+## What's new in 2.12.0
+
+- Live browser progress now uses readable phases such as “Thinking on it”, “Mapping it out”, tool activity, retry, and completion; assistant text streams into the chat as it arrives.
+- Added a cooperative Stop control, a true plan-only mode that sends no tools, per-tool ask/allow/block/default policies, and a “Run this plan” follow-up action.
+- The chat view lists the session’s recent file edits and offers guarded undo; saved/current chats can export visible user/assistant messages only.
+- Settings now include local memory management and offline context compaction. Mobile layout, saved-thread search/resume, test-running tools, and Git review tools remain available.
+- Added browser/API tests for streaming state, planning without tools, tool policies, transcript privacy, memory, and context compaction.
 
 ## What's new in 2.11.0
 
@@ -174,7 +182,7 @@ Interactive slash commands: `/help`, `/model` (browse/switch provider and model 
 ```sh
 niji --ask "Check the repo status, search for TODOs, and run the tests"
 niji --ask "Search the web for the latest Python release and cite sources"
-niji --ask "Inspect this SQLite database with a read-only query" 
+niji --ask "Inspect this SQLite database with a read-only query"
 niji --ask "Start the dev server, show its logs, then stop it"
 ```
 

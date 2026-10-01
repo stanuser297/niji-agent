@@ -51,6 +51,22 @@ class FileUndoTests(unittest.TestCase):
             self.assertEqual(target.read_text(), "newer human change")
             self.assertIsNotNone(agent.latest_file_change())
 
+    def test_session_tool_policy_can_block_or_allow_an_action(self):
+        agent = self.make_agent()
+        agent.approval = "ask"
+        agent.approval_callback = lambda *args: (_ for _ in ()).throw(AssertionError("approval should be bypassed"))
+        call = {"name": "write_file", "args": {"path": "/tmp/niji-policy-test.txt", "content": "ok"}}
+        agent.tool_policies["write_file"] = "block"
+        blocked = agent._execute(call)
+        self.assertIn("blocked by session tool policy", blocked)
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "allowed.txt"
+            call["args"]["path"] = str(target)
+            agent.tool_policies["write_file"] = "allow"
+            result = agent._execute(call)
+            self.assertTrue(target.exists())
+            self.assertIn("ok", result)
+
     def test_edit_tool_exposes_undo_checkpoint_to_user(self):
         agent = self.make_agent()
         with tempfile.TemporaryDirectory() as directory:

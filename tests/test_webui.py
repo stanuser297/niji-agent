@@ -1,4 +1,6 @@
+import hashlib
 import json
+import os
 import threading
 import time
 import unittest
@@ -16,6 +18,7 @@ class FakeAgent:
         self.provider_cfg = {"provider": "test", "model": "demo-model", "api_key": "private-test-secret"}
         self.provider_name = "test"
         self.model = "demo-model"
+        self.client = object()
         self.session_id = "test-session"
         self.approval = "ask"
         self.approval_callback = None
@@ -33,6 +36,16 @@ class FakeAgent:
         self.max_tool_calls = 30
         self.max_tool_calls_per_turn = 6
         self.require_approval = require_approval
+        self.tool_policies = {}
+        self.last_plan_only = False
+        self.pause_stream = False
+        self.stream_ready = threading.Event()
+        self.finish_stream = threading.Event()
+        self.cancel_requested = threading.Event()
+
+    def cancel(self):
+        self.cancel_requested.set()
+        self.finish_stream.set()
 
     def resume(self, messages):
         self.messages = list(messages)
@@ -41,12 +54,24 @@ class FakeAgent:
         self.activity.append({"time": "12:01:00", "level": level, "message": message})
 
     def chat(self, message):
+        self.last_plan_only = bool(getattr(self, "plan_only", False))
+        if self.activity_callback:
+            self.activity_callback({"time": "12:02:00", "level": "THINKING", "message": "Thinking on it"})
         self.messages.append({"role": "user", "content": message})
         if self.require_approval:
             approved = self.approval_callback("write_file", {"path": "notes.txt"})
             answer = "approved" if approved else "denied"
+        elif self.last_plan_only:
+            answer = "1. Inspect the project\\n2. Run the tests"
         else:
             answer = "Hello from Niji: " + message
+        if self.stream_callback:
+            self.stream_callback(answer[:10])
+            self.stream_ready.set()
+            if self.pause_stream:
+                self.finish_stream.wait(2)
+            if not self.cancel_requested.is_set():
+                self.stream_callback(answer[10:])
         self.messages.append({"role": "assistant", "content": answer})
         self.usage["turns"] += 1
         return answer
@@ -94,6 +119,12 @@ class WebUITests(unittest.TestCase):
         self.assertIn('id="view-overview"', page)
         self.assertIn('id="view-tools"', page)
         self.assertIn('id="view-settings"', page)
+        self.assertIn("Thinking on it", page)
+        self.assertIn("Mapping it out", page)
+        self.assertIn('id="plan-only"', page)
+        self.assertIn('id="stop-job"', page)
+        self.assertIn('id="file-changes"', page)
+        self.assertIn("Ask every time", page)
 
     def test_state_endpoint_requires_token_and_never_returns_api_key(self):
         with self.assertRaises(urllib.error.HTTPError) as missing:
@@ -119,6 +150,143 @@ class WebUITests(unittest.TestCase):
             time.sleep(0.03)
         self.assertEqual(job["status"], "completed")
         self.assertEqual(job["response"], "Hello from Niji: hello")
+        self.assertEqual(job["streamed"], "Hello from Niji: hello")
+        self.assertTrue(job["plan_only"] is False)
+
+    def test_streamed_text_is_available_before_completion_and_stop_is_cooperative(self):
+        self.agent.pause_stream = True
+        started = json.loads(self.request("/api/chat", {"message": "slow response"}, self.ui.token).read())
+        self.assertTrue(self.agent.stream_ready.wait(2))
+        job = json.loads(self.request("/api/jobs/" + started["id"], token=self.ui.token).read())
+        self.assertEqual(job["status"], "running")
+        self.assertTrue(job["streamed"])
+        self.assertEqual(job["progress"], "Writing the response")
+        response = self.request("/api/jobs/" + started["id"] + "/cancel", {}, self.ui.token)
+        self.assertEqual(response.status, 202)
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            job = json.loads(self.request("/api/jobs/" + started["id"], token=self.ui.token).read())
+            if job["status"] != "running":
+                break
+            time.sleep(0.03)
+        self.assertEqual(job["status"], "cancelled")
+
+    def test_plan_only_does_not_execute_tools_and_is_visible_in_job(self):
+        started = json.loads(self.request("/api/chat", {"message": "inspect project", "plan_only": True}, self.ui.token).read())
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            job = json.loads(self.request("/api/jobs/" + started["id"], token=self.ui.token).read())
+            if job["status"] != "running":
+                break
+            time.sleep(0.03)
+        self.assertEqual(job["status"], "completed")
+        self.assertTrue(job["plan_only"])
+        self.assertTrue(self.agent.last_plan_only)
+        self.assertIn("Inspect the project", job["response"])
+
+    def test_session_tool_policy_can_be_changed(self):
+        state = json.loads(self.request("/api/tool-policy", {"name": "read_file", "policy": "block"}, self.ui.token).read())
+        self.assertEqual(state["tool_policies"]["read_file"], "block")
+        with self.assertRaises(urllib.error.HTTPError) as invalid:
+            self.request("/api/tool-policy", {"name": "not_a_tool", "policy": "allow"}, self.ui.token).read()
+        self.assertEqual(invalid.exception.code, 400)
+
+    def test_workspace_profiles_switch_folder_and_reload_project_guidance(self):
+        old_cwd = Path.cwd()
+        self.addCleanup(os.chdir, old_cwd)
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            workspace = base / "project"
+            workspace.mkdir()
+            (workspace / "AGENTS.md").write_text("Use unittest for this project.")
+            with patch("niji.webui.CONFIG_DIR", base / "config"), \
+                 patch("niji.webui._PROFILE_FILE", base / "config" / "project_profiles.json"):
+                saved = json.loads(self.request("/api/profiles", {
+                    "action": "save", "name": "demo", "path": str(workspace)}, self.ui.token).read())
+                self.assertEqual(saved["profiles"][0]["name"], "demo")
+                active = json.loads(self.request("/api/profiles", {
+                    "action": "activate", "name": "demo"}, self.ui.token).read())
+                self.assertEqual(active["workspace"], str(workspace.resolve()))
+                state = json.loads(self.request("/api/state", token=self.ui.token).read())
+                self.assertTrue(state["runtime"]["project_guidance"])
+                self.assertIn("Use unittest", self.agent.messages[0]["content"])
+        os.chdir(old_cwd)
+
+    def test_file_diff_endpoint_returns_unified_diff_and_redacts_provider_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "notes.txt"
+            path.write_text("new private-test-secret value\n")
+            self.agent.file_change_history = [{
+                "path": str(path), "before": b"old value\n",
+                "after_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "operation": "write",
+            }]
+            result = json.loads(self.request("/api/changes/0", token=self.ui.token).read())
+            self.assertIn("-old value", result["diff"])
+            self.assertIn("+new [redacted] value", result["diff"])
+            self.assertNotIn("private-test-secret", result["diff"])
+
+    def test_file_diff_endpoint_rejects_symlink_and_bad_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "target.txt"
+            target.write_text("content")
+            link = Path(tmp) / "link.txt"
+            link.symlink_to(target)
+            self.agent.file_change_history = [{"path": str(link), "before": b"", "operation": "write"}]
+            with self.assertRaises(urllib.error.HTTPError) as unsafe:
+                self.request("/api/changes/0", token=self.ui.token).read()
+            self.assertEqual(unsafe.exception.code, 400)
+            with self.assertRaises(urllib.error.HTTPError) as invalid:
+                self.request("/api/changes/abc", token=self.ui.token).read()
+            self.assertEqual(invalid.exception.code, 400)
+
+    def test_profile_storage_error_returns_json_not_dropped_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            workspace = base / "project"
+            workspace.mkdir()
+            blocked = base / "not-a-directory"
+            blocked.write_text("block")
+            with patch("niji.webui.CONFIG_DIR", blocked), \
+                 patch("niji.webui._PROFILE_FILE", blocked / "profiles.json"):
+                with self.assertRaises(urllib.error.HTTPError) as failure:
+                    self.request("/api/profiles", {
+                        "action": "save", "name": "demo", "path": str(workspace)}, self.ui.token).read()
+                self.assertEqual(failure.exception.code, 400)
+                payload = json.loads(failure.exception.read())
+                self.assertIn("Could not save workspace profiles", payload["error"])
+
+    def test_browser_memory_controls_read_replace_and_clear_private_notes(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("niji.webui.MEMORY_FILE", Path(tmp) / "MEMORY.md"):
+            initial = json.loads(self.request("/api/memory", token=self.ui.token).read())
+            self.assertEqual(initial["content"], "")
+            saved = self.request("/api/memory", {"action": "replace", "content": "Use pytest."}, self.ui.token).read()
+            self.assertIn(b"Use pytest", saved)
+            self.assertEqual((Path(tmp) / "MEMORY.md").read_text(), "Use pytest.")
+            self.request("/api/memory", {"action": "clear", "content": ""}, self.ui.token).read()
+            self.assertFalse((Path(tmp) / "MEMORY.md").exists())
+
+    def test_browser_context_compaction_keeps_the_latest_request(self):
+        self.agent.messages.extend([
+            {"role": "user", "content": "old question"},
+            {"role": "assistant", "content": "old answer " * 500},
+            {"role": "user", "content": "current question"},
+        ])
+        result = json.loads(self.request("/api/compact", {}, self.ui.token).read())
+        self.assertTrue(result["changed"])
+        self.assertEqual(self.agent.messages[-1]["content"], "current question")
+        self.assertLess(result["after"], result["before"])
+
+    def test_current_session_export_omits_internal_messages(self):
+        self.agent.messages.extend([
+            {"role": "user", "content": "export this"},
+            {"role": "assistant", "content": "visible reply"},
+            {"role": "tool", "content": "private tool output"},
+        ])
+        data = json.loads(self.request("/api/sessions/test-session/export", token=self.ui.token).read())
+        self.assertEqual([m["role"] for m in data["messages"]], ["user", "assistant"])
+        self.assertNotIn("private system instructions", json.dumps(data))
+        self.assertNotIn("private tool output", json.dumps(data))
 
     def test_tool_approval_is_delivered_to_the_browser(self):
         self.agent.require_approval = True

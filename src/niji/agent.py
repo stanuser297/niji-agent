@@ -93,6 +93,10 @@ class Agent:
         self.activity = [{"time": datetime.now().strftime("%H:%M:%S"),
                           "level": "INFO", "message": "Provider configuration loaded"}]
         self.activity_callback = None
+        self.stream_callback = None
+        self.tool_policies = {}
+        self.plan_only = False
+        self._cancel_event = threading.Event()
         self._activity_lock = threading.Lock()
         self._usage_supported = True
 
@@ -235,6 +239,10 @@ class Agent:
         finally:
             self._save_session()
 
+    def cancel(self):
+        """Request a cooperative stop at the next model-stream or tool boundary."""
+        self._cancel_event.set()
+
     def resume(self, messages: list):
         self.messages = messages
 
@@ -258,9 +266,17 @@ class Agent:
 
     def _loop(self) -> str:
         for turn in range(1, self.max_turns + 1):
+            if self._cancel_event.is_set():
+                self._record_activity("STOPPED", "Stopped by user")
+                return "[Stopped by user]"
             self.usage["turns"] += 1
             self._record_activity("THINKING", f"Thinking · {self.provider_name}/{self.model} · turn {turn}")
             msg, text, tool_calls = self._chat()
+            if self._cancel_event.is_set():
+                if text and not tool_calls:
+                    self.messages.append(msg)
+                self._record_activity("STOPPED", "Stopped by user")
+                return text or "[Stopped by user]"
             self.messages.append(msg)
 
             if not tool_calls:
@@ -327,8 +343,14 @@ class Agent:
             raise
 
     def _chat(self):
-        kwargs = dict(model=self.model, messages=self.messages,
-                      tools=self.tool_schemas, stream=True)
+        request_messages = self.messages
+        if self.plan_only:
+            request_messages = [*self.messages, {
+                "role": "system",
+                "content": "This is a planning-only turn. Return a concise actionable plan and important risks. Do not call tools, edit files, run commands, or claim execution."
+            }]
+        kwargs = dict(model=self.model, messages=request_messages,
+                      tools=[] if self.plan_only else self.tool_schemas, stream=True)
         if self._usage_supported:
             kwargs["stream_options"] = {"include_usage": True}
         try:
@@ -354,6 +376,8 @@ class Agent:
 
         text_parts, tool_acc = [], {}
         for chunk in stream:
+            if self._cancel_event.is_set():
+                break
             if getattr(chunk, "usage", None):
                 self.usage["prompt_tokens"] += chunk.usage.prompt_tokens or 0
                 self.usage["completion_tokens"] += chunk.usage.completion_tokens or 0
@@ -362,6 +386,12 @@ class Agent:
             d = chunk.choices[0].delta
             if getattr(d, "content", None):
                 text_parts.append(d.content)
+                callback = self.stream_callback
+                if callback:
+                    try:
+                        callback(d.content)
+                    except Exception:
+                        pass
                 if self.verbose:
                     self._write_stream_chunk(d.content)
             for tc in (getattr(d, "tool_calls", None) or []):
@@ -445,6 +475,9 @@ class Agent:
 
     def _execute(self, tc: dict):
         name, args = tc["name"], tc["args"]
+        if self._cancel_event.is_set():
+            self._record_activity("STOPPED", "Skipped remaining tool calls after stop request")
+            return "[cancelled by user]"
         with self._activity_lock:
             self.tool_usage[name] = self.tool_usage.get(name, 0) + 1
         self._record_activity("TOOL", f"Tool call: {name}")
@@ -459,7 +492,13 @@ class Agent:
         no_approval_needed = name in read_only_tools
         if name == "archive" and args.get("action") == "list":
             no_approval_needed = True
-        if self.approval == "ask" and not no_approval_needed:
+        policy = self.tool_policies.get(name, "default")
+        if policy == "block":
+            self._record_activity("DENIED", f"{name} blocked by session tool policy")
+            return "[blocked by session tool policy]"
+        needs_approval = (policy == "ask" or
+                          (policy == "default" and self.approval == "ask" and not no_approval_needed))
+        if needs_approval:
             if self.approval_callback is not None:
                 try:
                     approved = bool(self.approval_callback(name, args))
