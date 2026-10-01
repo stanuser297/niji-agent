@@ -13,7 +13,7 @@ from rich.table import Table
 from rich.text import Text
 
 from . import __version__
-from .ui import render_home
+from .ui import render_home, render_startup_dashboard
 from .config import (CONFIG_DIR, CONFIG_FILE, MCP_FILE, PRESETS, SESSION_DIR,
                      load_config, load_mcp_servers, resolve_provider,
                      save_config)
@@ -408,6 +408,10 @@ def _render_home(agent, provider, quiet=False):
     render_home(agent, provider, quiet=quiet)
 
 
+def _render_startup_dashboard(agent, provider, quiet=False):
+    render_startup_dashboard(agent, provider, quiet=quiet)
+
+
 def _show_context(agent):
     from .compaction import estimate_tokens
     messages = list(getattr(agent, "messages", []) or [])
@@ -542,8 +546,9 @@ def _show_provider_error(provider, exc):
 
 def _interactive_chat(agent, provider, quiet=False):
     console = Console()
-    # Keep the live chat composer as the primary screen; the full command-center
-    # dashboard remains available on demand with /status.
+    # Show a compact command-center summary above the pinned composer at launch;
+    # /status opens the full dashboard on demand.
+    _render_startup_dashboard(agent, provider, quiet=quiet)
     while True:
         try:
             from .chat_prompt import read_chat_prompt
