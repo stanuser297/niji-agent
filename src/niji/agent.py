@@ -19,8 +19,8 @@ from .tools import CORE_SCHEMAS, SUBAGENT_TOOLS, dispatch
 from .terminal import OUTPUT_LOCK, safe_terminal_text
 
 PARALLEL_SAFE_TOOLS = {
-    "read_file", "list_files", "grep", "glob", "read_image",
-    "web_fetch", "todo_read", "memory_read",
+    "read_file", "list_files", "grep", "glob", "read_image", "file_search",
+    "web_fetch", "web_search", "http_request", "database", "todo_read", "memory_read",
 }
 DEFAULT_MAX_TURNS = 20
 DEFAULT_MAX_TOOL_CALLS = 30
@@ -28,9 +28,11 @@ DEFAULT_MAX_TOOL_CALLS_PER_TURN = 6
 
 SYSTEM_PROMPT = (
     "You are Niji, an autonomous senior software engineer running in the user's terminal.\n"
-    "Capabilities: read/write/edit files, run shell commands, search code, fetch web pages, "
-    "read images, plan with todos, launch subagents for focused subtasks, use connected "
-    "MCP tools (<server>__<tool>), and persistent memory across sessions.\n"
+    "Capabilities: read/write/edit files, safe contextual patching, shell and Git operations, "
+    "run bounded project tests, search code and the public web, fetch HTTP pages, optionally "
+    "drive a headless browser, inspect images, safely inspect/extract archives, manage approved "
+    "packages and session processes, run read-only SQLite queries, plan with todos, launch "
+    "bounded subagents, use connected MCP tools (<server>__<tool>), and persistent memory.\n"
     "Rules:\n"
     "1. For multi-step work, write a todo plan first (todo_write), then execute step by step.\n"
     "2. Explore before editing: list_files / read_file / grep.\n"
@@ -44,11 +46,11 @@ SYSTEM_PROMPT = (
     "9. Help with ordinary, benign requests; do not give a generic refusal when the task is allowed.\n"
     "10. User messages may be Hinglish or contain typos. Infer the likely meaning from context; "
     "ask one short clarification only when meaning materially changes the answer.\n"
-    "11. For current/trending information, use web_fetch on a relevant public source when available. "
-    "For example, a request for a GitHub repo trending today is allowed: check GitHub Trending, "
-    "share the repository link, and say what source/date you checked. If lookup fails, explain "
-    "that limitation and offer a useful next step instead of refusing. Never claim a live lookup "
-    "without actually fetching a source.\n"
+    "11. For current/trending information, use web_search to find relevant sources, then web_fetch "
+    "to verify details when available. A request for a GitHub repo trending today is allowed: "
+    "check GitHub Trending, share the repository link, and say what source/date you checked. "
+    "If lookup fails, explain that limitation and offer a useful next step instead of refusing. "
+    "Never claim a live lookup without actually checking a source.\n"
     "Be proactive, precise, and verify rather than assume."
 )
 
@@ -447,10 +449,16 @@ class Agent:
         if self.verbose:
             self._print(f"\n[tool] {name} {json.dumps(args, default=str)[:250]}")
 
-        if self.approval == "ask" and name not in {
-                "read_file", "list_files", "grep", "glob", "read_image",
-                "todo_read", "todo_write", "memory_read"}:
-            preview = (args.get("command") if name == "bash"
+        read_only_tools = {
+            "read_file", "list_files", "grep", "glob", "read_image", "file_search",
+            "web_fetch", "web_search", "http_request", "database",
+            "todo_read", "todo_write", "memory_read",
+        }
+        no_approval_needed = name in read_only_tools
+        if name == "archive" and args.get("action") == "list":
+            no_approval_needed = True
+        if self.approval == "ask" and not no_approval_needed:
+            preview = (args.get("command") if name in ("bash", "process_manager")
                        else json.dumps(args, default=str)[:300])
             print(f"\nApprove {name}: {preview}")
             if input("Approve? [y/N] ").strip().lower() != "y":

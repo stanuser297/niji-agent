@@ -1,6 +1,9 @@
 from .builtin import (bash, read_file, write_file, edit_file, list_files,
                       grep, glob, web_fetch, read_image)
 from .stateful import todo_read, todo_write, task, memory_read, memory_write
+from .advanced import (web_search, browser, git, run_tests, file_search,
+                       apply_patch, package_manager, database, http_request,
+                       archive, process_manager)
 
 HANDLERS = {
     "bash": bash, "read_file": read_file, "write_file": write_file,
@@ -9,9 +12,14 @@ HANDLERS = {
     "todo_read": todo_read, "todo_write": todo_write,
     "memory_read": memory_read, "memory_write": memory_write,
     "task": task,
+    "web_search": web_search, "browser": browser, "git": git,
+    "run_tests": run_tests, "file_search": file_search,
+    "apply_patch": apply_patch, "package_manager": package_manager,
+    "database": database, "http_request": http_request,
+    "archive": archive, "process_manager": process_manager,
 }
 
-# tools a subagent is allowed to use ("task" excluded to stop recursion)
+# Tools a subagent is allowed to use ("task" excluded to stop recursion).
 SUBAGENT_TOOLS = [k for k in HANDLERS if k != "task"]
 
 
@@ -21,7 +29,7 @@ def dispatch(name: str, args: dict, ctx: dict = None):
     if fn:
         if name == "todo_read":
             return fn(ctx)
-        if name in ("todo_write", "task", "write_file", "edit_file"):
+        if name in ("todo_write", "task", "write_file", "edit_file", "apply_patch"):
             return fn(ctx=ctx, **args)
         return fn(**args)
     # MCP connector tools: "<server>__<tool>"
@@ -41,84 +49,83 @@ def _schema(name, desc, props, req):
         "name": name, "description": desc,
         "parameters": {"type": "object", "properties": props, "required": req}}}
 
+
 def _s(t, d, **kw):
     return {"type": t, "description": d, **kw}
 
 
 CORE_SCHEMAS = [
     _schema("bash",
-            "Run a shell command (build, test, git, install, execute code, run scripts). "
-            "Returns combined stdout+stderr.",
+            "Run a shell command (build, test, git, install, execute code, run scripts). Returns combined stdout+stderr.",
             {"command": _s("string", "The shell command"),
              "cwd": _s("string", "Working directory (optional)"),
-             "timeout": _s("integer", "Timeout seconds (default 120)")},
-            ["command"]),
+             "timeout": _s("integer", "Timeout seconds (default 120)")}, ["command"]),
     _schema("read_file", "Read a text file with line numbers.",
-            {"path": _s("string", "File path"),
-             "offset": _s("integer", "Start line (0-based)"),
-             "limit": _s("integer", "Max lines (default 400)")},
-            ["path"]),
-    _schema("write_file", "Create or overwrite a file with exact content. Niji keeps a private, session-local undo checkpoint for files up to 1 MB; the user can restore it with /undo.",
-            {"path": _s("string", "File path"),
-             "content": _s("string", "Full file content")},
-            ["path", "content"]),
-    _schema("edit_file",
-            "Replace exactly ONE unique occurrence of old_text with new_text. "
-            "Prefer over write_file for small changes. Niji keeps a private, session-local undo checkpoint for files up to 1 MB; the user can restore it with /undo.",
-            {"path": _s("string", "File path"),
-             "old_text": _s("string", "Exact unique text to replace"),
-             "new_text": _s("string", "Replacement text")},
-            ["path", "old_text", "new_text"]),
+            {"path": _s("string", "File path"), "offset": _s("integer", "Start line (0-based)"),
+             "limit": _s("integer", "Max lines (default 400)")}, ["path"]),
+    _schema("write_file", "Create or overwrite a file with exact content. Niji keeps a private, session-local undo checkpoint for files up to 1 MB; restore with /undo.",
+            {"path": _s("string", "File path"), "content": _s("string", "Full file content")}, ["path", "content"]),
+    _schema("edit_file", "Replace exactly ONE unique occurrence of old_text with new_text. Prefer over write_file for small changes; changes can be restored with /undo.",
+            {"path": _s("string", "File path"), "old_text": _s("string", "Exact unique text to replace"),
+             "new_text": _s("string", "Replacement text")}, ["path", "old_text", "new_text"]),
     _schema("list_files", "List files in a directory tree up to a depth.",
-            {"path": _s("string", "Directory (default .)"),
-             "depth": _s("integer", "Max depth (default 2)")},
-            []),
+            {"path": _s("string", "Directory (default .)"), "depth": _s("integer", "Max depth (default 2)")}, []),
     _schema("grep", "Regex-search file contents under a directory.",
-            {"pattern": _s("string", "Regex pattern"),
-             "path": _s("string", "Directory (default .)"),
-             "include": _s("string", "Glob filter e.g. *.py (default *)")},
-            ["pattern"]),
+            {"pattern": _s("string", "Regex pattern"), "path": _s("string", "Directory (default .)"),
+             "include": _s("string", "Glob filter e.g. *.py (default *)")}, ["pattern"]),
     _schema("glob", "Find files by glob pattern.",
-            {"pattern": _s("string", "Glob e.g. **/*.py"),
-             "path": _s("string", "Base directory (default .)")},
-            ["pattern"]),
-    _schema("web_fetch",
-            "Fetch a URL and return its text content (HTML stripped). "
-            "Use for docs, APIs, pages.",
-            {"url": _s("string", "Full URL including https://"),
-             "max_chars": _s("integer", "Max chars to return (default 15000)")},
-            ["url"]),
-    _schema("read_image",
-            "Read an image file so a vision model can see it (screenshots, diagrams, photos).",
-            {"path": _s("string", "Image file path")},
-            ["path"]),
-    _schema("todo_write",
-            "Plan and track progress on multi-step tasks. Overwrite the full list each time. "
-            "Mark exactly one task in_progress.",
-            {"todos": _s("array", "The task list", items={
-                "type": "object",
-                "properties": {
-                    "content": _s("string", "What to do"),
-                    "status": _s("string", "pending | in_progress | completed",
-                                 enum=["pending", "in_progress", "completed"]),
-                    "activeForm": _s("string", "Short form shown while working on it"),
-                },
-                "required": ["content", "status"]}),
-             "activeForm": _s("string", "What you are doing right now")},
-            ["todos"]),
+            {"pattern": _s("string", "Glob e.g. **/*.py"), "path": _s("string", "Base directory (default .)")}, ["pattern"]),
+    _schema("web_fetch", "Fetch a public URL and return its text content (HTML stripped).", 
+            {"url": _s("string", "Full URL including https://"), "max_chars": _s("integer", "Max chars to return (default 15000)")}, ["url"]),
+    _schema("read_image", "Read an image file so a vision model can see it (screenshots, diagrams, photos).",
+            {"path": _s("string", "Image file path")}, ["path"]),
+    _schema("todo_write", "Plan and track a multi-step task. Overwrite the full list each time; mark exactly one task in_progress.",
+            {"todos": _s("array", "The task list", items={"type": "object", "properties": {
+                "content": _s("string", "What to do"), "status": _s("string", "pending | in_progress | completed", enum=["pending", "in_progress", "completed"]),
+                "activeForm": _s("string", "Short form shown while working")}, "required": ["content", "status"]}),
+             "activeForm": _s("string", "Current work")}, ["todos"]),
     _schema("todo_read", "Read the current task plan.", {}, []),
-    _schema("task",
-            "Launch a SUBAGENT with a fresh context window to handle a self-contained "
-            "subtask (research, a focused bug, exploring a big file). The subagent has all "
-            "tools but cannot spawn more subagents. Returns its final report.",
-            {"prompt": _s("string", "Complete, self-contained instructions for the subagent")},
-            ["prompt"]),
-    _schema("memory_read",
-            "Read niji's long-term memory (persistent across all sessions/projects).",
-            {}, []),
-    _schema("memory_write",
-            "Append a fact/preference/decision to long-term memory. Use sparingly, "
-            "for things useful across sessions (user prefs, project conventions).",
-            {"note": _s("string", "The fact to remember, 1-3 lines")},
-            ["note"]),
+    _schema("task", "Launch a bounded subagent for a self-contained subtask. Subagents cannot spawn more subagents.",
+            {"prompt": _s("string", "Complete, self-contained instructions for the subagent")}, ["prompt"]),
+    _schema("memory_read", "Read Niji's long-term memory (persistent across sessions/projects). Do not store secrets.", {}, []),
+    _schema("memory_write", "Append a non-secret fact/preference useful across future sessions.",
+            {"note": _s("string", "The fact to remember, 1-3 lines; never include credentials")}, ["note"]),
+
+    # Additional requested capabilities (14 areas total including memory/todos/images).
+    _schema("web_search", "Search public web pages and return result titles, snippets, and source URLs. Verify important facts at the source.",
+            {"query": _s("string", "Search query"), "limit": _s("integer", "Maximum results, 1-10 (default 5)")}, ["query"]),
+    _schema("browser", "Optional headless browser for public pages. Open a URL, then perform up to 12 click/fill/press/wait actions and return visible page text. Use --ask for interactions.",
+            {"url": _s("string", "Public http(s) URL"), "actions": _s("array", "Optional actions", items={"type": "object", "properties": {
+                "type": _s("string", "click, fill, press, or wait", enum=["click", "fill", "press", "wait"]),
+                "selector": _s("string", "CSS selector, when applicable"), "value": _s("string", "Text/key or wait milliseconds")}, "required": ["type"]}),
+             "wait_ms": _s("integer", "Extra page wait (0-3000 ms)")}, ["url"]),
+    _schema("git", "Run an allowlisted Git command. Read commands are safe; use --ask before mutations such as commit, push, checkout, or reset.",
+            {"args": _s("array", "Git arguments, e.g. [status, --short]", items={"type": "string"}),
+             "cwd": _s("string", "Repository directory (default .)"), "timeout": _s("integer", "Timeout seconds")}, ["args"]),
+    _schema("run_tests", "Run known project tests without arbitrary shell input (Python, npm, Go, Cargo). Auto-detects supported manifests.",
+            {"kind": _s("string", "auto, pytest, unittest, npm, go, cargo", enum=["auto", "pytest", "unittest", "npm", "go", "cargo"]),
+             "path": _s("string", "Project directory"), "timeout": _s("integer", "Timeout, maximum 120 seconds")}, []),
+    _schema("file_search", "Search filenames and file text for a literal, case-insensitive phrase. Skips common dependency/build directories.",
+            {"query": _s("string", "Text to find"), "path": _s("string", "Directory to search"), "include": _s("string", "Glob filter, e.g. *.py")}, ["query"]),
+    _schema("apply_patch", "Apply one exact, unique old_text/new_text patch to a file. Refuses ambiguous matches and records /undo checkpoint.",
+            {"path": _s("string", "File path"), "old_text": _s("string", "Unique exact context to replace"),
+             "new_text": _s("string", "Replacement text")}, ["path", "old_text", "new_text"]),
+    _schema("package_manager", "Check or install named packages with pip, uv, npm, or bun. Use --ask before installing dependencies.",
+            {"manager": _s("string", "pip, uv, npm, bun", enum=["pip", "uv", "npm", "bun"]),
+             "action": _s("string", "check or install", enum=["check", "install"]),
+             "packages": _s("array", "Package names (not shell flags)", items={"type": "string"}),
+             "cwd": _s("string", "Project directory"), "timeout": _s("integer", "Timeout, maximum 120 seconds")}, ["manager", "action"]),
+    _schema("database", "Run a read-only SELECT against a SQLite database; writes and multiple statements are blocked.",
+            {"path": _s("string", "SQLite database file"), "query": _s("string", "One SELECT statement"),
+             "max_rows": _s("integer", "Maximum 1-500 rows")}, ["path", "query"]),
+    _schema("http_request", "Make a public HTTP GET or HEAD request without credentials/custom headers; private/local IP targets are blocked.",
+            {"url": _s("string", "Public http(s) URL"), "method": _s("string", "GET or HEAD", enum=["GET", "HEAD"]),
+             "max_chars": _s("integer", "Maximum response text")}, ["url"]),
+    _schema("archive", "List or safely extract ZIP/TAR archives. Extraction rejects path traversal, symlinks, and special files; use --ask for extraction.",
+            {"action": _s("string", "list or extract", enum=["list", "extract"]), "path": _s("string", "Archive file"),
+             "destination": _s("string", "Extraction directory"), "limit": _s("integer", "Maximum entries, 1-500")}, ["action", "path"]),
+    _schema("process_manager", "Start, inspect, read logs, or stop a long-running process owned by this Niji session. Use --ask for start/stop.",
+            {"action": _s("string", "start, status, logs, or stop", enum=["start", "status", "logs", "stop"]),
+             "process_id": _s("string", "ID returned by start"), "command": _s("string", "Command for start"),
+             "cwd": _s("string", "Working directory"), "timeout": _s("integer", "Stop wait seconds")}, ["action"]),
 ]
