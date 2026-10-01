@@ -16,7 +16,7 @@ from . import __version__
 from .ui import render_home
 from .config import (CONFIG_DIR, CONFIG_FILE, MCP_FILE, PRESETS, SESSION_DIR,
                      load_config, load_mcp_servers, resolve_provider,
-                     save_config)
+                     save_config, save_mcp_servers)
 from .model_catalog import (fetch_provider_models, provider_is_configured,
                             provider_names, resolve_catalog_provider)
 from .terminal import OUTPUT_LOCK
@@ -305,9 +305,130 @@ def _provider_add():
     print(f"[ok] provider '{name}' added and set as default")
 
 
+# ---------------- MCP connectors ----------------
+
+def _cmd_connectors(argv):
+    """Manage trusted local and Nango authenticated MCP connectors."""
+    parser = argparse.ArgumentParser(prog="niji connectors",
+                                     description="Connect Nango integrations or manage MCP servers")
+    sub = parser.add_subparsers(dest="action")
+    add = sub.add_parser("add", help="Add a connector")
+    add.add_argument("provider", choices=["nango"], help="Connector platform")
+    add.add_argument("--name", help="Local connector name (used as a tool prefix)")
+    sub.add_parser("list", help="List configured connectors")
+    test = sub.add_parser("test", help="Connect and check discovered tools")
+    test.add_argument("name", nargs="?", help="Connector name (defaults to all)")
+    remove = sub.add_parser("remove", help="Remove a connector configuration")
+    remove.add_argument("name", help="Connector name")
+    remove.add_argument("--yes", action="store_true", help="Do not ask for confirmation")
+    args = parser.parse_args(argv)
+    if not args.action:
+        parser.print_help()
+        print("\nQuick start: niji connectors add nango")
+        return
+
+    servers = load_mcp_servers()
+    if not isinstance(servers, dict):
+        print("[error] ~/.niji/mcp.json must contain a JSON object")
+        return
+
+    if args.action == "list":
+        if not servers:
+            print("No connectors configured. Add one with: niji connectors add nango")
+            return
+        for name, cfg in servers.items():
+            transport = str(cfg.get("transport", "stdio")) if isinstance(cfg, dict) else "invalid"
+            print(f"  {name} · {transport}")
+        return
+
+    if args.action == "add":
+        print("Create a Nango integration and authorize its account at https://app.nango.dev/ first.")
+        print("You will need its API key, provider-config/integration ID, and authorized connection ID.")
+        if not sys.stdin.isatty():
+            print("[error] Nango setup needs an interactive terminal. Run: niji connectors add nango")
+            return
+        from getpass import getpass
+        import re as _re
+        try:
+            api_key = getpass("Nango API key (input hidden): ").strip()
+        except Exception:
+            print("[note] Hidden entry unavailable; type/paste the key visibly.")
+            api_key = input("Nango API key: ").strip()
+        if not api_key:
+            print("[error] API key cannot be empty")
+            return
+        integration = input("Provider-config key / integration ID: ").strip()
+        connection = input("Authorized connection ID: ").strip()
+        if not integration or not connection:
+            print("[error] Both integration ID and connection ID are required")
+            return
+        default_name = "nango_" + _re.sub(r"[^A-Za-z0-9_]", "_", integration)[:18]
+        name = (args.name or input(f"Local name [{default_name}]: ").strip() or default_name).strip()
+        if not _re.fullmatch(r"[A-Za-z0-9_]{1,32}", name):
+            print("[error] Name must be 1–32 letters, digits, or underscores")
+            return
+        if name in servers:
+            print(f"[error] Connector '{name}' already exists; choose a different --name")
+            return
+        servers[name] = {
+            "transport": "http",
+            "url": "https://api.nango.dev/proxy/v2/mcp",
+            "api_key": api_key,
+            "provider_config_key": integration,
+            "connection_id": connection,
+        }
+        save_mcp_servers(servers)
+        print(f"[ok] Nango connector '{name}' saved in ~/.niji/mcp.json with private file permissions")
+        print("Restart Niji to load it. Check access with: niji connectors test " + name)
+        print("Nango Free has usage limits; review current plan limits in your Nango dashboard.")
+        return
+
+    if args.action == "remove":
+        if args.name not in servers:
+            print(f"[error] No connector named '{args.name}'")
+            return
+        if not args.yes:
+            answer = input(f"Remove '{args.name}' and its saved credentials? [y/N] ").strip().lower()
+            if answer not in ("y", "yes"):
+                print("Cancelled")
+                return
+        del servers[args.name]
+        save_mcp_servers(servers)
+        print(f"[ok] Removed connector '{args.name}'")
+        return
+
+    from .mcp import HttpMCPServer, MCPServer
+    targets = ({args.name: servers[args.name]} if args.name in servers
+               else ({} if args.name else servers))
+    if args.name and args.name not in servers:
+        print(f"[error] No connector named '{args.name}'")
+        return
+    if not targets:
+        print("No connectors configured.")
+        return
+    ok = True
+    for name, cfg in targets.items():
+        client = None
+        try:
+            transport = str(cfg.get("transport", "stdio")).lower()
+            client = (HttpMCPServer(name, cfg) if transport in ("http", "streamable-http", "nango")
+                      else MCPServer(name, cfg))
+            client.start()
+            print(f"[ok] {name}: connected; {len(client.tools)} tools discovered")
+        except Exception as exc:
+            ok = False
+            print(f"[error] {name}: connection failed ({type(exc).__name__}). Check credentials, IDs, and network.")
+        finally:
+            if client:
+                client.stop()
+    if not ok:
+        print("If this is Nango, confirm the API key, integration/provider-config key, and connection ID in Nango.")
+
+
 # ---------------- doctor ----------------
 
 def _cmd_doctor():
+
     from .setup_wizard import test_connection
     print("niji doctor — checking your setup\n")
     ok_all = True
@@ -771,6 +892,10 @@ def main():
     # ---------- subcommands ----------
     if argv and argv[0] == "ui":
         _cmd_ui(argv[1:])
+        return
+
+    if argv and argv[0] == "connectors":
+        _cmd_connectors(argv[1:])
         return
 
     if argv and argv[0] == "providers":

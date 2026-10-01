@@ -1,19 +1,24 @@
-"""Minimal MCP (Model Context Protocol) stdio client — connector support.
+"""MCP clients for trusted local stdio servers and authenticated HTTP endpoints.
 
-Connects to any MCP server (GitHub, Postgres, filesystem, Slack, ...).
-Config lives in ~/.niji/mcp.json:
-    {"servers": {"github": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"]}}}
+The Nango cloud MCP proxy uses Streamable HTTP JSON-RPC at
+https://api.nango.dev/proxy/v2/mcp. Configuration lives in ~/.niji/mcp.json.
 """
 import json
+import os
 import queue
+import re
 import subprocess
 import threading
+from urllib.parse import urlsplit
+
+import httpx
 
 from . import __version__
 from .safety import subprocess_environment
 
 
 class MCPServer:
+    """Newline-delimited JSON-RPC MCP client over a local subprocess."""
     def __init__(self, name: str, cfg: dict):
         self.name = name
         self.command = cfg["command"]
@@ -25,10 +30,7 @@ class MCPServer:
         self._pending = {}
         self._send_lock = threading.Lock()
 
-    # ---------- lifecycle ----------
-
     def start(self, timeout=20):
-        # Credentials needed by a connector belong in its explicit mcp.json env.
         env = subprocess_environment(self.env)
         self.proc = subprocess.Popen(
             [self.command, *self.args],
@@ -53,8 +55,6 @@ class MCPServer:
                 self.proc.terminate()
         except Exception:
             pass
-
-    # ---------- wire protocol (newline-delimited JSON-RPC) ----------
 
     def _read_loop(self):
         for line in self.proc.stdout:
@@ -95,43 +95,232 @@ class MCPServer:
                 "jsonrpc": "2.0", "method": method, "params": params}) + "\n")
             self.proc.stdin.flush()
 
-    # ---------- tool bridge ----------
-
     def to_openai_tools(self):
-        out = []
-        for t in self.tools:
-            out.append({
-                "type": "function",
-                "function": {
-                    "name": f"{self.name}__{t['name']}",
-                    "description": (t.get("description") or "")[:1000],
-                    "parameters": t.get("inputSchema") or {
-                        "type": "object", "properties": {}},
-                },
-            })
-        return out
+        return _to_openai_tools(self.name, self.tools)
 
     def call(self, tool_name, args):
-        result = self._request("tools/call",
-                               {"name": tool_name, "arguments": args}, timeout=180)
-        parts = []
-        for c in result.get("content", []):
-            if c.get("type") == "text":
-                parts.append(c.get("text", ""))
+        result = self._request("tools/call", {
+            "name": tool_name, "arguments": args}, timeout=180)
+        return _format_tool_result(result)
+
+
+class HttpMCPServer:
+    """MCP client over Streamable HTTP, including Nango's authenticated proxy."""
+    def __init__(self, name: str, cfg: dict):
+        self.name = name
+        self.url = str(cfg.get("url") or "").strip()
+        try:
+            parsed_url = urlsplit(self.url)
+            hostname = parsed_url.hostname or ""
+        except ValueError:
+            raise ValueError("HTTP MCP connector URL is invalid") from None
+        if parsed_url.scheme not in ("http", "https") or not hostname:
+            raise ValueError("HTTP MCP connector URL must be an absolute http(s) URL")
+        if parsed_url.username is not None or parsed_url.password is not None:
+            raise ValueError("HTTP MCP connector URL must not contain embedded credentials")
+        if parsed_url.scheme == "http" and hostname.lower() not in ("localhost", "127.0.0.1", "::1"):
+            raise ValueError("HTTP MCP credentials require HTTPS except for loopback servers")
+        self.cfg = cfg
+        self.tools = []
+        self._id = 0
+        self._lock = threading.Lock()
+        self._session_id = None
+        self._protocol_version = "2024-11-05"
+        self._secrets = []
+        self._headers = self._build_headers()
+        self._client = httpx.Client(timeout=httpx.Timeout(45.0, connect=15.0),
+                                    follow_redirects=False)
+
+    def _resolve_value(self, value, label):
+        if value is None:
+            return ""
+        value = str(value)
+        match = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", value)
+        if match:
+            env_name = match.group(1)
+            value = os.environ.get(env_name, "")
+            if not value:
+                raise ValueError(f"missing environment variable {env_name} for {label}")
+        return value
+
+    def _build_headers(self):
+        headers = {"Accept": "application/json, text/event-stream",
+                   "Content-Type": "application/json",
+                   "User-Agent": f"niji-agent/{__version__}"}
+        for key, value in (self.cfg.get("headers") or {}).items():
+            if not re.fullmatch(r"[A-Za-z0-9-]{1,80}", str(key)):
+                raise ValueError("invalid HTTP MCP header name")
+            resolved = self._resolve_value(value, f"header {key}")
+            if resolved:
+                headers[str(key)] = resolved
+                self._secrets.append(resolved)
+
+        # Nango's documented MCP proxy authentication headers.
+        api_key = self._resolve_value(self.cfg.get("api_key"), "Nango API key")
+        provider = self._resolve_value(
+            self.cfg.get("provider_config_key") or self.cfg.get("integration_id"),
+            "Nango provider-config key")
+        connection = self._resolve_value(self.cfg.get("connection_id"),
+                                         "Nango connection ID")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+            self._secrets.extend([api_key, f"Bearer {api_key}"])
+        if provider:
+            headers["Provider-Config-Key"] = provider
+            self._secrets.append(provider)
+        if connection:
+            headers["Connection-Id"] = connection
+            self._secrets.append(connection)
+        return headers
+
+    def _redact(self, value):
+        text = str(value)
+        for secret in sorted((s for s in self._secrets if s), key=len, reverse=True):
+            text = text.replace(secret, "[redacted]")
+        return text[:1200]
+
+    def _request(self, method, params=None, *, notification=False, timeout=60):
+        with self._lock:
+            self._id += 1
+            request_id = self._id
+        body = {"jsonrpc": "2.0", "method": method}
+        if not notification:
+            body["id"] = request_id
+        if params is not None:
+            body["params"] = params
+        headers = dict(self._headers)
+        if self._session_id:
+            headers["MCP-Session-Id"] = self._session_id
+        if method != "initialize":
+            headers["MCP-Protocol-Version"] = self._protocol_version
+        try:
+            response = self._client.post(self.url, headers=headers, json=body,
+                                         timeout=timeout)
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"HTTP MCP '{self.name}' network error: {self._redact(exc)}") from None
+        session_id = response.headers.get("MCP-Session-Id") or response.headers.get("mcp-session-id")
+        if session_id:
+            self._session_id = session_id
+        if response.status_code >= 400:
+            detail = f"HTTP {response.status_code}"
+            if response.status_code in (401, 403):
+                detail += " (authentication or connection permission rejected)"
+            raise RuntimeError(f"HTTP MCP '{self.name}' {method} failed: {detail}")
+        if notification or response.status_code in (202, 204) or not response.content:
+            return {}
+        content_type = response.headers.get("content-type", "").lower()
+        try:
+            if "text/event-stream" in content_type:
+                messages = []
+                for line in response.text.splitlines():
+                    if line.startswith("data:"):
+                        data = line[5:].strip()
+                        if data and data != "[DONE]":
+                            messages.append(json.loads(data))
+                parsed = next((item for item in messages
+                               if item.get("id") == request_id),
+                              messages[-1] if messages else {})
             else:
-                parts.append(json.dumps(c)[:2000])
-        return "\n".join(parts) or json.dumps(result)[:2000]
+                parsed = response.json()
+        except (ValueError, json.JSONDecodeError):
+            raise RuntimeError(f"HTTP MCP '{self.name}' returned an invalid JSON-RPC response") from None
+        if not isinstance(parsed, dict):
+            raise RuntimeError(f"HTTP MCP '{self.name}' returned an invalid JSON-RPC response")
+        if "error" in parsed:
+            error = parsed.get("error") or {}
+            raise RuntimeError(self._redact(error.get("message") or "MCP request failed"))
+        result = parsed.get("result", parsed)
+        if not isinstance(result, dict):
+            raise RuntimeError(f"HTTP MCP '{self.name}' returned an invalid result")
+        return result
+
+    def start(self, timeout=20):
+        initialized = self._request("initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "niji-agent", "version": __version__},
+        }, timeout=timeout)
+        self._protocol_version = initialized.get("protocolVersion") or "2024-11-05"
+        self._request("notifications/initialized", {}, notification=True,
+                      timeout=timeout)
+        listing = self._request("tools/list", {}, timeout=timeout)
+        tools = listing.get("tools", [])
+        if not isinstance(tools, list):
+            raise RuntimeError(f"HTTP MCP '{self.name}' returned an invalid tool list")
+        self.tools = tools
+
+    def stop(self):
+        try:
+            if self._session_id:
+                headers = dict(self._headers)
+                headers["MCP-Session-Id"] = self._session_id
+                headers["MCP-Protocol-Version"] = self._protocol_version
+                self._client.delete(self.url, headers=headers, timeout=5)
+        except Exception:
+            pass
+        try:
+            self._client.close()
+        except Exception:
+            pass
+
+    def to_openai_tools(self):
+        return _to_openai_tools(self.name, self.tools)
+
+    def call(self, tool_name, args):
+        try:
+            result = self._request("tools/call", {
+                "name": tool_name, "arguments": args}, timeout=180)
+        except Exception as exc:
+            raise RuntimeError(self._redact(exc)) from None
+        return self._redact(_format_tool_result(result))
+
+
+def _to_openai_tools(server_name, tools):
+    out = []
+    for tool in tools:
+        if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
+            continue
+        out.append({
+            "type": "function",
+            "function": {
+                "name": f"{server_name}__{tool['name']}",
+                "description": (tool.get("description") or "")[:1000],
+                "parameters": tool.get("inputSchema") or {
+                    "type": "object", "properties": {}},
+            },
+        })
+    return out
+
+
+def _format_tool_result(result):
+    parts = []
+    for item in result.get("content", []):
+        if item.get("type") == "text":
+            parts.append(item.get("text", ""))
+        else:
+            parts.append(json.dumps(item)[:2000])
+    return "\n".join(parts) or json.dumps(result)[:2000]
 
 
 def connect_all(servers_cfg: dict):
-    """Start every configured MCP server; a failing server never kills the agent."""
+    """Start configured MCP servers; one failing connector never kills Niji."""
     clients = []
     for name, cfg in (servers_cfg or {}).items():
         try:
-            c = MCPServer(name, cfg)
-            c.start()
-            print(f"[niji] connector connected: {name} ({len(c.tools)} tools)")
-            clients.append(c)
-        except Exception as e:
-            print(f"[niji] connector '{name}' failed to start: {e}")
+            if not isinstance(cfg, dict):
+                raise ValueError("connector configuration must be an object")
+            transport = str(cfg.get("transport", "stdio")).lower()
+            if transport in ("http", "streamable-http", "nango"):
+                client = HttpMCPServer(name, cfg)
+            elif transport == "stdio":
+                client = MCPServer(name, cfg)
+            else:
+                raise ValueError(f"unsupported MCP transport '{transport}'")
+            client.start()
+            print(f"[niji] connector connected: {name} ({len(client.tools)} tools)")
+            clients.append(client)
+        except Exception as exc:
+            # Never echo a possibly credential-bearing connector exception.
+            print(f"[niji] connector '{name}' failed to start ({type(exc).__name__}); "
+                  "check its private configuration and network access")
     return clients

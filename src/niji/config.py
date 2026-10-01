@@ -82,6 +82,26 @@ def load_mcp_servers(path=None):
         return {}
 
 
+def save_mcp_servers(servers):
+    """Atomically store MCP configuration with owner-only file permissions."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        CONFIG_DIR.chmod(0o700)
+    except OSError:
+        pass
+    temp_file = MCP_FILE.with_suffix(".json.tmp")
+    temp_file.write_text(json.dumps({"servers": servers}, indent=2) + "\n")
+    try:
+        temp_file.chmod(0o600)
+    except OSError:
+        pass
+    temp_file.replace(MCP_FILE)
+    try:
+        MCP_FILE.chmod(0o600)
+    except OSError:
+        pass
+
+
 def resolve_provider(name=None, model=None, api_key=None):
     cfg = load_config()
     name = name or os.environ.get("NIJI_PROVIDER") or cfg.get("provider")

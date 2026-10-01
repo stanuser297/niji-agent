@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.20.0
+# Niji Agent 🌈 — v2.21.0
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -15,6 +15,14 @@ niji
 Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, enter its API key (visible input is the Termux-friendly default; hidden entry is optional), and choose a model. The key is saved locally in `~/.niji/config.json` with private file permissions—no `export` command is needed. Ollama can be used without an API key.
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
+
+## What's new in 2.21.0
+
+- Added authenticated Streamable HTTP MCP support, including Nango's documented `/proxy/v2/mcp` endpoint, API-key bearer auth, provider-config key, connection ID, session headers, JSON/SSE responses, timeouts, safe errors, and secret redaction.
+- Added guided `niji connectors add nango`, plus `list`, `test`, and `remove` commands. Nango credentials are stored only in `~/.niji/mcp.json`, with owner-only directory/file permissions; HTTP MCP credentials can also use `${ENV_VAR}` references.
+- Preserved existing local stdio MCP servers. Connector failures remain isolated so one unavailable integration does not stop Niji.
+- Nango advertises 1,000+ API/MCP integrations, but its hosted Free plan has capped usage and may change. Nango source is published under Elastic License 2.0 (source-available, not an OSI-approved open-source license); review the license and current limits before production use.
+- Added HTTP/SSE MCP, auth headers, environment-variable references, redaction, URL validation, and stdio compatibility tests.
 
 ## What's new in 2.20.0
 
@@ -227,6 +235,9 @@ niji providers                            # list available providers
 niji models                               # list catalogs for connected providers
 niji models groq                          # list Groq model IDs
 niji providers add                        # add a custom provider
+niji connectors add nango                 # add an authenticated Nango integration
+niji connectors list                      # list configured MCP connectors
+niji connectors test                      # test connector access and discover tools
 niji providers use openrouter             # switch default provider
 ```
 
@@ -251,7 +262,20 @@ Use the tool only in directories where you trust it to read and modify files. It
 
 ## MCP connectors
 
-Create `~/.niji/mcp.json`. Put connector-specific credentials in that server's `env` object; common credential variables from the parent environment are not inherited by default.
+Connect Nango integrations from an interactive terminal:
+
+```sh
+niji connectors add nango
+niji connectors list
+niji connectors test nango_<integration>
+niji connectors remove nango_<integration>
+```
+
+Create the Nango integration and authorize its account in Nango first; the wizard asks for your Nango API key, provider-config/integration ID, and connection ID. Obtain them from [Nango](https://app.nango.dev/). Niji stores the credentials locally in `~/.niji/mcp.json` with owner-only permissions; keep your OS account secure and never commit that file. Restart Niji after adding or removing a connector. Use `/tools` to see discovered tools. Under `--ask`, MCP actions participate in the normal approval flow.
+
+Nango's cloud MCP endpoint is authenticated using documented bearer, provider-config, and connection-ID headers. Niji also supports `transport: "http"` MCP servers and `${ENV_VAR}` references for secret fields/headers if you prefer keeping secret values out of the JSON file. The HTTP transport currently supports Streamable HTTP JSON and server-sent-event responses. Only configure endpoints you trust; redirects are not followed.
+
+Existing local stdio MCP configuration remains supported. Common credential variables from the parent environment are not inherited by default:
 
 ```json
 {
@@ -260,6 +284,13 @@ Create `~/.niji/mcp.json`. Put connector-specific credentials in that server's `
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-github"],
       "env": {"GITHUB_TOKEN": "your-token"}
+    },
+    "nango_linear": {
+      "transport": "http",
+      "url": "https://api.nango.dev/proxy/v2/mcp",
+      "api_key": "${NANGO_SECRET_KEY}",
+      "provider_config_key": "linear",
+      "connection_id": "your-connection-id"
     }
   }
 }
