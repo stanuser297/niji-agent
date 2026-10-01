@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.8.3
+# Niji Agent 🌈 — v2.8.4
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -16,10 +16,13 @@ Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, ent
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
 
+## What's new in 2.8.4
+
+- Restored the full Niji command-center dashboard at interactive launch, above the fixed chat composer, matching the supplied reference: profile, agent overview, available tools, tool usage, system status, recent activity, and quick commands. `/status` redraws it during a session.
+
 ## What's new in 2.8.3
 
-- Interactive chat now starts with a compact branded Niji Home card above the pinned composer, showing status, active model/provider, runtime, tools, and quick commands. The full command-center dashboard remains available with `/status`.
-- Quiet mode continues to suppress the startup card.
+- Interactive chat starts with the Niji-branded home area above the pinned composer; `/status` opens the full command-center dashboard.
 
 ## What's new in 2.8.2
 

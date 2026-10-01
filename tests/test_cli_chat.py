@@ -39,7 +39,7 @@ class InteractiveChatTests(unittest.TestCase):
         agent = FakeAgent()
         provider = {"provider": "groq", "model": "test-model"}
         with (
-            patch("niji.cli._render_startup_dashboard"),
+            patch("niji.cli._render_home"),
             patch("niji.chat_prompt.read_chat_prompt", return_value="/exit"),
             patch("niji.chat_prompt.reset_chat_layout") as reset_layout,
         ):
@@ -52,7 +52,7 @@ class InteractiveChatTests(unittest.TestCase):
         agent = FakeAgent()
         provider = {"provider": "groq", "model": "test-model"}
         with (
-            patch("niji.cli._render_startup_dashboard", side_effect=lambda *a, **k: order.append("dashboard")),
+            patch("niji.cli._render_home", side_effect=lambda *a, **k: order.append("dashboard")),
             patch("niji.chat_prompt.read_chat_prompt", side_effect=lambda *a: (order.append("prompt") or None)),
             patch("niji.chat_prompt.reset_chat_layout"),
         ):
@@ -66,7 +66,7 @@ class InteractiveChatTests(unittest.TestCase):
         provider = {"provider": "groq", "model": "test-model"}
         with (
             patch("niji.cli.Console", return_value=console),
-            patch("niji.cli._render_startup_dashboard"),
+            patch("niji.cli._render_home"),
             patch("niji.chat_prompt.read_chat_prompt", side_effect=["meri pehli line", None]),
         ):
             _interactive_chat(agent, provider)

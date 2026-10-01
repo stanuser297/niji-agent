@@ -244,26 +244,6 @@ def render_setup_banner(console=None):
     console.print(Text("First, connect your AI provider. The API key is stored locally.", style="dim"))
 
 
-def render_startup_dashboard(agent, provider, quiet=False, console=None):
-    """Render a compact branded dashboard that fits above the pinned chat UI."""
-    if quiet:
-        return
-    console = console or Console()
-    content = Table.grid(padding=(0, 1))
-    content.add_column(style="bold bright_cyan", no_wrap=True)
-    content.add_column(style="bright_white", overflow="fold")
-    content.add_row("✧ NIJI", f"Niji-Agent v{__version__} · Your ideas, in motion")
-    content.add_row("STATUS", Text("● READY", style="bold green"))
-    content.add_row("MODEL", str(provider.get("model", "default")))
-    content.add_row("PROVIDER", str(provider.get("provider", "unknown")))
-    content.add_row("RUNTIME", f"Python {platform.python_version()} · "
-                    f"{len(getattr(agent, 'tool_schemas', []))} tools · "
-                    f"{len(getattr(agent, 'mcp_clients', []))} MCP links")
-    content.add_row("COMMANDS", "/help · /status · /activity · /exit")
-    console.print(Panel(content, title="[bold bright_cyan]NIJI HOME[/]",
-                        border_style="bright_cyan", padding=(0, 1)))
-
-
 def render_home(agent, provider, quiet=False, console=None):
     """Render a detailed dashboard that adapts to desktop and phone terminals."""
     if quiet:

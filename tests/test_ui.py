@@ -4,7 +4,7 @@ import unittest
 
 from rich.console import Console
 
-from niji.ui import render_home, render_startup_dashboard
+from niji.ui import render_home
 
 
 class DummyAgent:
@@ -33,19 +33,6 @@ class DashboardTests(unittest.TestCase):
             "provider": "nvidia", "model": "z-ai/glm-5.3-flash"
         }, console=console)
         return output.getvalue()
-
-    def test_startup_dashboard_is_compact_and_shows_active_session(self):
-        output = io.StringIO()
-        console = Console(file=output, width=56, color_system=None, force_terminal=False)
-        render_startup_dashboard(DummyAgent(), {
-            "provider": "nvidia", "model": "z-ai/glm-5.3-flash"
-        }, console=console)
-        rendered = output.getvalue()
-        for expected in ("NIJI HOME", "Niji-Agent", "READY", "z-ai/glm-5.3-flash",
-                         "nvidia", "Python", "COMMANDS", "/status"):
-            self.assertIn(expected.lower(), rendered.lower())
-        self.assertLessEqual(len(rendered.splitlines()), 14)
-        self.assertTrue(all(len(line) <= 56 for line in rendered.splitlines()))
 
     def test_dashboard_shows_real_agent_and_capability_details(self):
         output = self.render(120)
