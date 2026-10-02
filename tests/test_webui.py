@@ -1,6 +1,8 @@
 import hashlib
 import json
 import os
+import shutil
+import subprocess
 import threading
 import time
 import unittest
@@ -11,6 +13,8 @@ import urllib.request
 from unittest.mock import patch
 
 from niji.webui import NijiWebUI
+from niji.webui_frontend import PAGE
+from niji.planning import save_plan as REAL_SAVE_PLAN
 
 
 class FakeAgent:
@@ -38,6 +42,10 @@ class FakeAgent:
         self.require_approval = require_approval
         self.tool_policies = {}
         self.last_plan_only = False
+        self.approved_plan_seen = None
+        self.leave_plan_incomplete = False
+        self.todos = {"items": []}
+        self.plan_callback = None
         self.pause_stream = False
         self.stream_ready = threading.Event()
         self.finish_stream = threading.Event()
@@ -55,9 +63,26 @@ class FakeAgent:
 
     def chat(self, message):
         self.last_plan_only = bool(getattr(self, "plan_only", False))
+        approved_plan = getattr(self, "approved_plan", None)
+        self.approved_plan_seen = list(approved_plan) if approved_plan is not None else None
         if self.activity_callback:
             self.activity_callback({"time": "12:02:00", "level": "THINKING", "message": "Thinking on it"})
         self.messages.append({"role": "user", "content": message})
+        if approved_plan is not None and not self.leave_plan_incomplete:
+            from niji.tools import dispatch
+            for index in range(len(approved_plan)):
+                active = [dict(item) for item in self.todos["items"]]
+                active[index]["status"] = "in_progress"
+                started = dispatch("todo_write", {"todos": active, "activeForm": "Working"},
+                                   {"agent": self, "todos": self.todos})
+                if str(started).startswith("[error]"):
+                    raise AssertionError(started)
+                completed = [dict(item) for item in self.todos["items"]]
+                completed[index]["status"] = "completed"
+                result = dispatch("todo_write", {"todos": completed, "activeForm": "Verified"},
+                                  {"agent": self, "todos": self.todos})
+                if str(result).startswith("[error]"):
+                    raise AssertionError(result)
         if self.require_approval:
             approved = self.approval_callback("write_file", {"path": "notes.txt"})
             answer = "approved" if approved else "denied"
@@ -89,8 +114,10 @@ class WebUITests(unittest.TestCase):
         self.agent = FakeAgent()
         self._plan_load_patch = patch("niji.webui.load_plan", return_value=[])
         self._plan_save_patch = patch("niji.webui.save_plan")
+        self._stateful_plan_save_patch = patch("niji.planning.save_plan")
         self._plan_load_patch.start()
         self._plan_save_patch.start()
+        self._stateful_plan_save_patch.start()
         self.ui = NijiWebUI(self.agent, port=0)
         self.thread = threading.Thread(target=self.ui.httpd.serve_forever, daemon=True)
         self.thread.start()
@@ -101,6 +128,7 @@ class WebUITests(unittest.TestCase):
         self.thread.join(timeout=2)
         self._plan_load_patch.stop()
         self._plan_save_patch.stop()
+        self._stateful_plan_save_patch.stop()
 
     def request(self, path, data=None, token=None):
         body = json.dumps(data).encode() if data is not None else None
@@ -111,6 +139,50 @@ class WebUITests(unittest.TestCase):
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(self.base + path, data=body, headers=headers)
         return urllib.request.urlopen(req, timeout=3)
+
+    def test_plan_editor_reordering_preserves_prerequisite_order(self):
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        start = PAGE.index("function canMovePlanStep(")
+        end = PAGE.index("\nfunction openPlanEditor", start)
+        helper = PAGE[start:end]
+        script = helper + """
+const rows = [
+  {id:'inspect', depends_on:[]},
+  {id:'implement', depends_on:['inspect']},
+  {id:'verify', depends_on:['implement']},
+  {id:'docs', depends_on:[]}
+];
+if (canMovePlanStep(rows, 1, 0)) throw new Error('dependent step moved before prerequisite');
+if (canMovePlanStep(rows, 0, 1)) throw new Error('prerequisite moved after dependent');
+if (!canMovePlanStep(rows, 3, 2)) throw new Error('independent step could not be reordered');
+"""
+        subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+    def test_plan_renderer_shows_dependency_waiting_state_safely(self):
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        start = PAGE.index("function buildTaskPlanList(")
+        end = PAGE.index("\nfunction renderJobPlan", start)
+        renderer = PAGE[start:end]
+        script = renderer + """
+class FakeNode {
+  constructor(tag){this.tagName=tag;this.children=[];this.attributes={};this.className='';this.textContent=''}
+  append(...nodes){this.children.push(...nodes)}
+  setAttribute(key,value){this.attributes[key]=value}
+}
+global.document={createElement:(tag)=>new FakeNode(tag)};
+const tree=buildTaskPlanList([
+  {id:'inspect',content:'Inspect <source>',status:'pending'},
+  {id:'build',content:'Build safely',status:'pending',depends_on:['inspect']}
+]);
+function walk(node){return [node,...node.children.flatMap(walk)]}
+const nodes=walk(tree);
+if(!nodes.some(n=>n.className==='task-plan-deps waiting' && n.textContent==='Waiting for: Inspect <source>')) throw new Error('waiting dependency label missing');
+if(!nodes.some(n=>n.className==='task-plan-state pending')) throw new Error('explicit pending status missing');
+if(nodes.some(n=>n.innerHTML)) throw new Error('renderer used unsafe HTML');
+"""
+        subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
     def test_page_requires_private_one_time_token(self):
         with self.assertRaises(urllib.error.HTTPError) as missing:
@@ -210,12 +282,22 @@ class WebUITests(unittest.TestCase):
         self.assertIn("renderJobEvents(j.events,placeholder)", page)
         self.assertIn("className='execution-steps'", page)
         self.assertIn("function renderJobPlan(items", page)
+        self.assertIn("function buildTaskPlanList(items)", page)
+        self.assertIn("task-plan-deps", page)
+        self.assertIn("Waiting for: ", page)
+        self.assertIn("function openPlanEditor(actions,run,box,sourceJobId,items,setItems)", page)
+        self.assertIn("function canMovePlanStep(rows,from,to)", page)
+        self.assertIn("depends_on:[...x.depends_on]", page)
+        self.assertIn("aria-describedby',hint.id", page)
+        self.assertIn("removing a step also removes it from prerequisite lists", page)
         self.assertIn("function renderSavedPlan(items", page)
         self.assertIn("Approve & run plan", page)
         self.assertIn("/approve-plan", page)
         self.assertIn("/edit-plan", page)
         self.assertIn("function attachPlanAction(box,sourceJobId,items=[])", page)
-        self.assertIn("One step per line", page)
+        self.assertIn("choose prerequisites", page)
+        self.assertIn("+ Add step", page)
+        self.assertIn("Step ${index+1} depends on", page)
         self.assertNotIn("Execute the approved numbered plan above", page)
         self.assertIn('id="auto-compact-toggle"', page)
         self.assertIn('id="compaction-threshold"', page)
@@ -643,12 +725,19 @@ class WebUITests(unittest.TestCase):
         }, self.ui.token).read())
         plan_job = self._wait_for_job(preview["id"])
         original = list(plan_job["plan"])
-        steps = ["Inspect the source tree", "Run the full test suite", "Review the diff"]
+        steps = [
+            {"id": "inspect", "content": "Inspect the source tree", "depends_on": []},
+            {"id": "tests", "content": "Run the full test suite", "depends_on": ["inspect"]},
+            {"id": "review", "content": "Review the diff", "depends_on": ["tests"]},
+        ]
         with patch("niji.webui.load_plan", return_value=original):
             edited = json.loads(self.request(
                 f"/api/jobs/{preview['id']}/edit-plan", {"steps": steps}, self.ui.token).read())
         self.assertTrue(edited["ok"])
-        self.assertEqual([item["content"] for item in edited["plan"]], steps)
+        self.assertEqual([item["content"] for item in edited["plan"]],
+                         [item["content"] for item in steps])
+        self.assertEqual(edited["plan"][1]["depends_on"], ["inspect"])
+        self.assertEqual(edited["plan"][2]["depends_on"], ["tests"])
         self.assertTrue(all(item["status"] == "pending" for item in edited["plan"]))
         source = json.loads(self.request(f"/api/jobs/{preview['id']}", token=self.ui.token).read())
         self.assertEqual(source["plan"], edited["plan"])
@@ -659,18 +748,22 @@ class WebUITests(unittest.TestCase):
         self.assertEqual(execution["status"], "completed")
         self.assertIn('"approved_steps":["Inspect the source tree","Run the full test suite","Review the diff"]',
                       execution["response"])
+        self.assertIn('"id":"tests","content":"Run the full test suite","depends_on":["inspect"]',
+                      execution["response"])
         with patch("niji.webui.load_plan", return_value=edited["plan"]):
             with self.assertRaises(urllib.error.HTTPError) as rejected:
                 self.request(f"/api/jobs/{preview['id']}/edit-plan", {"steps": ["late edit"]}, self.ui.token)
         self.assertEqual(rejected.exception.code, 409)
 
     def test_plan_edits_persist_on_disk_and_are_the_plan_that_runs(self):
-        from niji.planning import load_plan as persisted_load, save_plan as persisted_save
+        from niji.planning import load_plan as persisted_load
         with tempfile.TemporaryDirectory() as tmp:
-            with patch("niji.webui.load_plan",
+            with patch("niji.planning.save_plan",
+                       side_effect=lambda sid, items: REAL_SAVE_PLAN(sid, items, root=tmp)), \
+                 patch("niji.webui.load_plan",
                        side_effect=lambda sid: persisted_load(sid, root=tmp)), \
                  patch("niji.webui.save_plan",
-                       side_effect=lambda sid, items: persisted_save(sid, items, root=tmp)):
+                       side_effect=lambda sid, items: REAL_SAVE_PLAN(sid, items, root=tmp)):
                 preview = json.loads(self.request("/api/chat", {
                     "message": "inspect project", "plan_only": True,
                 }, self.ui.token).read())
@@ -718,6 +811,20 @@ class WebUITests(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as bad:
                 self.request(path, payload, self.ui.token)
             self.assertEqual(bad.exception.code, 400)
+        invalid_graphs = [
+            [{"id": "a", "content": "A", "depends_on": ["missing"]}],
+            [{"id": "a", "content": "A", "depends_on": ["a"]}],
+            [{"id": "a", "content": "A", "depends_on": ["b"]},
+             {"id": "b", "content": "B", "depends_on": ["a"]}],
+            [{"id": "first", "content": "First", "depends_on": ["later"]},
+             {"id": "later", "content": "Later"}],
+            [{"id": "a", "content": "A", "status": "completed"}],
+        ]
+        with patch("niji.webui.load_plan", return_value=plan_job["plan"]):
+            for graph in invalid_graphs:
+                with self.subTest(graph=graph), self.assertRaises(urllib.error.HTTPError) as invalid:
+                    self.request(path, {"steps": graph}, self.ui.token)
+                self.assertEqual(invalid.exception.code, 400)
         with patch("niji.webui.load_plan", return_value=[{"content": "stale plan"}]):
             with self.assertRaises(urllib.error.HTTPError) as stale:
                 self.request(path, {"steps": ["replace stale plan"]}, self.ui.token)
@@ -750,6 +857,10 @@ class WebUITests(unittest.TestCase):
         run_job = self._wait_for_job(submitted["id"])
         self.assertEqual(run_job["status"], "completed")
         self.assertFalse(run_job["plan_only"])
+        self.assertEqual(self.agent.approved_plan_seen, saved_plan)
+        self.assertIsNone(self.agent.approved_plan)
+        self.assertEqual([item["status"] for item in run_job["plan"]],
+                         ["completed", "completed"])
         self.assertIn('"original_request":"inspect project"', run_job["response"])
         self.assertIn('"approved_steps":["Inspect the project","Run the tests"]', run_job["response"])
         updated_source = json.loads(self.request(
@@ -759,6 +870,19 @@ class WebUITests(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as duplicate:
                 self.request(f"/api/jobs/{preview['id']}/approve-plan", {}, self.ui.token)
         self.assertEqual(duplicate.exception.code, 409)
+
+    def test_approved_plan_cannot_report_success_when_steps_remain_incomplete(self):
+        preview = json.loads(self.request("/api/chat", {
+            "message": "inspect project", "plan_only": True,
+        }, self.ui.token).read())
+        plan_job = self._wait_for_job(preview["id"])
+        self.agent.leave_plan_incomplete = True
+        with patch("niji.webui.load_plan", return_value=plan_job["plan"]):
+            submitted = json.loads(self.request(
+                f"/api/jobs/{preview['id']}/approve-plan", {}, self.ui.token).read())
+        result = self._wait_for_job(submitted["id"])
+        self.assertEqual(result["status"], "error")
+        self.assertIn("unfinished steps", result["error"])
 
     def test_plan_approval_rejects_stale_saved_plan_and_wrong_thread(self):
         preview = json.loads(self.request("/api/chat", {

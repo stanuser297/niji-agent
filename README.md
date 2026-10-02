@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.31.0
+# Niji Agent 🌈 — v2.32.0
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -15,6 +15,15 @@ niji
 Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, enter its API key (visible input is the Termux-friendly default; hidden entry is optional), and choose a model. The key is saved locally in `~/.niji/config.json` with private file permissions—no `export` command is needed. Ollama can be used without an API key.
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
+
+## What's new in 2.32.0
+
+- Added stable plan-step IDs and prerequisite dependencies with server-side validation for missing IDs, duplicates, self-links, cycles, malformed IDs, reverse-ordered prerequisites, and starting/completing a step before its prerequisites.
+- The plan editor now supports adding, removing, reordering, and editing steps while preserving dependencies; progress and saved-plan views show status and human-readable prerequisite/waiting information.
+- Approved execution is server-gated: only the exact approved checklist can progress, a step must be active before tools run, tool batches stay serial, and unfinished plans cannot be reported as successful. Subagent delegation is disabled during approved runs until child scope can be enforced.
+- Plan storage rejects symlinked path components; POSIX uses no-follow directory descriptors and repairs private file/directory modes. Non-POSIX systems use a best-effort path-based fallback; Windows ACL parity is not verified.
+- Checklist transitions are enforced, but completed status is not proof by itself that external work was substantively verified; use explicit tests/checks in the approved plan.
+- Added regression coverage for dependency graph validation, approved-step transitions and execution order, incomplete runs, legacy ID migration, storage symlinks/permissions, persistence, plan edits, approval payloads, and frontend rendering.
 
 ## What's new in 2.31.0
 

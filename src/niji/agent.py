@@ -39,7 +39,10 @@ SYSTEM_PROMPT = (
     "1. Understand the user's outcome, constraints, and requested format before acting. For a simple task, "
     "answer or act directly. For a genuinely multi-step task, inspect relevant context, create a concise "
     "ordered todo_write plan with observable completion checks, and keep exactly one unfinished step "
-    "in_progress. Update the full list as work advances; mark a step completed only after checking it. "
+    "in_progress. Give steps stable unique ids and use depends_on for prerequisites; list every "
+    "prerequisite before its dependent step, and do not start or complete a dependent step until "
+    "every prerequisite is completed. Update the full list as work "
+    "advances; mark a step completed only after checking it. "
     "If resuming an existing plan, call todo_read first and continue from its actual status.\n"
     "2. For Plan-only requests, return a usable proposal before execution: goal, numbered steps, key "
     "assumptions/risks, and how success will be verified. Do not call tools or imply anything was done. "
@@ -58,7 +61,9 @@ SYSTEM_PROMPT = (
     "a step is blocked, or evidence is incomplete, state that plainly and offer the safest next action.\n"
     "7. Delegate only independent, bounded, self-contained subtasks with enough context and explicit "
     "completion checks. Use read-only roles for research/planning when possible; review the returned evidence "
-    "and any changes yourself before accepting them. Do not delegate the whole user's responsibility.\n"
+    "and any changes yourself before accepting them. Do not delegate the whole user's responsibility. "
+    "During user-approved plan execution, do not invoke subagents; work only inside the currently active "
+    "approved step because child-agent scoping is not yet implemented.\n"
     "8. Communicate progress with short, useful updates describing the current phase or action. Do not reveal "
     "private chain-of-thought; provide a concise rationale, evidence, and conclusions instead.\n"
     "9. Help with ordinary, allowed requests; do not give a generic refusal when a useful answer is possible. "
@@ -106,6 +111,9 @@ class Agent:
         self.allowed_tools = allowed_tools
         self.session_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
         self.todos = {"items": load_plan(self.session_id)}
+        # Non-None only while the web UI is executing a user-approved plan.
+        # This enables server-side checklist and tool-order enforcement.
+        self.approved_plan = None
         self.plan_callback = None
         self.started_at = time.monotonic()
         self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "turns": 0}
@@ -368,7 +376,7 @@ class Agent:
             self._record_activity("PLAN", f"Executing {len(executable)} of {len(tool_calls)} requested tool call(s)")
 
             results = []
-            if (len(executable) > 1 and self.approval != "ask"
+            if (self.approved_plan is None and len(executable) > 1 and self.approval != "ask"
                     and all(tc["name"] in PARALLEL_SAFE_TOOLS for tc in executable)):
                 # Parallelize only read-only operations; mutations may depend on one another.
                 with ThreadPoolExecutor(max_workers=min(4, len(executable))) as ex:
@@ -634,6 +642,15 @@ class Agent:
         if self._cancel_event.is_set():
             self._record_activity("STOPPED", "Skipped remaining tool calls after stop request")
             return "[cancelled by user]"
+        if self.approved_plan is not None and name == "task":
+            self._record_activity("DENIED", "Subagent delegation is disabled during approved-plan execution")
+            return "[blocked] subagent execution is not available in approved-plan runs yet; use the approved steps directly"
+        if self.approved_plan is not None and name not in {"todo_read", "todo_write"}:
+            items = (getattr(self, "todos", {}) or {}).get("items", [])
+            active = [item for item in items if item.get("status") == "in_progress"]
+            if len(active) != 1:
+                self._record_activity("DENIED", f"{name} blocked until one approved plan step is active")
+                return "[blocked] start exactly one approved plan step with todo_write before using other tools"
         with self._activity_lock:
             self.tool_usage[name] = self.tool_usage.get(name, 0) + 1
         self._record_activity("TOOL", f"Tool call: {name} · {self._tool_progress_label(name)}")

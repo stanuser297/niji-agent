@@ -2,24 +2,42 @@ def todo_read(ctx: dict) -> str:
     todos = (ctx.get("todos") or {}).get("items", [])
     if not todos:
         return "[no todos yet]"
+    by_id = {item.get("id"): item for item in todos if isinstance(item, dict)}
     lines = []
-    for i, t in enumerate(todos, 1):
-        mark = {"pending": " ", "in_progress": ">", "completed": "x"}.get(t.get("status"), "?")
-        lines.append(f"{mark} {i}. {t.get('content', '')}")
+    for i, item in enumerate(todos, 1):
+        mark = {"pending": " ", "in_progress": ">", "completed": "x", "blocked": "!"}.get(
+            item.get("status"), "?")
+        line = f"{mark} {i}. {item.get('content', '')}"
+        dependencies = item.get("depends_on", [])
+        waiting = [dependency for dependency in dependencies
+                   if by_id.get(dependency, {}).get("status") != "completed"]
+        if dependencies:
+            line += " (depends on: " + ", ".join(dependencies) + ")"
+        if waiting:
+            line += " (waiting for: " + ", ".join(waiting) + ")"
+        lines.append(line)
     return "\n".join(lines)
 
 
 def todo_write(todos: list, activeForm: str = "", ctx: dict = None) -> str:
-    from ..planning import normalize_plan, save_plan
-    plan = normalize_plan(todos)
+    from ..planning import normalize_plan, save_plan, validate_approved_plan_progress
     ctx = ctx or {}
+    agent = ctx.get("agent")
+    approved = getattr(agent, "approved_plan", None) if agent is not None else None
+    if approved is not None:
+        previous = getattr(agent, "todos", {}).get("items", [])
+        plan = validate_approved_plan_progress(todos, approved, previous)
+    else:
+        plan = normalize_plan(todos)
+    # Save before mutating in-memory state so an I/O error cannot report a
+    # checklist update that was not durably recorded.
+    if agent is not None:
+        save_plan(agent.session_id, plan)
     state = ctx.get("todos")
     if isinstance(state, dict):
         state["items"] = plan
-    agent = ctx.get("agent")
     if agent is not None:
         agent.todos = state if isinstance(state, dict) else {"items": plan}
-        save_plan(agent.session_id, plan)
         callback = getattr(agent, "plan_callback", None)
         if callback:
             try:

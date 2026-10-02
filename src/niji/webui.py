@@ -832,9 +832,16 @@ class NijiWebUI:
         task_data = {
             "original_request": str(original_message)[:_MAX_PROMPT],
             "approved_steps": [item["content"] for item in plan],
+            "approved_plan": [
+                {"id": item["id"], "content": item["content"],
+                 "depends_on": item.get("depends_on", [])}
+                for item in plan
+            ],
         }
         return (
             "Execute the task data below using the approved steps in their listed order. "
+            "Preserve the approved_plan step ids and dependencies in the task checklist; a step "
+            "must not start until every id in its depends_on list is completed and verified. "
             "Keep work within the original request and approved plan. Do not silently add, "
             "reorder, or omit steps. If new information makes a material plan change necessary, "
             "stop and ask the user to review an updated plan. Continue to follow all system safety "
@@ -848,11 +855,26 @@ class NijiWebUI:
         """Update a completed plan preview without letting edits bypass approval checks."""
         if not isinstance(steps, list):
             return 400, {"error": "Plan steps must be an array of text descriptions"}
-        if not steps or any(not isinstance(step, str) or not step.strip() for step in steps):
-            return 400, {"error": "A plan needs non-empty text for every step"}
+        if not steps:
+            return 400, {"error": "A plan needs at least one step"}
+        prepared = []
+        for step in steps:
+            if isinstance(step, str):
+                item = {"content": step}
+            elif isinstance(step, dict) and set(step).issubset({"id", "content", "depends_on"}):
+                item = step
+            else:
+                return 400, {"error": "Each step must contain only an id, text, and optional dependency ids"}
+            if not isinstance(item.get("content"), str) or not item["content"].strip():
+                return 400, {"error": "A plan needs non-empty text for every step"}
+            normalized = {"content": item["content"], "status": "pending",
+                          "depends_on": item.get("depends_on", [])}
+            if "id" in item:
+                normalized["id"] = item["id"]
+            prepared.append(normalized)
         try:
             # Edited plans are proposals: never let client-supplied status/IDs imply work is done.
-            plan = normalize_plan([{"content": step, "status": "pending"} for step in steps])
+            plan = normalize_plan(prepared)
         except (TypeError, ValueError) as exc:
             return 400, {"error": str(exc)[:250]}
         with self._lock:
@@ -910,14 +932,20 @@ class NijiWebUI:
             if load_plan(session_id) != plan:
                 return 409, {"error": "The saved plan changed after preview; request a fresh plan before running it"}
             message = self._approved_plan_message(source.get("original_message", ""), plan)
-            status, result = self._start_job(message, plan_only=False)
+            status, result = self._start_job(message, plan_only=False, approved_plan=plan)
             if status != 202:
                 return status, result
             source["plan_approved"] = True
             source["execution_job_id"] = result["id"]
             return 202, {"ok": True, "id": result["id"], "source_job_id": source_job_id}
 
-    def _start_job(self, message, plan_only=False, automation_id=None):
+    def _start_job(self, message, plan_only=False, automation_id=None, approved_plan=None):
+        try:
+            approved_plan = normalize_plan(approved_plan) if approved_plan is not None else None
+            if approved_plan is not None and any(item["status"] != "pending" for item in approved_plan):
+                return 400, {"error": "An approved plan must begin with every step pending"}
+        except (TypeError, ValueError) as exc:
+            return 400, {"error": f"Invalid approved plan: {str(exc)[:200]}"}
         with self._lock:
             if self._connector_mutating or self._model_mutating:
                 return 409, {"error": "Wait for model or connector setup to finish before starting a request"}
@@ -933,14 +961,16 @@ class NijiWebUI:
                                  "streamed": "", "progress": "Thinking on it",
                                  "progress_detail": "Preparing the model request", "activity": None,
                                  "events": [], "plan_only": bool(plan_only), "original_message": message,
-                                 "plan": ([] if plan_only else
-                                          list(getattr(self.agent, "todos", {}).get("items", []))),
+                                 "plan": (approved_plan if approved_plan is not None else
+                                          ([] if plan_only else
+                                           list(getattr(self.agent, "todos", {}).get("items", [])))),
+                                 "approved_plan": approved_plan,
                                  "plan_label": "", "plan_approved": False,
                                  "session_id": getattr(self.agent, "session_id", "local"),
                                  "cancel_requested": False, "created": time.time(),
                                  "automation_id": automation_id or ""}
             self._job_thread = threading.Thread(
-                target=self._run_job, args=(job_id, message, plan_only),
+                target=self._run_job, args=(job_id, message, plan_only, approved_plan),
                 name=f"niji-job-{job_id[:8]}", daemon=True)
             try:
                 self._job_thread.start()
@@ -1009,11 +1039,17 @@ class NijiWebUI:
         except (OSError, ValueError):
             pass
 
-    def _run_job(self, job_id, message, plan_only=False):
+    def _run_job(self, job_id, message, plan_only=False, approved_plan=None):
         started = time.monotonic()
         previous_plan_only = getattr(self.agent, "plan_only", False)
+        previous_approved_plan = getattr(self.agent, "approved_plan", None)
         try:
             self.agent.plan_only = bool(plan_only)
+            self.agent.approved_plan = approved_plan
+            if approved_plan is not None:
+                self.agent.todos = {"items": normalize_plan(approved_plan)}
+                save_plan(self.agent.session_id, self.agent.todos["items"])
+                self._record_plan(self.agent.todos["items"], "Executing approved plan")
             response = self.agent.chat(message)
             output = str(response or "[done]")[:40_000]
             if plan_only:
@@ -1021,11 +1057,28 @@ class NijiWebUI:
                 self.agent.todos = {"items": proposed_steps}
                 self._record_plan(proposed_steps,
                                   "Plan ready for review" if proposed_steps else "No actionable plan steps found")
+            try:
+                final_plan = normalize_plan(
+                    getattr(self.agent, "todos", {}).get("items", []))
+                unfinished = (approved_plan is not None and (
+                    len(final_plan) != len(approved_plan)
+                    or any(actual.get(field, []) != expected.get(field, [])
+                           for actual, expected in zip(final_plan, approved_plan)
+                           for field in ("id", "content", "depends_on"))
+                    or any(item["status"] != "completed" for item in final_plan)))
+            except (TypeError, ValueError):
+                unfinished = approved_plan is not None
             with self._lock:
                 job = self._jobs[job_id]
-                final_status = "cancelled" if job.get("cancel_requested") else "completed"
-                job.update(status=final_status, response=output, error="",
-                           progress="Stopped" if final_status == "cancelled" else "Complete")
+                if job.get("cancel_requested"):
+                    final_status, error, progress = "cancelled", "", "Stopped"
+                elif unfinished:
+                    final_status = "error"
+                    error = "Approved plan ended with unfinished steps; review the checklist before calling it complete."
+                    progress = "Plan incomplete"
+                else:
+                    final_status, error, progress = "completed", "", "Complete"
+                job.update(status=final_status, response=output, error=error, progress=progress)
         except Exception as exc:
             message = str(exc)
             api_key = str(getattr(self.agent, "provider_cfg", {}).get("api_key", ""))
@@ -1043,6 +1096,7 @@ class NijiWebUI:
         finally:
             try:
                 self.agent.plan_only = previous_plan_only
+                self.agent.approved_plan = previous_approved_plan
             except Exception:
                 pass
             try:

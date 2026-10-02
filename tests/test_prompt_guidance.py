@@ -26,6 +26,12 @@ class BenignRequestGuidanceTests(unittest.TestCase):
         self.assertIn("hinglish", prompt)
         self.assertIn("ask only when ambiguity materially changes", prompt)
 
+    def test_task_plans_list_prerequisites_before_dependents(self):
+        prompt = _system_prompt().lower()
+        tools = TOOLS_SOURCE.read_text().lower()
+        self.assertIn("list every prerequisite before its dependent step", prompt)
+        self.assertIn("list each prerequisite before the dependent step", tools)
+
     def test_current_github_trending_lookup_uses_public_web_source(self):
         prompt = _system_prompt().lower()
         tools = TOOLS_SOURCE.read_text()
