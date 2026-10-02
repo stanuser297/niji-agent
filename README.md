@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.22.0
+# Niji Agent 🌈 — v2.23.0
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -15,6 +15,13 @@ niji
 Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, enter its API key (visible input is the Termux-friendly default; hidden entry is optional), and choose a model. The key is saved locally in `~/.niji/config.json` with private file permissions—no `export` command is needed. Ollama can be used without an API key.
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
+
+## What's new in 2.23.0
+
+- Added a live, request-scoped execution timeline to the chat home: safe thinking/progress summaries, tool starts/completions, compaction, approvals/denials, and errors remain visible with streamed response output. It shows actions and outcomes, never raw tool arguments or private chain-of-thought.
+- Added Settings-based Nango connector management: test and authorize a connector, discover tools before saving, add/remove it live without restarting, and keep credentials out of state responses. Secrets are persisted via the existing owner-only `~/.niji/mcp.json` path.
+- Exposed automatic context compaction and an estimated-token threshold in Settings; preferences persist locally. Manual compact remains available, and one emergency non-model trim on HTTP 413 remains enabled even when proactive compaction is off.
+- Added regression tests for job-scoped execution events, connector secret handling/lifecycle, and saved automatic-compaction preferences.
 
 ## What's new in 2.22.0
 

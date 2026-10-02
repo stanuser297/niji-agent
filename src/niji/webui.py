@@ -20,7 +20,8 @@ from urllib.parse import parse_qs, urlsplit
 from . import __version__
 from .compaction import estimate_tokens
 from .terminal import safe_terminal_text
-from .config import CONFIG_DIR, MEMORY_FILE, SESSION_DIR
+from .config import (CONFIG_DIR, MEMORY_FILE, SESSION_DIR, load_config,
+                    load_mcp_servers, save_config, save_mcp_servers)
 
 _MAX_BODY = 32_000
 _MAX_PROMPT = 20_000
@@ -78,6 +79,7 @@ class NijiWebUI:
         self.token = secrets.token_urlsafe(32)
         self._lock = threading.RLock()
         self._busy = False
+        self._connector_mutating = False
         self._active_job = None
         self._jobs = {}
         self._approvals = {}
@@ -178,6 +180,8 @@ class NijiWebUI:
                     except (ValueError, OSError, json.JSONDecodeError) as exc:
                         self._json(400, {"error": str(exc)[:250]}); return
                     self._json(200, {"session_id": session_id, "messages": transcript}); return
+                if parsed.path == "/api/connectors":
+                    self._json(200, {"connectors": ui._connector_state()}); return
                 if parsed.path == "/api/profiles":
                     self._json(200, {"profiles": ui._load_profiles(),
                                      "workspace": str(Path.cwd()),
@@ -206,7 +210,7 @@ class NijiWebUI:
                         if job:
                             result = {k: job.get(k) for k in (
                                 "id", "status", "response", "error", "streamed", "progress",
-                                "progress_detail", "activity", "plan_only", "original_message",
+                                "progress_detail", "activity", "events", "plan_only", "original_message",
                                 "cancel_requested")}
                         else:
                             result = None
@@ -241,6 +245,83 @@ class NijiWebUI:
                             approval["approved"] = False
                             approval["event"].set()
                     self._json(202, {"ok": True, "message": "Stop requested; an in-flight provider or tool call may finish first"}); return
+                if parsed.path == "/api/connectors":
+                    action = data.get("action") if isinstance(data, dict) else None
+                    name = data.get("name", "") if isinstance(data, dict) else ""
+                    with ui._lock:
+                        if ui._busy or ui._connector_mutating:
+                            self._json(409, {"error": "Wait until the current request or connector operation finishes"}); return
+                        ui._connector_mutating = True
+                    try:
+                        servers = load_mcp_servers()
+                        if not isinstance(servers, dict):
+                            self._json(400, {"error": "The saved connector file is invalid; fix ~/.niji/mcp.json first"}); return
+                        if action == "add_nango":
+                            api_key = data.get("api_key") if isinstance(data, dict) else None
+                            provider_key = data.get("provider_config_key") if isinstance(data, dict) else None
+                            connection_id = data.get("connection_id") if isinstance(data, dict) else None
+                            if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,32}", name)
+                                    or not isinstance(api_key, str) or not 8 <= len(api_key.strip()) <= 4096
+                                    or not isinstance(provider_key, str) or not 1 <= len(provider_key.strip()) <= 256
+                                    or not isinstance(connection_id, str) or not 1 <= len(connection_id.strip()) <= 256):
+                                self._json(400, {"error": "Enter a short connector name, Nango API key, provider-config key, and authorized connection ID"}); return
+                            if name in servers or any(getattr(c, "name", None) == name for c in getattr(ui.agent, "mcp_clients", [])):
+                                self._json(409, {"error": f"A connector named {name} already exists"}); return
+                            cfg = {"transport": "http", "url": "https://api.nango.dev/proxy/v2/mcp",
+                                   "api_key": api_key.strip(), "provider_config_key": provider_key.strip(),
+                                   "connection_id": connection_id.strip()}
+                            from .mcp import HttpMCPServer
+                            client = HttpMCPServer(name, cfg)
+                            try:
+                                client.start(timeout=20)
+                            except Exception as exc:
+                                client.stop()
+                                detail = safe_terminal_text(str(exc))[:300]
+                                for secret in (api_key.strip(), provider_key.strip(), connection_id.strip()):
+                                    detail = detail.replace(secret, "[redacted]")
+                                self._json(400, {"error": f"Nango connection test failed ({type(exc).__name__}): {detail}"[:420]}); return
+                            servers[name] = cfg
+                            try:
+                                save_mcp_servers(servers)
+                            except OSError as exc:
+                                client.stop()
+                                self._json(500, {"error": f"Could not securely save connector configuration ({type(exc).__name__})"}); return
+                            with ui._lock:
+                                ui.agent.mcp_clients = [*getattr(ui.agent, "mcp_clients", []), client]
+                            record = getattr(ui.agent, "_record_activity", None)
+                            if callable(record):
+                                record("CONNECTOR", f"Connected {name} · {len(client.tools)} tool(s) available")
+                            self._json(200, {"ok": True, "connectors": ui._connector_state()}); return
+                        if action == "remove":
+                            if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,32}", name) or name not in servers:
+                                self._json(404, {"error": "Choose a configured connector to remove"}); return
+                            del servers[name]
+                            try:
+                                save_mcp_servers(servers)
+                            except OSError as exc:
+                                self._json(500, {"error": f"Could not save connector changes ({type(exc).__name__})"}); return
+                            removed = []
+                            with ui._lock:
+                                retained = []
+                                for client in getattr(ui.agent, "mcp_clients", []):
+                                    if getattr(client, "name", None) == name:
+                                        removed.append(client)
+                                    else:
+                                        retained.append(client)
+                                ui.agent.mcp_clients = retained
+                            for client in removed:
+                                try:
+                                    client.stop()
+                                except Exception:
+                                    pass
+                            record = getattr(ui.agent, "_record_activity", None)
+                            if callable(record):
+                                record("CONNECTOR", f"Removed connector {name}")
+                            self._json(200, {"ok": True, "connectors": ui._connector_state()}); return
+                        self._json(400, {"error": "Connector action must be add_nango or remove"}); return
+                    finally:
+                        with ui._lock:
+                            ui._connector_mutating = False
                 if parsed.path == "/api/tool-policy":
                     name = data.get("name") if isinstance(data, dict) else None
                     policy = data.get("policy") if isinstance(data, dict) else None
@@ -365,6 +446,8 @@ class NijiWebUI:
                     if not isinstance(plan_only, bool):
                         self._json(400, {"error": "plan_only must be true or false"}); return
                     with ui._lock:
+                        if ui._connector_mutating:
+                            self._json(409, {"error": "Wait until connector setup finishes before starting a request"}); return
                         if ui._busy:
                             self._json(409, {"error": "Niji is already working on a request"}); return
                         cancel_event = getattr(ui.agent, "_cancel_event", None)
@@ -376,7 +459,7 @@ class NijiWebUI:
                         ui._jobs[job_id] = {"id": job_id, "status": "running", "response": "", "error": "",
                                              "streamed": "", "progress": "Thinking on it",
                                              "progress_detail": "Preparing the model request", "activity": None,
-                                             "plan_only": plan_only, "original_message": message.strip(),
+                                             "events": [], "plan_only": plan_only, "original_message": message.strip(),
                                              "cancel_requested": False, "created": time.time()}
                     ui._job_thread = threading.Thread(
                         target=ui._run_job, args=(job_id, message.strip(), plan_only),
@@ -397,13 +480,39 @@ class NijiWebUI:
                         self._json(400, {"error": str(exc)[:250]}); return
                     self._json(200, ui._state()); return
                 if parsed.path == "/api/settings":
-                    approval_mode = data.get("approval") if isinstance(data, dict) else None
-                    if approval_mode not in ("ask", "auto"):
+                    if not isinstance(data, dict):
+                        self._json(400, {"error": "Settings must be a JSON object"}); return
+                    approval_mode = data.get("approval")
+                    auto_compact = data.get("auto_compact")
+                    threshold = data.get("compaction_threshold")
+                    if approval_mode is not None and approval_mode not in ("ask", "auto"):
                         self._json(400, {"error": "approval must be ask or auto"}); return
+                    if auto_compact is not None and not isinstance(auto_compact, bool):
+                        self._json(400, {"error": "auto_compact must be true or false"}); return
+                    if threshold is not None and (isinstance(threshold, bool) or not isinstance(threshold, int)
+                                                  or not 8_000 <= threshold <= 200_000):
+                        self._json(400, {"error": "compaction_threshold must be between 8000 and 200000 estimated tokens"}); return
+                    if approval_mode is None and auto_compact is None and threshold is None:
+                        self._json(400, {"error": "No supported setting was provided"}); return
                     with ui._lock:
-                        if ui._busy:
-                            self._json(409, {"error": "Wait until the current request finishes before changing approval mode"}); return
-                        ui.agent.approval = approval_mode
+                        if ui._busy or ui._connector_mutating:
+                            self._json(409, {"error": "Wait until the current request or connector operation finishes before changing settings"}); return
+                        config = load_config()
+                        if auto_compact is not None:
+                            config["auto_compact"] = auto_compact
+                        if threshold is not None:
+                            config["compaction_threshold"] = threshold
+                        if auto_compact is not None or threshold is not None:
+                            try:
+                                save_config(config)
+                            except OSError as exc:
+                                self._json(500, {"error": f"Could not save settings ({type(exc).__name__})"}); return
+                        if approval_mode is not None:
+                            ui.agent.approval = approval_mode
+                        if auto_compact is not None:
+                            ui.agent.auto_compact = auto_compact
+                        if threshold is not None:
+                            ui.agent.compaction_threshold = threshold
                     self._json(200, ui._state()); return
                 if parsed.path.startswith("/api/approvals/"):
                     approval_id = parsed.path.rsplit("/", 1)[-1]
@@ -425,6 +534,15 @@ class NijiWebUI:
     def url(self):
         host = "[::1]" if self.host == "::1" else ("127.0.0.1" if self.host == "localhost" else self.host)
         return f"http://{host}:{self.httpd.server_port}/?token={self.token}"
+
+    def _safe_event_message(self, value):
+        text = safe_terminal_text(str(value or ""))
+        secrets = [str(getattr(self.agent, "provider_cfg", {}).get("api_key", ""))]
+        for client in getattr(self.agent, "mcp_clients", []):
+            secrets.extend(str(item) for item in getattr(client, "_secrets", []) if item)
+        for secret in sorted((s for s in secrets if len(s) >= 6), key=len, reverse=True):
+            text = text.replace(secret, "[redacted]")
+        return text[:400]
 
     def _record_activity(self, event):
         callback = self._previous_activity_callback
@@ -449,12 +567,20 @@ class NijiWebUI:
         with self._lock:
             job = self._jobs.get(self._active_job) if self._active_job else None
             if job and job.get("status") == "running":
-                level = str(event.get("level", "INFO"))
-                detail = str(event.get("message", ""))[:400]
+                level = str(event.get("level", "INFO"))[:32]
+                detail = self._safe_event_message(event.get("message", ""))
+                timestamp = safe_terminal_text(str(event.get("time", "")))[:24]
                 job["progress"] = labels.get(level, "Working")
                 job["progress_detail"] = detail
-                job["activity"] = {"level": level, "message": detail,
-                                   "time": event.get("time", "")}
+                visible_detail = "Thinking through the next step" if level == "THINKING" else detail
+                activity = {"level": level, "message": visible_detail, "time": timestamp}
+                job["activity"] = activity
+                if level in {"THINKING", "PLAN", "TOOL", "TOOL_PROGRESS", "TOOL_DONE",
+                             "RETRY", "COMPACT", "DONE", "STOPPED", "ERROR", "LIMIT",
+                             "DENIED", "CHECKPOINT", "UNDO", "CONNECTOR", "INTERRUPTED"}:
+                    events = job.setdefault("events", [])
+                    events.append(activity)
+                    del events[:-120]
 
     def _record_stream_chunk(self, chunk):
         safe = safe_terminal_text(str(chunk))
@@ -573,6 +699,23 @@ class NijiWebUI:
             self.agent.file_change_history = []
             self.agent.started_at = time.monotonic()
             self.agent._record_activity("READY", f"Opened saved thread {session_id}")
+
+    def _connector_state(self):
+        configured = load_mcp_servers()
+        if not isinstance(configured, dict):
+            configured = {}
+        live = {getattr(client, "name", ""): client
+                for client in getattr(self.agent, "mcp_clients", [])}
+        result = []
+        for name, cfg in configured.items():
+            if not isinstance(name, str) or not isinstance(cfg, dict):
+                continue
+            client = live.get(name)
+            result.append({"name": name,
+                           "transport": str(cfg.get("transport", "stdio"))[:32],
+                           "connected": client is not None,
+                           "tools": len(getattr(client, "tools", [])) if client else 0})
+        return sorted(result, key=lambda item: item["name"].casefold())
 
     def _load_profiles(self):
         if _PROFILE_FILE.is_symlink() or not _PROFILE_FILE.is_file() or _PROFILE_FILE.stat().st_size > 100_000:
@@ -748,6 +891,9 @@ class NijiWebUI:
                         "project_guidance": (Path.cwd() / "AGENTS.md").is_file(),
                         "active_profile": getattr(self.agent, "active_profile", "")},
             "context_tokens": estimate_tokens(messages), "transcript": transcript[-80:],
+            "auto_compact": bool(getattr(self.agent, "auto_compact", True)),
+            "compaction_threshold": int(getattr(self.agent, "compaction_threshold", 60_000)),
+            "connectors": self._connector_state(),
             "limits": {"max_turns": getattr(self.agent, "max_turns", 20),
                        "max_tool_calls": getattr(self.agent, "max_tool_calls", 30),
                        "max_tool_calls_per_turn": getattr(self.agent, "max_tool_calls_per_turn", 6)},

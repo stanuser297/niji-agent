@@ -1,7 +1,7 @@
 import sys
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from niji.compaction import estimate_tokens, maybe_compact
 
@@ -20,6 +20,24 @@ class CompactionTests(unittest.TestCase):
         with patch("niji.agent.OpenAI", return_value=object()):
             return Agent({"provider": "groq", "model": "m", "api_key": "k",
                           "base_url": "https://example.test/v1"}, verbose=False)
+
+    def test_saved_auto_compaction_settings_are_loaded_and_respected(self):
+        from niji.agent import Agent
+        with patch("niji.agent.load_config", return_value={
+            "auto_compact": False, "compaction_threshold": 40000
+        }), patch("niji.agent.OpenAI", return_value=object()):
+            agent = Agent({"provider": "test", "model": "m", "api_key": "k",
+                           "base_url": "https://example.test/v1"}, verbose=False)
+        self.assertFalse(agent.auto_compact)
+        self.assertEqual(agent.compaction_threshold, 40000)
+        tool_call = {"id": "call-1", "name": "read_file", "arguments": {}}
+        assistant_tool = {"role": "assistant", "content": "", "tool_calls": [tool_call]}
+        agent._chat = Mock(side_effect=[(assistant_tool, "", [tool_call]),
+                                                      ({"role": "assistant", "content": "done"}, "done", [])])
+        agent._execute = lambda call: "read ok"
+        with patch("niji.agent.maybe_compact") as compact:
+            self.assertEqual(agent._loop(), "done")
+        compact.assert_not_called()
 
     def test_forced_compaction_keeps_current_request_even_for_short_transcript(self):
         messages = [
@@ -56,6 +74,7 @@ class CompactionTests(unittest.TestCase):
 
     def test_http_413_compacts_once_and_retries_with_smaller_context(self):
         agent = self.make_agent()
+        agent.auto_compact = False
         agent.messages = [
             {"role": "system", "content": "rules"},
             {"role": "user", "content": "environment"},

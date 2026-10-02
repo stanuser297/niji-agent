@@ -15,7 +15,7 @@ from pathlib import Path
 from openai import OpenAI
 
 from .compaction import estimate_tokens, maybe_compact
-from .config import MEMORY_FILE, SESSION_DIR
+from .config import MEMORY_FILE, SESSION_DIR, load_config
 from .instructions import discover_skills, load_project_guidance, skill_index
 from .tools import CORE_SCHEMAS, SUBAGENT_TOOLS, dispatch
 from .terminal import OUTPUT_LOCK, safe_terminal_text
@@ -87,6 +87,13 @@ class Agent:
         self.max_tool_calls = max(1, min(int(max_tool_calls), 1000))
         self.max_tool_calls_per_turn = max(
             1, min(int(max_tool_calls_per_turn), self.max_tool_calls, 20))
+        saved_settings = load_config()
+        self.auto_compact = saved_settings.get("auto_compact") is not False
+        try:
+            self.compaction_threshold = max(8_000, min(
+                int(saved_settings.get("compaction_threshold", 60_000)), 200_000))
+        except (TypeError, ValueError):
+            self.compaction_threshold = 60_000
         self._request_tool_calls = 0
         self.verbose = verbose
         self.depth = depth
@@ -371,8 +378,10 @@ class Agent:
                                       "tool_call_id": tc["id"],
                                       "content": result})
 
-            self.messages, compacted = maybe_compact(
-                self.messages, self.client, self.model)
+            compacted = False
+            if self.auto_compact:
+                self.messages, compacted = maybe_compact(
+                    self.messages, self.client, self.model, self.compaction_threshold)
             if compacted and self.verbose:
                 self._print("\n[niji] context compacted (old messages summarized)")
 

@@ -184,6 +184,14 @@ class WebUITests(unittest.TestCase):
         self.assertNotIn("provider}/${model} · turn", page)
         self.assertNotIn("j.streamed||j.progress_detail", page)
         self.assertIn('id="file-changes"', page)
+        self.assertIn('id="connector-settings"', page)
+        self.assertIn('id="connector-api-key"', page)
+        self.assertIn('id="add-connector"', page)
+        self.assertIn("renderJobEvents(j.events,placeholder)", page)
+        self.assertIn("className='execution-steps'", page)
+        self.assertIn('id="auto-compact-toggle"', page)
+        self.assertIn('id="compaction-threshold"', page)
+        self.assertIn("413 emergency recovery is still enabled", page)
         self.assertIn("Ask every time", page)
 
     def test_state_endpoint_requires_token_and_never_returns_api_key(self):
@@ -212,6 +220,37 @@ class WebUITests(unittest.TestCase):
         self.assertEqual(job["response"], "Hello from Niji: hello")
         self.assertEqual(job["streamed"], "Hello from Niji: hello")
         self.assertTrue(job["plan_only"] is False)
+
+    def test_job_execution_timeline_is_request_scoped_and_redacts_secrets(self):
+        started = json.loads(self.request("/api/chat", {"message": "show progress"}, self.ui.token).read())
+        deadline = time.time() + 3
+        job = None
+        while time.time() < deadline:
+            job = json.loads(self.request("/api/jobs/" + started["id"], token=self.ui.token).read())
+            if job["status"] != "running":
+                break
+            time.sleep(0.03)
+        self.assertTrue(job["events"])
+        self.assertEqual(job["events"][0]["level"], "THINKING")
+        self.assertEqual(job["events"][0]["message"], "Thinking through the next step")
+        self.assertNotIn("private-test-secret", json.dumps(job["events"]))
+        self.assertNotIn("demo-model", json.dumps(job["events"]))
+
+    def test_settings_persist_automatic_compaction_preferences(self):
+        with (patch("niji.webui.load_config", return_value={}),
+              patch("niji.webui.save_config") as save):
+            state = json.loads(self.request("/api/settings", {
+                "auto_compact": False, "compaction_threshold": 40000
+            }, self.ui.token).read())
+        self.assertFalse(self.agent.auto_compact)
+        self.assertEqual(self.agent.compaction_threshold, 40000)
+        self.assertFalse(state["auto_compact"])
+        self.assertEqual(state["compaction_threshold"], 40000)
+        saved = save.call_args.args[0]
+        self.assertEqual(saved, {"auto_compact": False, "compaction_threshold": 40000})
+        with self.assertRaises(urllib.error.HTTPError) as invalid:
+            self.request("/api/settings", {"compaction_threshold": 2000}, self.ui.token).read()
+        self.assertEqual(invalid.exception.code, 400)
 
     def test_cancelled_provider_exception_is_reported_as_cancelled(self):
         job_id = "cancelled-error-case"
@@ -247,6 +286,45 @@ class WebUITests(unittest.TestCase):
                 break
             time.sleep(0.03)
         self.assertEqual(job["status"], "cancelled")
+
+    def test_settings_can_add_and_remove_nango_without_exposing_credentials(self):
+        saved = {}
+
+        class MockHttpMCP:
+            def __init__(self, name, cfg):
+                self.name, self.cfg = name, cfg
+                self.tools = [{"name": "issue_search"}]
+                self.stopped = False
+            def start(self, timeout=20):
+                self.timeout = timeout
+            def stop(self):
+                self.stopped = True
+
+        def save(servers):
+            saved.clear()
+            saved.update(servers)
+
+        with (patch("niji.webui.load_mcp_servers", side_effect=lambda: dict(saved)),
+              patch("niji.webui.save_mcp_servers", side_effect=save),
+              patch("niji.mcp.HttpMCPServer", MockHttpMCP)):
+            result = json.loads(self.request("/api/connectors", {
+                "action": "add_nango", "name": "nango_github",
+                "api_key": "nango-private-api-key", "provider_config_key": "github-prod",
+                "connection_id": "connection-private-id",
+            }, self.ui.token).read())
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["connectors"][0]["tools"], 1)
+            self.assertTrue(result["connectors"][0]["connected"])
+            self.assertNotIn("nango-private-api-key", json.dumps(result))
+            self.assertNotIn("connection-private-id", json.dumps(result))
+            state = json.loads(self.request("/api/state", token=self.ui.token).read())
+            self.assertNotIn("nango-private-api-key", json.dumps(state))
+            removed = json.loads(self.request("/api/connectors", {
+                "action": "remove", "name": "nango_github"
+            }, self.ui.token).read())
+        self.assertTrue(removed["ok"])
+        self.assertEqual(saved, {})
+        self.assertEqual(self.agent.mcp_clients, [])
 
     def test_plan_only_does_not_execute_tools_and_is_visible_in_job(self):
         started = json.loads(self.request("/api/chat", {"message": "inspect project", "plan_only": True}, self.ui.token).read())
