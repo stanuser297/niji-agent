@@ -263,6 +263,12 @@ class NijiWebUI:
                 data = self._read_json()
                 if data is None:
                     self._json(400, {"error": "Invalid or oversized JSON body"}); return
+                if parsed.path.startswith("/api/jobs/") and parsed.path.endswith("/edit-plan"):
+                    parts = parsed.path.strip("/").split("/")
+                    if len(parts) != 4 or not isinstance(data, dict) or set(data) != {"steps"}:
+                        self._json(400, {"error": "Plan editing requires only a steps array for one job"}); return
+                    status, result = ui._edit_plan(parts[2], data.get("steps"))
+                    self._json(status, result); return
                 if parsed.path.startswith("/api/jobs/") and parsed.path.endswith("/approve-plan"):
                     parts = parsed.path.strip("/").split("/")
                     if len(parts) != 4 or not isinstance(data, dict) or data:
@@ -838,6 +844,50 @@ class NijiWebUI:
             json.dumps(task_data, ensure_ascii=False, separators=(",", ":"))
         )
 
+    def _edit_plan(self, source_job_id: str, steps):
+        """Update a completed plan preview without letting edits bypass approval checks."""
+        if not isinstance(steps, list):
+            return 400, {"error": "Plan steps must be an array of text descriptions"}
+        if not steps or any(not isinstance(step, str) or not step.strip() for step in steps):
+            return 400, {"error": "A plan needs non-empty text for every step"}
+        try:
+            # Edited plans are proposals: never let client-supplied status/IDs imply work is done.
+            plan = normalize_plan([{"content": step, "status": "pending"} for step in steps])
+        except (TypeError, ValueError) as exc:
+            return 400, {"error": str(exc)[:250]}
+        with self._lock:
+            source = self._jobs.get(source_job_id)
+            if source is None:
+                return 404, {"error": "Plan preview was not found or has expired"}
+            if source.get("plan_approved"):
+                return 409, {"error": "An approved plan can no longer be edited"}
+            if source.get("status") != "completed" or not source.get("plan_only"):
+                return 409, {"error": "Only a completed plan-only preview can be edited"}
+            session_id = source.get("session_id")
+            if not isinstance(session_id, str) or session_id != getattr(self.agent, "session_id", None):
+                return 409, {"error": "This plan belongs to a different thread; reopen that thread to edit it"}
+            if self._busy:
+                return 409, {"error": "Wait for the current task to finish before editing this plan"}
+            try:
+                current = normalize_plan(source.get("plan", []))
+            except (TypeError, ValueError):
+                return 409, {"error": "The proposed plan is invalid; request a new plan"}
+            if load_plan(session_id) != current:
+                return 409, {"error": "The saved plan changed after preview; request a fresh plan before editing it"}
+            try:
+                save_plan(session_id, plan)
+            except (OSError, ValueError) as exc:
+                return 500, {"error": f"Could not save the edited plan: {str(exc)[:200]}"}
+            source["plan"] = plan
+            self.agent.todos = {"items": plan}
+            callback = self._previous_plan_callback
+        if callback:
+            try:
+                callback(plan, "Plan updated for review")
+            except Exception:
+                pass
+        return 200, {"ok": True, "plan": plan}
+
     def _approve_plan(self, source_job_id: str):
         """Start execution only for a completed, current-session, unchanged saved plan."""
         with self._lock:
@@ -883,7 +933,8 @@ class NijiWebUI:
                                  "streamed": "", "progress": "Thinking on it",
                                  "progress_detail": "Preparing the model request", "activity": None,
                                  "events": [], "plan_only": bool(plan_only), "original_message": message,
-                                 "plan": list(getattr(self.agent, "todos", {}).get("items", [])),
+                                 "plan": ([] if plan_only else
+                                          list(getattr(self.agent, "todos", {}).get("items", []))),
                                  "plan_label": "", "plan_approved": False,
                                  "session_id": getattr(self.agent, "session_id", "local"),
                                  "cancel_requested": False, "created": time.time(),
@@ -967,9 +1018,9 @@ class NijiWebUI:
             output = str(response or "[done]")[:40_000]
             if plan_only:
                 proposed_steps = extract_plan_steps(output)
-                if proposed_steps:
-                    self.agent.todos = {"items": proposed_steps}
-                    self._record_plan(proposed_steps, "Plan ready for review")
+                self.agent.todos = {"items": proposed_steps}
+                self._record_plan(proposed_steps,
+                                  "Plan ready for review" if proposed_steps else "No actionable plan steps found")
             with self._lock:
                 job = self._jobs[job_id]
                 final_status = "cancelled" if job.get("cancel_requested") else "completed"
