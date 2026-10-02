@@ -20,12 +20,15 @@ from urllib.parse import parse_qs, urlsplit
 from . import __version__
 from .compaction import estimate_tokens
 from .terminal import safe_terminal_text
-from .config import (CONFIG_DIR, MEMORY_FILE, SESSION_DIR, load_config,
-                    load_mcp_servers, save_config, save_mcp_servers)
+from .config import (CONFIG_DIR, MEMORY_FILE, SESSION_DIR, PRESETS, load_config,
+                    load_mcp_servers, resolve_provider, save_config, save_mcp_servers)
+from .model_catalog import (fetch_provider_models, provider_is_configured,
+                            provider_names, resolve_catalog_provider)
 
 _MAX_BODY = 32_000
 _MAX_PROMPT = 20_000
 _PROFILE_FILE = CONFIG_DIR / "project_profiles.json"
+_PIN_FILE = CONFIG_DIR / "pinned_sessions.json"
 
 
 _PAGE = r'''<!doctype html>
@@ -80,6 +83,7 @@ class NijiWebUI:
         self._lock = threading.RLock()
         self._busy = False
         self._connector_mutating = False
+        self._model_mutating = False
         self._active_job = None
         self._jobs = {}
         self._approvals = {}
@@ -173,6 +177,8 @@ class NijiWebUI:
                     self._json(200, ui._state()); return
                 if parsed.path == "/api/sessions":
                     self._json(200, {"sessions": ui._list_sessions()}); return
+                if parsed.path == "/api/models":
+                    self._json(200, ui._model_state()); return
                 if parsed.path.startswith("/api/sessions/") and parsed.path.endswith("/export"):
                     session_id = parsed.path.split("/")[3]
                     try:
@@ -245,6 +251,9 @@ class NijiWebUI:
                             approval["approved"] = False
                             approval["event"].set()
                     self._json(202, {"ok": True, "message": "Stop requested; an in-flight provider or tool call may finish first"}); return
+                if parsed.path == "/api/models":
+                    status, result = ui._model_action(data)
+                    self._json(status, result); return
                 if parsed.path == "/api/connectors":
                     action = data.get("action") if isinstance(data, dict) else None
                     name = data.get("name", "") if isinstance(data, dict) else ""
@@ -446,8 +455,8 @@ class NijiWebUI:
                     if not isinstance(plan_only, bool):
                         self._json(400, {"error": "plan_only must be true or false"}); return
                     with ui._lock:
-                        if ui._connector_mutating:
-                            self._json(409, {"error": "Wait until connector setup finishes before starting a request"}); return
+                        if ui._connector_mutating or ui._model_mutating:
+                            self._json(409, {"error": "Wait until model or connector setup finishes before starting a request"}); return
                         if ui._busy:
                             self._json(409, {"error": "Niji is already working on a request"}); return
                         cancel_event = getattr(ui.agent, "_cancel_event", None)
@@ -472,6 +481,14 @@ class NijiWebUI:
                     except RuntimeError as exc:
                         self._json(409, {"error": str(exc)}); return
                     self._json(200, ui._state()); return
+                if parsed.path.startswith("/api/sessions/") and parsed.path.endswith("/pin"):
+                    session_id = parsed.path.split("/")[3]
+                    pinned = data.get("pinned") if isinstance(data, dict) else None
+                    try:
+                        ui._set_session_pinned(session_id, pinned)
+                    except (ValueError, OSError) as exc:
+                        self._json(400, {"error": str(exc)[:250]}); return
+                    self._json(200, {"ok": True, "sessions": ui._list_sessions()}); return
                 if parsed.path.startswith("/api/sessions/"):
                     session_id = parsed.path.rsplit("/", 1)[-1]
                     try:
@@ -495,8 +512,8 @@ class NijiWebUI:
                     if approval_mode is None and auto_compact is None and threshold is None:
                         self._json(400, {"error": "No supported setting was provided"}); return
                     with ui._lock:
-                        if ui._busy or ui._connector_mutating:
-                            self._json(409, {"error": "Wait until the current request or connector operation finishes before changing settings"}); return
+                        if ui._busy or ui._connector_mutating or ui._model_mutating:
+                            self._json(409, {"error": "Wait until the current request or setup operation finishes before changing settings"}); return
                         config = load_config()
                         if auto_compact is not None:
                             config["auto_compact"] = auto_compact
@@ -717,6 +734,132 @@ class NijiWebUI:
                            "tools": len(getattr(client, "tools", [])) if client else 0})
         return sorted(result, key=lambda item: item["name"].casefold())
 
+    def _model_state(self):
+        cfg = load_config()
+        active_provider = str(getattr(self.agent, "provider_name", ""))
+        providers = []
+        names = provider_names(cfg)
+        if active_provider and active_provider not in names:
+            names.append(active_provider)
+        for name in names:
+            providers.append({"name": name,
+                              "configured": bool(provider_is_configured(name, cfg)) or name == active_provider,
+                              "active": name == active_provider})
+        return {"providers": providers,
+                "provider": active_provider,
+                "model": str(getattr(self.agent, "model", ""))}
+
+    def _model_action(self, data):
+        if not isinstance(data, dict):
+            return 400, {"error": "Model action must be a JSON object"}
+        action = data.get("action")
+        name = data.get("provider")
+        if not isinstance(name, str) or name not in provider_names(load_config()):
+            return 400, {"error": "Choose a known provider"}
+        if action == "catalog":
+            if not provider_is_configured(name):
+                return 400, {"error": "Connect this provider in `niji setup` first"}
+            provider_cfg, error = resolve_catalog_provider(name)
+            if error:
+                return 400, {"error": error, "models": []}
+            models, message = fetch_provider_models(provider_cfg)
+            return (200 if models else 400), {"models": models, "message": message}
+        if action != "switch":
+            return 400, {"error": "Choose catalog or switch"}
+        model_id = data.get("model")
+        if not isinstance(model_id, str):
+            return 400, {"error": "Enter a model ID"}
+        model_id = model_id.strip()
+        if not 1 <= len(model_id) <= 200 or any(ord(ch) < 32 for ch in model_id):
+            return 400, {"error": "Model ID must be 1–200 visible characters"}
+        if not provider_is_configured(name):
+            return 400, {"error": "Connect this provider in `niji setup` first"}
+        with self._lock:
+            if self._busy or self._connector_mutating or self._model_mutating:
+                return 409, {"error": "Wait until the current task or setup operation finishes"}
+            self._model_mutating = True
+        try:
+            try:
+                provider_cfg = resolve_provider(name, model=model_id)
+            except (SystemExit, KeyError, ValueError):
+                return 400, {"error": "Provider setup is incomplete; reconnect it with `niji setup`"}
+            from .setup_wizard import test_connection
+            ok, _message = test_connection(provider_cfg)
+            if not ok:
+                return 400, {"error": "Provider did not pass the chat test; model was not changed. Check the provider, key, and model ID."}
+            try:
+                from openai import OpenAI
+                client = OpenAI(api_key=provider_cfg["api_key"],
+                                base_url=provider_cfg["base_url"], timeout=120,
+                                max_retries=0)
+                cfg = load_config()
+                cfg["provider"] = name
+                if name in PRESETS:
+                    cfg.setdefault("models", {})[name] = model_id
+                else:
+                    cfg.setdefault("custom_providers", {}).setdefault(name, {})["model"] = model_id
+                save_config(cfg)
+            except Exception as exc:
+                return 500, {"error": f"Could not safely activate this model ({type(exc).__name__})"}
+            old_client = getattr(self.agent, "client", None)
+            self.agent.client = client
+            self.agent.model = model_id
+            self.agent.provider_name = name
+            self.agent.provider_cfg = provider_cfg
+            if hasattr(self.agent, "_record_activity"):
+                self.agent._record_activity("MODEL", f"Switched model to {name}/{model_id}")
+            if isinstance(getattr(self.agent, "messages", None), list):
+                self.agent.messages.append({"role": "system", "content":
+                                            f"The active model was changed to {name}/{model_id}. Continue the same task and conversation."})
+            close = getattr(old_client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+            return 200, {"ok": True, "provider": name, "model": model_id}
+        finally:
+            with self._lock:
+                self._model_mutating = False
+
+    def _load_pinned_session_ids(self):
+        if (_PIN_FILE.is_symlink() or not _PIN_FILE.is_file()
+                or _PIN_FILE.stat().st_size > 20_000):
+            return []
+        try:
+            raw = json.loads(_PIN_FILE.read_text())
+            if not isinstance(raw, list):
+                return []
+            return list(dict.fromkeys(item for item in raw
+                                      if isinstance(item, str)
+                                      and re.fullmatch(r"[A-Za-z0-9_-]{1,80}", item)))[:100]
+        except (OSError, ValueError, TypeError):
+            return []
+
+    def _set_session_pinned(self, session_id, pinned):
+        if not isinstance(session_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", session_id):
+            raise ValueError("Invalid session id")
+        if not isinstance(pinned, bool):
+            raise ValueError("pinned must be true or false")
+        path = SESSION_DIR / f"{session_id}.json"
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 5_000_000:
+            raise ValueError("Choose a saved thread to pin")
+        pins = self._load_pinned_session_ids()
+        pins = [item for item in pins if item != session_id]
+        if pinned:
+            if len(pins) >= 100:
+                raise ValueError("You can pin at most 100 threads")
+            pins.insert(0, session_id)
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        CONFIG_DIR.chmod(0o700)
+        if _PIN_FILE.is_symlink():
+            raise OSError("Refusing to replace a symlinked pinned-thread file")
+        temp = _PIN_FILE.with_suffix(".json.tmp")
+        temp.write_text(json.dumps(pins[:100], ensure_ascii=False, indent=2))
+        temp.chmod(0o600)
+        temp.replace(_PIN_FILE)
+        _PIN_FILE.chmod(0o600)
+
     def _load_profiles(self):
         if _PROFILE_FILE.is_symlink() or not _PROFILE_FILE.is_file() or _PROFILE_FILE.stat().st_size > 100_000:
             return []
@@ -812,6 +955,7 @@ class NijiWebUI:
 
     def _list_sessions(self):
         results = []
+        pinned = set(self._load_pinned_session_ids())
         try:
             files = sorted(SESSION_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
         except OSError:
@@ -828,7 +972,8 @@ class NijiWebUI:
                               and m.get("content") and not str(m["content"]).startswith("[Environment:")), "New thread")
                 results.append({"id": path.stem, "title": title[:100],
                                 "updated": datetime.fromtimestamp(path.stat().st_mtime).strftime("%b %d · %H:%M"),
-                                "messages": sum(1 for m in messages if isinstance(m, dict) and m.get("role") in ("user", "assistant"))})
+                                "messages": sum(1 for m in messages if isinstance(m, dict) and m.get("role") in ("user", "assistant")),
+                                "pinned": path.stem in pinned})
             except (OSError, ValueError, TypeError):
                 continue
         return results

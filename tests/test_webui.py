@@ -132,6 +132,10 @@ class WebUITests(unittest.TestCase):
         self.assertIn("File is over 64 KB", page)
         self.assertIn("X-Niji-Token", page)
         self.assertIn("RECENT THREADS", page)
+        self.assertIn('id="model-provider"', page)
+        self.assertIn('id="fetch-models"', page)
+        self.assertIn('id="apply-model"', page)
+        self.assertIn("async function togglePinnedSession", page)
         self.assertIn('id="view-overview"', page)
         self.assertIn('id="view-tools"', page)
         self.assertIn('id="view-settings"', page)
@@ -203,6 +207,99 @@ class WebUITests(unittest.TestCase):
         self.assertIn('id="compaction-threshold"', page)
         self.assertIn("413 emergency recovery is still enabled", page)
         self.assertIn("Ask every time", page)
+
+    def test_browser_model_picker_and_thread_pinning_controls_are_present(self):
+        page = urllib.request.urlopen(self.ui.url, timeout=3).read().decode()
+        for marker in ('id="model-provider"', 'id="model-catalog"', 'id="model-manual"',
+                       'id="fetch-models"', 'id="apply-model"', 'pin-thread',
+                       'async function fetchModelCatalog', 'async function applyModel',
+                       'async function togglePinnedSession', 'PINNED'):
+            self.assertIn(marker, page)
+
+    def test_model_state_does_not_expose_credentials(self):
+        with (patch("niji.webui.load_config", return_value={"api_keys": {"test": "private-test-secret"}}),
+              patch("niji.webui.provider_names", return_value=["test", "openai"]),
+              patch("niji.webui.provider_is_configured", side_effect=lambda name, cfg=None: name == "test")):
+            state = json.loads(self.request("/api/models", token=self.ui.token).read())
+        self.assertEqual(state["provider"], "test")
+        self.assertEqual(state["model"], "demo-model")
+        self.assertTrue(next(p for p in state["providers"] if p["name"] == "test")["configured"])
+        self.assertNotIn("private-test-secret", json.dumps(state))
+
+    def test_model_catalog_returns_models_for_configured_provider(self):
+        with (patch("niji.webui.load_config", return_value={}),
+              patch("niji.webui.provider_names", return_value=["demo"]),
+              patch("niji.webui.provider_is_configured", return_value=True),
+              patch("niji.webui.resolve_catalog_provider", return_value=({"provider": "demo"}, None)),
+              patch("niji.webui.fetch_provider_models", return_value=(["demo-fast", "demo-pro"], ""))):
+            result = json.loads(self.request("/api/models", {
+                "action": "catalog", "provider": "demo"
+            }, self.ui.token).read())
+        self.assertEqual(result["models"], ["demo-fast", "demo-pro"])
+
+    def test_model_switch_requires_successful_chat_test_before_persisting(self):
+        cfg = {"api_key": "key-for-test", "base_url": "https://example.invalid/v1",
+               "provider": "demo", "model": "demo-pro"}
+        with (patch("niji.webui.load_config", return_value={}),
+              patch("niji.webui.provider_names", return_value=["demo"]),
+              patch("niji.webui.provider_is_configured", return_value=True),
+              patch("niji.webui.resolve_provider", return_value=dict(cfg)),
+              patch("niji.setup_wizard.test_connection", return_value=(True, "ok")),
+              patch("niji.webui.save_config") as save,
+              patch("openai.OpenAI", return_value=object())):
+            result = json.loads(self.request("/api/models", {
+                "action": "switch", "provider": "demo", "model": "demo-pro"
+            }, self.ui.token).read())
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.agent.provider_name, "demo")
+        self.assertEqual(self.agent.model, "demo-pro")
+        save.assert_called_once()
+        self.assertFalse(self.ui._model_mutating)
+
+    def test_failed_model_chat_test_does_not_change_active_model_or_config(self):
+        with (patch("niji.webui.load_config", return_value={}),
+              patch("niji.webui.provider_names", return_value=["demo"]),
+              patch("niji.webui.provider_is_configured", return_value=True),
+              patch("niji.webui.resolve_provider", return_value={"api_key": "secret", "base_url": "https://example.invalid/v1", "model": "bad"}),
+              patch("niji.setup_wizard.test_connection", return_value=(False, "secret response")),
+              patch("niji.webui.save_config") as save):
+            with self.assertRaises(urllib.error.HTTPError) as failed:
+                self.request("/api/models", {"action": "switch", "provider": "demo", "model": "bad"}, self.ui.token)
+        self.assertEqual(failed.exception.code, 400)
+        self.assertEqual(self.agent.model, "demo-model")
+        save.assert_not_called()
+        self.assertFalse(self.ui._model_mutating)
+
+    def test_pinned_threads_persist_and_appear_in_session_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sessions, config = root / "sessions", root / "config"
+            sessions.mkdir(); config.mkdir()
+            (sessions / "thread-1.json").write_text(json.dumps([
+                {"role": "user", "content": "Review this release"},
+                {"role": "assistant", "content": "I will review it."},
+            ]))
+            with (patch("niji.webui.SESSION_DIR", sessions),
+                  patch("niji.webui.CONFIG_DIR", config),
+                  patch("niji.webui._PIN_FILE", config / "pinned_sessions.json")):
+                result = json.loads(self.request("/api/sessions/thread-1/pin", {
+                    "pinned": True
+                }, self.ui.token).read())
+                self.assertTrue(result["sessions"][0]["pinned"])
+                self.assertEqual(json.loads((config / "pinned_sessions.json").read_text()), ["thread-1"])
+                self.assertEqual((config / "pinned_sessions.json").stat().st_mode & 0o777, 0o600)
+                result = json.loads(self.request("/api/sessions/thread-1/pin", {
+                    "pinned": False
+                }, self.ui.token).read())
+                self.assertFalse(result["sessions"][0]["pinned"])
+
+    def test_pin_endpoint_rejects_unsaved_threads_and_bad_values(self):
+        with self.assertRaises(urllib.error.HTTPError) as missing:
+            self.request("/api/sessions/not-saved/pin", {"pinned": True}, self.ui.token)
+        self.assertEqual(missing.exception.code, 400)
+        with self.assertRaises(urllib.error.HTTPError) as invalid:
+            self.request("/api/sessions/bad/pin", {"pinned": "yes"}, self.ui.token)
+        self.assertEqual(invalid.exception.code, 400)
 
     def test_state_endpoint_requires_token_and_never_returns_api_key(self):
         with self.assertRaises(urllib.error.HTTPError) as missing:
