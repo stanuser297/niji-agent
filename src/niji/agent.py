@@ -131,6 +131,15 @@ class Agent:
         self.tool_policies = {}
         self.plan_only = False
         self._cancel_event = threading.Event()
+        # Pause requests are cooperative: already-admitted model/tool calls may finish,
+        # but no new action is admitted after the pause request wins the control lock.
+        self._pause_requested = threading.Event()
+        self._resume_gate = threading.Event()
+        self._resume_gate.set()
+        # Linearizes pause requests against admission of each new tool action.
+        self._pause_control_lock = threading.Lock()
+        self._inflight_model_calls = 0
+        self._inflight_tool_actions = 0
         self._activity_lock = threading.Lock()
         self._usage_supported = True
 
@@ -204,6 +213,8 @@ class Agent:
         self.file_change_history = []
         self.started_at = time.monotonic()
         self._cancel_event.clear()
+        self._pause_requested.clear()
+        self._resume_gate.set()
         self.activity = []
         self._record_activity("PROJECT", f"Workspace switched to {root.name}; started a fresh thread")
 
@@ -325,7 +336,86 @@ class Agent:
 
     def cancel(self):
         """Request a cooperative stop at the next model-stream or tool boundary."""
-        self._cancel_event.set()
+        with self._pause_control_lock:
+            self._cancel_event.set()
+            # A paused run must be woken so cancellation cannot deadlock behind the pause gate.
+            self._resume_gate.set()
+
+    def request_pause(self):
+        """Pause at the next safe boundary; an already-admitted tool call may finish."""
+        with self._pause_control_lock:
+            if self._cancel_event.is_set():
+                return False
+            self._resume_gate.clear()
+            self._pause_requested.set()
+        return True
+
+    def request_resume(self):
+        """Release a cooperatively paused run without replaying completed tool calls."""
+        with self._pause_control_lock:
+            self._pause_requested.clear()
+            self._resume_gate.set()
+            return not self._cancel_event.is_set()
+
+    def _admit_model_call(self):
+        """Atomically admit one provider request or wait for pause/resume."""
+        while True:
+            if not self._pause_at_safe_boundary():
+                return False
+            with self._pause_control_lock:
+                if self._cancel_event.is_set():
+                    return False
+                if self._pause_requested.is_set():
+                    continue
+                self._inflight_model_calls += 1
+                return True
+
+    def _release_model_call(self):
+        with self._pause_control_lock:
+            self._inflight_model_calls = max(0, self._inflight_model_calls - 1)
+
+    def _admit_tool_action(self):
+        """Atomically decide whether a new tool action starts before a pause request."""
+        while True:
+            if not self._pause_at_safe_boundary():
+                return False
+            with self._pause_control_lock:
+                if self._cancel_event.is_set():
+                    return False
+                if self._pause_requested.is_set():
+                    # Pause won the race after the boundary wait but before admission.
+                    continue
+                # Once admitted, this action is the in-flight action a pause may wait for.
+                self._inflight_tool_actions += 1
+                return True
+
+    def _release_tool_action(self):
+        with self._pause_control_lock:
+            self._inflight_tool_actions = max(0, self._inflight_tool_actions - 1)
+
+    def _execute_admitted(self, call):
+        if not self._admit_tool_action():
+            return False, None
+        try:
+            return True, self._execute(call)
+        finally:
+            self._release_tool_action()
+
+    def _pause_at_safe_boundary(self):
+        """Wait between model/tool actions, returning false if cancellation wins."""
+        pause_requested = getattr(self, "_pause_requested", None)
+        if pause_requested is None or not pause_requested.is_set():
+            return not self._cancel_event.is_set()
+        self._record_activity("PAUSED", "Paused safely · waiting for you to resume")
+        gate = getattr(self, "_resume_gate", None)
+        if gate is None:
+            return not self._cancel_event.is_set()
+        while pause_requested.is_set() and not self._cancel_event.is_set():
+            gate.wait(0.1)
+        if self._cancel_event.is_set():
+            return False
+        self._record_activity("RESUMED", "Resuming at the next safe action boundary")
+        return True
 
     def resume(self, messages: list):
         self.messages = messages
@@ -354,18 +444,30 @@ class Agent:
 
     def _loop(self) -> str:
         for turn in range(1, self.max_turns + 1):
-            if self._cancel_event.is_set():
+            if self._cancel_event.is_set() or not self._admit_model_call():
                 self._record_activity("STOPPED", "Stopped by user")
                 return "[Stopped by user]"
             self.usage["turns"] += 1
             self._record_activity("THINKING", f"Preparing the next step · turn {turn}")
-            msg, text, tool_calls = self._chat()
+            try:
+                msg, text, tool_calls = self._chat()
+            finally:
+                self._release_model_call()
             if self._cancel_event.is_set():
                 if text and not tool_calls:
                     self.messages.append(msg)
                 self._record_activity("STOPPED", "Stopped by user")
                 return text or "[Stopped by user]"
             self.messages.append(msg)
+
+            # Finish the provider response, save it, then pause before any action begins.
+            if not self._pause_at_safe_boundary():
+                if tool_calls:
+                    for call in tool_calls:
+                        self.messages.append({"role": "tool", "tool_call_id": call["id"],
+                                              "content": "[not executed: task was stopped before this action]"})
+                self._record_activity("STOPPED", "Stopped by user")
+                return text or "[Stopped by user]"
 
             if not tool_calls:
                 self._record_activity("DONE", "Response complete")
@@ -378,25 +480,39 @@ class Agent:
             self._record_activity("PLAN", f"Executing {len(executable)} of {len(tool_calls)} requested tool call(s)")
 
             results = []
-            if (self.approved_plan is None and len(executable) > 1 and self.approval != "ask"
-                    and all(tc["name"] in PARALLEL_SAFE_TOOLS for tc in executable)):
-                # Parallelize only read-only operations; mutations may depend on one another.
-                with ThreadPoolExecutor(max_workers=min(4, len(executable))) as ex:
-                    results = list(ex.map(self._execute, executable))
+            parallel_safe = (self.approved_plan is None and len(executable) > 1
+                             and self.approval != "ask"
+                             and all(tc["name"] in PARALLEL_SAFE_TOOLS for tc in executable))
+            if parallel_safe:
+                # Read-only batch is one admitted in-flight boundary; pause takes effect after it finishes.
+                if self._admit_tool_action():
+                    try:
+                        with ThreadPoolExecutor(max_workers=min(4, len(executable))) as ex:
+                            results = list(ex.map(self._execute, executable))
+                    finally:
+                        self._release_tool_action()
             else:
-                results = [self._execute(tc) for tc in executable]
-            self._request_tool_calls += len(executable)
+                for call in executable:
+                    admitted, result = self._execute_admitted(call)
+                    if not admitted:
+                        break
+                    results.append(result)
+            self._request_tool_calls += len(results)
 
-            for index, tc in enumerate(tool_calls):
-                if index < len(executable):
+            for index, call in enumerate(tool_calls):
+                if index < len(results):
                     result = results[index]
+                elif index < allowed_count:
+                    result = "[not executed: task was stopped before this action]"
                 else:
                     result = ("[not executed: per-request tool-call limit reached] "
                               "Review the completed tool results and ask the user to continue if more work is needed.")
-                    self._record_activity("LIMIT", f"Skipped {tc['name']} at the per-request tool-call limit")
-                self.messages.append({"role": "tool",
-                                      "tool_call_id": tc["id"],
-                                      "content": result})
+                    self._record_activity("LIMIT", f"Skipped {call['name']} at the per-request tool-call limit")
+                self.messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+
+            if self._cancel_event.is_set():
+                self._record_activity("STOPPED", "Stopped by user")
+                return "[Stopped by user]"
 
             compacted = False
             if self.auto_compact:

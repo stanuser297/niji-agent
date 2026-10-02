@@ -22,6 +22,12 @@ class ApprovedPlanExecutionTests(unittest.TestCase):
         agent.depth = 0
         agent.allowed_tools = None
         agent._cancel_event = threading.Event()
+        agent._pause_requested = threading.Event()
+        agent._resume_gate = threading.Event()
+        agent._resume_gate.set()
+        agent._pause_control_lock = threading.Lock()
+        agent._inflight_model_calls = 0
+        agent._inflight_tool_actions = 0
         agent._record_activity = lambda *args, **kwargs: None
         agent.approval = "auto"
         agent.tool_policies = {}

@@ -51,10 +51,45 @@ class FakeAgent:
         self.stream_ready = threading.Event()
         self.finish_stream = threading.Event()
         self.cancel_requested = threading.Event()
+        self._cancel_event = threading.Event()
+        self.pause_requested = threading.Event()
+        self.resume_gate = threading.Event()
+        self.resume_gate.set()
+        self.after_pause_resume = None
 
     def cancel(self):
         self.cancel_requested.set()
+        self._cancel_event.set()
         self.finish_stream.set()
+        self.resume_gate.set()
+
+    def request_pause(self):
+        if self.cancel_requested.is_set():
+            return False
+        self.resume_gate.clear()
+        self.pause_requested.set()
+        return True
+
+    def request_resume(self):
+        self.pause_requested.clear()
+        self.resume_gate.set()
+        return not self.cancel_requested.is_set()
+
+    def _pause_at_boundary(self):
+        if not self.pause_requested.is_set():
+            return not self.cancel_requested.is_set()
+        if self.activity_callback:
+            self.activity_callback({"time": "12:02:01", "level": "PAUSED", "message": "Paused safely"})
+        while self.pause_requested.is_set() and not self.cancel_requested.is_set():
+            self.resume_gate.wait(0.05)
+        if not self.cancel_requested.is_set() and self.activity_callback:
+            self.activity_callback({"time": "12:02:02", "level": "RESUMED", "message": "Resuming safely"})
+        if callable(self.after_pause_resume):
+            self.after_pause_resume()
+        return not self.cancel_requested.is_set()
+
+    def _pause_at_safe_boundary(self):
+        return self._pause_at_boundary()
 
     def resume(self, messages):
         self.messages = list(messages)
@@ -101,6 +136,9 @@ class FakeAgent:
                 self.finish_stream.wait(2)
             if not self.cancel_requested.is_set():
                 self.stream_callback(answer[10:])
+        self._pause_at_boundary()
+        if self.cancel_requested.is_set():
+            return "[Stopped by user]"
         self.messages.append({"role": "assistant", "content": answer})
         self.usage["turns"] += 1
         return answer
@@ -144,10 +182,55 @@ class WebUITests(unittest.TestCase):
         req = urllib.request.Request(self.base + path, data=body, headers=headers)
         return urllib.request.urlopen(req, timeout=3)
 
+    def wait_for_job_status(self, job_id, expected, timeout=3):
+        deadline = time.time() + timeout
+        job = None
+        while time.time() < deadline:
+            job = json.loads(self.request(f"/api/jobs/{job_id}", token=self.ui.token).read())
+            if job["status"] == expected:
+                return job
+            time.sleep(0.02)
+        self.fail(f"Job {job_id} did not reach {expected}; last status was {job and job.get('status')}")
+
+    def start_paused_stream_job(self, message="pause this job"):
+        self.agent.pause_stream = True
+        started = json.loads(self.request("/api/chat", {"message": message}, self.ui.token).read())
+        job_id = started["id"]
+        self.assertTrue(self.agent.stream_ready.wait(2))
+        response = self.request(f"/api/jobs/{job_id}/pause", {}, self.ui.token)
+        self.assertEqual(response.status, 202)
+        self.agent.finish_stream.set()
+        self.wait_for_job_status(job_id, "paused")
+        return job_id
+
     def test_plan_editor_exposes_optional_completion_criteria(self):
         self.assertIn("Optional completion criteria", PAGE)
         self.assertIn("acceptance_criteria:x.acceptance_criteria.trim()", PAGE)
         self.assertIn("maxLength=400", PAGE)
+
+    def test_frontend_exposes_pause_resume_and_paused_status(self):
+        self.assertIn('id="pause-resume"', PAGE)
+        self.assertIn("async function togglePauseJob()", PAGE)
+        self.assertIn("j.status==='paused'", PAGE)
+        self.assertIn("Paused safely", PAGE)
+
+    def test_frontend_expired_job_status_is_terminal_and_http_status_is_preserved(self):
+        self.assertIn("err.status=r.status", PAGE)
+        self.assertIn("if(e.status===404)", PAGE)
+        self.assertIn("Run history expired or this tab is out of date", PAGE)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        start = PAGE.index("async function api(")
+        end = PAGE.index("\nfunction ", start)
+        api_function = PAGE[start:end]
+        script = "const token='test-token';\n" + api_function + "\n" + r'''
+fetch = async () => ({ok:false,status:404,json:async()=>({error:'Unknown job'})});
+api('/api/jobs/expired').then(()=>{throw new Error('expected 404 rejection')}).catch(error=>{
+  if(error.status!==404)throw new Error('HTTP status was not preserved');
+  if(error.message!=='Unknown job')throw new Error('server error message was not preserved');
+});
+'''
+        subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
     def test_plan_editor_reordering_preserves_prerequisite_order(self):
         if not shutil.which("node"):
@@ -570,6 +653,34 @@ if(nodes.some(n=>n.innerHTML)) throw new Error('renderer used unsafe HTML');
         self.assertEqual(job["streamed"], "Hello from Niji: hello")
         self.assertTrue(job["plan_only"] is False)
 
+    def test_mcp_secrets_are_redacted_from_streams_jobs_errors_and_exports(self):
+        secret = "stdio-output-secret"
+        self.agent.mcp_clients = [type("MCP", (), {"_secrets": [secret]})()]
+
+        def chat_with_secret(message):
+            self.agent.stream_callback("streamed " + secret)
+            self.agent.messages.append({"role": "assistant", "content": "transcript " + secret})
+            return "final " + secret
+
+        with patch.object(self.agent, "chat", side_effect=chat_with_secret):
+            status, started = self.ui._start_job("show result")
+        self.assertEqual(status, 202)
+        job = self.wait_for_job_status(started["id"], "completed")
+        self.assertEqual(job["streamed"], "streamed [redacted]")
+        self.assertEqual(job["response"], "final [redacted]")
+        state = json.loads(self.request("/api/state", token=self.ui.token).read())
+        serialized_state = json.dumps(state)
+        self.assertNotIn(secret, serialized_state)
+        exported = self.ui._export_session(self.agent.session_id)
+        self.assertTrue(any("transcript [redacted]" in item["content"] for item in exported))
+        self.assertNotIn(secret, json.dumps(exported))
+
+        with patch.object(self.agent, "chat", side_effect=RuntimeError("connector failed: " + secret)):
+            status, failed = self.ui._start_job("cause safe failure")
+        self.assertEqual(status, 202)
+        failure_job = self.wait_for_job_status(failed["id"], "error")
+        self.assertNotIn(secret, failure_job["error"])
+
     def test_job_execution_timeline_is_request_scoped_and_redacts_secrets(self):
         started = json.loads(self.request("/api/chat", {"message": "show progress"}, self.ui.token).read())
         deadline = time.time() + 3
@@ -665,6 +776,348 @@ if(nodes.some(n=>n.innerHTML)) throw new Error('renderer used unsafe HTML');
                 break
             time.sleep(0.03)
         self.assertEqual(job["status"], "cancelled")
+
+    def test_pause_resume_keeps_job_busy_and_resumes_after_safe_boundary(self):
+        self.agent.pause_stream = True
+        started = json.loads(self.request("/api/chat", {"message": "slow task"}, self.ui.token).read())
+        job_id = started["id"]
+        self.assertTrue(self.agent.stream_ready.wait(2))
+        paused_request = self.request(f"/api/jobs/{job_id}/pause", {}, self.ui.token)
+        self.assertEqual(paused_request.status, 202)
+        self.assertEqual(json.loads(paused_request.read())["status"], "pause_requested")
+        self.agent.finish_stream.set()
+        job = self.wait_for_job_status(job_id, "paused")
+        self.assertEqual(job["progress"], "Paused safely")
+        state = json.loads(self.request("/api/state", token=self.ui.token).read())
+        self.assertTrue(state["busy"])
+        self.assertEqual(state["active_job"]["id"], job_id)
+        self.assertEqual(state["active_job"]["status"], "paused")
+        with self.assertRaises(urllib.error.HTTPError) as busy:
+            self.request("/api/chat", {"message": "duplicate"}, self.ui.token)
+        self.assertEqual(busy.exception.code, 409)
+        resumed = self.request(f"/api/jobs/{job_id}/resume", {}, self.ui.token)
+        self.assertEqual(resumed.status, 202)
+        self.assertEqual(json.loads(resumed.read())["status"], "running")
+        completed = self.wait_for_job_status(job_id, "completed")
+        self.assertEqual(completed["response"], "Hello from Niji: slow task")
+        self.assertEqual([event["level"] for event in completed["events"] if event["level"] in ("PAUSED", "RESUMED")],
+                         ["PAUSED", "RESUMED"])
+
+    def test_pause_requested_during_approval_holds_side_effect_until_resume(self):
+        self.agent.require_approval = True
+        started = json.loads(self.request("/api/chat", {"message": "approve carefully"}, self.ui.token).read())
+        job_id = started["id"]
+        deadline = time.time() + 2
+        pending = None
+        while time.time() < deadline:
+            state = json.loads(self.request("/api/state", token=self.ui.token).read())
+            if state["pending_approvals"]:
+                pending = state["pending_approvals"][0]
+                break
+            time.sleep(0.02)
+        self.assertIsNotNone(pending)
+        self.request(f"/api/jobs/{job_id}/pause", {}, self.ui.token)
+        approved = self.request(f"/api/approvals/{pending['id']}", {"approved": True}, self.ui.token)
+        self.assertEqual(approved.status, 200)
+        paused = self.wait_for_job_status(job_id, "paused")
+        self.assertEqual(paused["response"], "")
+        resumed = self.request(f"/api/jobs/{job_id}/resume", {}, self.ui.token)
+        self.assertEqual(resumed.status, 202)
+        complete = self.wait_for_job_status(job_id, "completed")
+        self.assertEqual(complete["response"], "approved")
+
+    def test_cancel_while_paused_wakes_job_and_prevents_resume(self):
+        self.agent.pause_stream = True
+        started = json.loads(self.request("/api/chat", {"message": "pause then stop"}, self.ui.token).read())
+        job_id = started["id"]
+        self.assertTrue(self.agent.stream_ready.wait(2))
+        self.request(f"/api/jobs/{job_id}/pause", {}, self.ui.token)
+        self.agent.finish_stream.set()
+        self.wait_for_job_status(job_id, "paused")
+        response = self.request(f"/api/jobs/{job_id}/cancel", {}, self.ui.token)
+        self.assertEqual(response.status, 202)
+        cancelled = self.wait_for_job_status(job_id, "cancelled")
+        self.assertEqual(cancelled["response"], "[Stopped by user]")
+        with self.assertRaises(urllib.error.HTTPError) as stale_resume:
+            self.request(f"/api/jobs/{job_id}/resume", {}, self.ui.token)
+        self.assertEqual(stale_resume.exception.code, 409)
+
+    def test_concurrent_chat_submissions_cannot_replace_a_paused_job(self):
+        job_id = self.start_paused_stream_job("hold a single active run")
+        barrier = threading.Barrier(3)
+        statuses = []
+
+        def submit(message):
+            barrier.wait(timeout=2)
+            try:
+                response = self.request("/api/chat", {"message": message}, self.ui.token)
+                statuses.append(response.status)
+                response.read()
+            except urllib.error.HTTPError as exc:
+                statuses.append(exc.code)
+                exc.read()
+
+        workers = [threading.Thread(target=submit, args=(f"duplicate {i}",)) for i in range(2)]
+        for worker in workers:
+            worker.start()
+        barrier.wait(timeout=2)
+        for worker in workers:
+            worker.join(3)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(sorted(statuses), [409, 409])
+        state = json.loads(self.request("/api/state", token=self.ui.token).read())
+        self.assertTrue(state["busy"])
+        self.assertEqual(state["active_job"]["id"], job_id)
+        self.assertEqual(state["active_job"]["status"], "paused")
+        self.assertEqual(len(self.ui._jobs), 1)
+        self.request(f"/api/jobs/{job_id}/cancel", {}, self.ui.token)
+        self.wait_for_job_status(job_id, "cancelled")
+
+    def test_concurrent_resume_and_cancel_finishes_cancelled_without_new_actions(self):
+        resumed_boundary = threading.Event()
+        release_after_resume = threading.Event()
+        self.agent.after_pause_resume = lambda: (resumed_boundary.set(), release_after_resume.wait(3))
+        job_id = self.start_paused_stream_job("race stop and resume")
+        barrier = threading.Barrier(3)
+        statuses = {}
+
+        def post(name, suffix):
+            barrier.wait(timeout=2)
+            try:
+                response = self.request(f"/api/jobs/{job_id}/{suffix}", {}, self.ui.token)
+                statuses[name] = response.status
+                response.read()
+            except urllib.error.HTTPError as exc:
+                statuses[name] = exc.code
+                exc.read()
+
+        workers = [threading.Thread(target=post, args=("resume", "resume")),
+                   threading.Thread(target=post, args=("cancel", "cancel"))]
+        for worker in workers:
+            worker.start()
+        barrier.wait(timeout=2)
+        for worker in workers:
+            worker.join(3)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(statuses.get("cancel"), 202)
+        self.assertIn(statuses.get("resume"), (202, 409))
+        if statuses.get("resume") == 202:
+            self.assertTrue(resumed_boundary.wait(2))
+        release_after_resume.set()
+        cancelled = self.wait_for_job_status(job_id, "cancelled")
+        self.assertEqual(cancelled["response"], "[Stopped by user]")
+        self.assertTrue(self.agent.cancel_requested.is_set())
+
+    def test_cancel_signal_is_serialized_before_next_job_generation(self):
+        old_job_id = "old-generation"
+        timeline = []
+
+        class RecordedEvent:
+            def __init__(self):
+                self.event = threading.Event()
+            def set(self):
+                timeline.append("cancel-delivered")
+                self.event.set()
+            def clear(self):
+                timeline.append("generation-started")
+                self.event.clear()
+            def is_set(self):
+                return self.event.is_set()
+
+        finalization_attempted = threading.Event()
+        admission_attempted = threading.Event()
+        allow_worker_lock = threading.Event()
+        allow_admission_lock = threading.Event()
+        original_lock = self.ui._lock
+
+        class ObservedRLock:
+            def __init__(self, inner):
+                self.inner = inner
+            def __enter__(self):
+                name = threading.current_thread().name
+                if name == "old-generation-worker":
+                    finalization_attempted.set()
+                    allow_worker_lock.wait(2)
+                elif name == "next-generation-admission":
+                    admission_attempted.set()
+                    allow_admission_lock.wait(2)
+                self.inner.acquire()
+                return self
+            def __exit__(self, *exc):
+                self.inner.release()
+
+        with original_lock:
+            self.ui._jobs[old_job_id] = {
+                "id": old_job_id, "status": "running", "cancel_requested": False,
+                "response": "", "error": "", "streamed": "", "events": [],
+                "automation_id": "", "plan_only": False,
+            }
+            self.ui._active_job = old_job_id
+            self.ui._busy = True
+        self.ui._lock = ObservedRLock(original_lock)
+        self.agent._cancel_event = RecordedEvent()
+
+        cancel_entered = threading.Event()
+        allow_cancel = threading.Event()
+        old_cancel = self.agent.cancel
+        original_chat = self.agent.chat
+        release_old_chat = threading.Event()
+        chat_entered = threading.Event()
+        old_run_finished = threading.Event()
+        next_start_finished = threading.Event()
+        cancel_result = {}
+        next_result = {}
+
+        def blocked_cancel():
+            cancel_entered.set()
+            allow_cancel.wait(2)
+            old_cancel()
+
+        def blocking_old_chat(message):
+            chat_entered.set()
+            release_old_chat.wait(2)
+            return "old generation complete"
+
+        def send_cancel():
+            response = self.request(f"/api/jobs/{old_job_id}/cancel", {}, self.ui.token)
+            cancel_result["status"] = response.status
+            response.read()
+
+        def run_old_generation():
+            self.ui._run_job(old_job_id, "old request")
+            old_run_finished.set()
+
+        def try_next_generation():
+            next_result["result"] = self.ui._start_job("fresh generation")
+            next_start_finished.set()
+
+        self.agent.cancel = blocked_cancel
+        self.agent.chat = blocking_old_chat
+        cancelling = threading.Thread(target=send_cancel, name="cancel-request")
+        finishing = threading.Thread(target=run_old_generation, name="old-generation-worker")
+        admitting = threading.Thread(target=try_next_generation, name="next-generation-admission")
+        try:
+            finishing.start()
+            self.assertTrue(chat_entered.wait(2))
+            cancelling.start()
+            self.assertTrue(cancel_entered.wait(2))
+            release_old_chat.set()
+            self.assertTrue(finalization_attempted.wait(2))
+            admitting.start()
+            self.assertTrue(admission_attempted.wait(2))
+            # First let the real completion path contend with cancel. In an unsafe
+            # implementation it would finish and make the next generation admissible.
+            allow_worker_lock.set()
+            self.assertFalse(old_run_finished.wait(0.1))
+            allow_admission_lock.set()
+            self.assertFalse(next_start_finished.wait(0.1))
+            allow_cancel.set()
+            cancelling.join(2)
+            finishing.join(2)
+            admitting.join(2)
+            self.assertFalse(cancelling.is_alive())
+            self.assertFalse(finishing.is_alive())
+            self.assertFalse(admitting.is_alive())
+            self.assertEqual(cancel_result.get("status"), 202)
+            self.assertTrue(old_run_finished.is_set())
+            self.assertTrue(next_start_finished.is_set())
+
+            status, started = next_result["result"]
+            self.assertIn("cancel-delivered", timeline)
+            if status == 202:
+                self.assertLess(timeline.index("cancel-delivered"),
+                                timeline.index("generation-started"))
+                self.assertFalse(self.agent._cancel_event.is_set())
+            else:
+                self.assertTrue(self.agent._cancel_event.is_set())
+                status, started = self.ui._start_job("fresh generation retry")
+            self.assertEqual(status, 202)
+            self.assertFalse(self.agent._cancel_event.is_set(),
+                             "a new generation must clear only an already-delivered old signal")
+            self.agent.chat = original_chat
+            self.agent.cancel = old_cancel
+            self.agent.cancel_requested.clear()
+            self.wait_for_job_status(started["id"], "completed")
+        finally:
+            allow_worker_lock.set()
+            allow_admission_lock.set()
+            allow_cancel.set()
+            release_old_chat.set()
+            for worker in (cancelling, finishing, admitting):
+                if worker.ident is not None:
+                    worker.join(2)
+            self.agent.chat = original_chat
+            self.agent.cancel = old_cancel
+            self.ui._lock = original_lock
+
+    def test_cancel_while_approval_is_pending_releases_worker_and_denies_action(self):
+        self.agent.require_approval = True
+        started = json.loads(self.request("/api/chat", {"message": "wait for approval"}, self.ui.token).read())
+        job_id = started["id"]
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            state = json.loads(self.request("/api/state", token=self.ui.token).read())
+            if state["pending_approvals"]:
+                break
+            time.sleep(0.02)
+        self.assertTrue(state["pending_approvals"])
+        response = self.request(f"/api/jobs/{job_id}/cancel", {}, self.ui.token)
+        self.assertEqual(response.status, 202)
+        cancelled = self.wait_for_job_status(job_id, "cancelled")
+        self.assertEqual(cancelled["response"], "[Stopped by user]")
+        self.assertEqual(json.loads(self.request("/api/state", token=self.ui.token).read())["pending_approvals"], [])
+
+    def test_approval_preview_redacts_provider_mcp_and_credential_field_values(self):
+        class FakeMcpClient:
+            _secrets = ["nango-secret-value", "Bearer nango-secret-value",
+                        "provider-config-secret", "connection-id-secret", "xy"]
+
+        from niji.mcp import MCPServer
+        local_mcp = MCPServer("local", {"command": "fake-server", "env": {
+            "GITHUB_TOKEN": "stdio-mcp-secret", "SAFE_LABEL": "ok"}})
+        self.agent.mcp_clients = [FakeMcpClient(), local_mcp]
+        result = []
+        args = {
+            "api_key": "unregistered-api-key-value",
+            "key": "generic-key-secret",
+            "token": "session-token-secret",
+            "connection_id": "connection-id-secret",
+            "nested": {"authorization": "Bearer nango-secret-value",
+                       "bearer_token": "bearer-token-secret"},
+            "description": "query contains provider-config-secret, private-test-secret, "
+                           "stdio-mcp-secret, and standalone xy.",
+        }
+        worker = threading.Thread(target=lambda: result.append(
+            self.ui._request_approval("connector_call", args)))
+        worker.start()
+        deadline = time.time() + 2
+        state = {}
+        while time.time() < deadline:
+            state = json.loads(self.request("/api/state", token=self.ui.token).read())
+            if state["pending_approvals"]:
+                break
+            time.sleep(0.02)
+        self.assertTrue(state["pending_approvals"])
+        preview = state["pending_approvals"][0]["preview"]
+        for secret in (*FakeMcpClient._secrets, "private-test-secret", "unregistered-api-key-value",
+                       "generic-key-secret", "session-token-secret", "bearer-token-secret",
+                       "stdio-mcp-secret"):
+            self.assertNotIn(secret, preview)
+        self.assertIn("[redacted]", preview)
+        self.assertEqual(local_mcp._secrets, ["stdio-mcp-secret"])
+        approval_id = state["pending_approvals"][0]["id"]
+        self.request(f"/api/approvals/{approval_id}", {"approved": False}, self.ui.token)
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result, [False])
+
+    def test_pause_resume_routes_reject_malformed_or_inactive_requests(self):
+        with self.assertRaises(urllib.error.HTTPError) as malformed:
+            self.request("/api/jobs/nope/pause", {"unexpected": True}, self.ui.token)
+        self.assertEqual(malformed.exception.code, 400)
+        with self.assertRaises(urllib.error.HTTPError) as inactive:
+            self.request("/api/jobs/nope/resume", {}, self.ui.token)
+        self.assertEqual(inactive.exception.code, 409)
 
     def test_settings_can_add_and_remove_nango_without_exposing_credentials(self):
         saved = {}

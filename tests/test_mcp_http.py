@@ -2,6 +2,8 @@ import json
 import os
 import stat
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -10,7 +12,7 @@ import httpx
 
 from niji.cli import _cmd_connectors
 from niji.config import save_mcp_servers
-from niji.mcp import HttpMCPServer, connect_all
+from niji.mcp import HttpMCPServer, MCPServer, connect_all
 
 
 class FakeHTTPClient:
@@ -39,6 +41,234 @@ def json_response(payload, *, headers=None):
 
 
 class HttpMCPTests(unittest.TestCase):
+    def test_local_stdio_client_tracks_credential_environment_values(self):
+        client = MCPServer("local", {"command": "fake-server", "env": {
+            "GITHUB_TOKEN": "secret-token", "API_KEY": "secret-key",
+            "GITHUB_PAT": "secret-pat", "PAT": "short-pat", "SAFE_LABEL": "ordinary"}})
+        self.assertEqual(client._secrets, ["secret-token", "secret-key", "secret-pat", "short-pat"])
+        self.assertEqual(client._redact("echo secret-pat and short-pat"),
+                         "echo [redacted] and [redacted]")
+        with self.assertRaisesRegex(ValueError, "environment must be an object"):
+            MCPServer("invalid", {"command": "fake-server", "env": ["not", "an object"]})
+
+    def test_local_stdio_tool_results_and_errors_redact_environment_secrets(self):
+        client = MCPServer("local", {"command": "fake-server", "env": {
+            "GITHUB_TOKEN": "stdio-secret-value"}})
+        client._request = MagicMock(return_value={"content": [
+            {"type": "text", "text": "result includes stdio-secret-value"}]})
+        result = client.call("read", {})
+        self.assertEqual(result, "result includes [redacted]")
+        client._request = MagicMock(side_effect=RuntimeError("server echoed stdio-secret-value"))
+        with self.assertRaises(RuntimeError) as raised:
+            client.call("read", {})
+        self.assertNotIn("stdio-secret-value", str(raised.exception))
+
+    def test_stdio_late_response_after_timeout_does_not_kill_reader(self):
+        class ControlledOutput:
+            def __init__(self):
+                self.ready = {1: threading.Event(), 2: threading.Event()}
+                self.index = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self.index += 1
+                mid = self.index
+                if mid not in self.ready:
+                    raise StopIteration
+                if not self.ready[mid].wait(2):
+                    raise StopIteration
+                return json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"id": mid}}) + "\n"
+
+        output = ControlledOutput()
+        request_sent = threading.Event()
+        cleanup_waiting = threading.Event()
+
+        class Stdin:
+            def write(self, payload):
+                output.ready[json.loads(payload)["id"]].set()
+                request_sent.set()
+            def flush(self):
+                pass
+
+        class ObservedLock:
+            def __init__(self):
+                self.lock = threading.Lock()
+            def __enter__(self):
+                if (threading.current_thread().name == "first-request"
+                        and request_sent.is_set()):
+                    cleanup_waiting.set()
+                self.lock.acquire()
+                return self
+            def __exit__(self, *exc):
+                self.lock.release()
+
+        class Pending(dict):
+            def __init__(self):
+                super().__init__()
+                self.lookup_started = threading.Event()
+                self.release_lookup = threading.Event()
+                self.blocked = False
+
+            def _lookup(self, key, present):
+                if key == 1 and present and not self.blocked:
+                    self.blocked = True
+                    self.lookup_started.set()
+                    self.release_lookup.wait(2)
+                return present
+
+            def __contains__(self, key):
+                return self._lookup(key, super().__contains__(key))
+
+            def get(self, key, default=None):
+                present = self._lookup(key, super().__contains__(key))
+                return super().get(key, default) if present else default
+
+        client = MCPServer("local", {"command": "fake-server"})
+        client.proc = type("Process", (), {"stdin": Stdin(), "stdout": output})()
+        client._pending = Pending()
+        client._pending_lock = ObservedLock()
+        reader = threading.Thread(target=client._read_loop, name="mcp-reader", daemon=True)
+        reader.start()
+
+        first_result = {}
+        def first_request():
+            try:
+                first_result["value"] = client._request("first", {}, timeout=0.05)
+            except Exception as exc:
+                first_result["error"] = exc
+
+        first = threading.Thread(target=first_request, name="first-request")
+        first.start()
+        self.assertTrue(client._pending.lookup_started.wait(1))
+        # The cleanup lock signals only after q.get timed out and the requester is
+        # contending with the reader's pending lookup; no timing sleep is needed.
+        self.assertTrue(cleanup_waiting.wait(1))
+        client._pending.release_lookup.set()
+        first.join(2)
+        self.assertFalse(first.is_alive())
+        self.assertIsInstance(first_result.get("error"), TimeoutError)
+
+        second = client._request("second", {}, timeout=1)
+        self.assertEqual(second, {"id": 2})
+        reader.join(1)
+        self.assertFalse(reader.is_alive())
+
+    def test_stdio_response_delivery_after_timeout_cleanup_uses_captured_queue_safely(self):
+        from queue import Queue as RealQueue
+
+        class ControlledOutput:
+            def __init__(self):
+                self.ready = {1: threading.Event(), 2: threading.Event()}
+                self.index = 0
+            def __iter__(self):
+                return self
+            def __next__(self):
+                self.index += 1
+                mid = self.index
+                if mid not in self.ready or not self.ready[mid].wait(2):
+                    raise StopIteration
+                return json.dumps({"jsonrpc": "2.0", "id": mid,
+                                   "result": {"id": mid}}) + "\n"
+
+        output = ControlledOutput()
+        class Stdin:
+            def write(self, payload):
+                output.ready[json.loads(payload)["id"]].set()
+            def flush(self):
+                pass
+
+        delivery_started = threading.Event()
+        release_delivery = threading.Event()
+        class DelayedQueue(RealQueue):
+            def put(self, item, block=True, timeout=None):
+                delivery_started.set()
+                release_delivery.wait(2)
+                return super().put(item, block=block, timeout=timeout)
+
+        client = MCPServer("local", {"command": "fake-server"})
+        client.proc = type("Process", (), {"stdin": Stdin(), "stdout": output})()
+        reader = threading.Thread(target=client._read_loop, daemon=True)
+        reader.start()
+        real_factory = RealQueue
+        queue_number = 0
+        def queue_factory(*args, **kwargs):
+            nonlocal queue_number
+            queue_number += 1
+            return DelayedQueue(*args, **kwargs) if queue_number == 1 else real_factory(*args, **kwargs)
+
+        first_result = {}
+        def first_request():
+            try:
+                first_result["value"] = client._request("first", {}, timeout=0.05)
+            except Exception as exc:
+                first_result["error"] = exc
+
+        with patch("niji.mcp.queue.Queue", side_effect=queue_factory):
+            first = threading.Thread(target=first_request)
+            first.start()
+            self.assertTrue(delivery_started.wait(1))
+            first.join(1)
+            self.assertFalse(first.is_alive())
+            self.assertIsInstance(first_result.get("error"), TimeoutError)
+            self.assertEqual(client._pending, {})
+            release_delivery.set()
+            second = client._request("second", {}, timeout=1)
+        self.assertEqual(second, {"id": 2})
+        reader.join(1)
+        self.assertFalse(reader.is_alive())
+
+    def test_stdio_tools_list_failure_is_reported_for_cleanup(self):
+        client = MCPServer("local", {"command": "fake-server"})
+        client.proc = MagicMock()
+
+        def request(method, params, timeout=60):
+            if method == "initialize":
+                return {}
+            raise TimeoutError("tools/list timed out")
+
+        with (patch.object(client, "_request", side_effect=request),
+              patch.object(client, "_notify"),
+              patch("niji.mcp.subprocess.Popen", return_value=client.proc),
+              patch("niji.mcp.threading.Thread.start")):
+            with self.assertRaisesRegex(TimeoutError, "tools/list timed out"):
+                client.start()
+
+    def test_stdio_stop_terminates_and_reaps_a_stuck_child(self):
+        from subprocess import TimeoutExpired
+        proc = MagicMock()
+        proc.poll.return_value = None
+        proc.wait.side_effect = [TimeoutExpired("fake", 2), 0]
+        client = MCPServer("local", {"command": "fake-server"})
+        client.proc = proc
+        client.stop()
+        proc.terminate.assert_called_once()
+        proc.kill.assert_called_once()
+        self.assertEqual(proc.wait.call_count, 2)
+        proc.stdin.close.assert_called_once()
+        proc.stdout.close.assert_called_once()
+
+    def test_connect_all_stops_clients_whose_startup_fails(self):
+        class FailingClient:
+            def __init__(self):
+                self.stopped = False
+            def start(self):
+                raise RuntimeError("startup failed")
+            def stop(self):
+                self.stopped = True
+
+        http_client, stdio_client = FailingClient(), FailingClient()
+        with (patch("niji.mcp.HttpMCPServer", return_value=http_client),
+              patch("niji.mcp.MCPServer", return_value=stdio_client),
+              patch("builtins.print")):
+            clients = connect_all({
+                "http": {"transport": "http", "url": "https://example.test/mcp"},
+                "stdio": {"transport": "stdio", "command": "fake-server"}})
+        self.assertEqual(clients, [])
+        self.assertTrue(http_client.stopped)
+        self.assertTrue(stdio_client.stopped)
+
     def _client(self, payloads, headers=None):
         return FakeHTTPClient([json_response(p, headers=headers if i == 0 else None)
                                for i, p in enumerate(payloads)])

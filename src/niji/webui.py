@@ -242,10 +242,10 @@ class NijiWebUI:
                     with ui._lock:
                         job = ui._jobs.get(job_id)
                         if job:
-                            result = {k: job.get(k) for k in (
+                            result = ui._redact_visible({k: job.get(k) for k in (
                                 "id", "status", "response", "error", "streamed", "progress",
                                 "progress_detail", "activity", "events", "plan_only", "original_message",
-                                "cancel_requested", "plan", "plan_label", "session_id", "plan_approved")}
+                                "cancel_requested", "plan", "plan_label", "session_id", "plan_approved")})
                         else:
                             result = None
                     if result is None:
@@ -276,17 +276,31 @@ class NijiWebUI:
                         self._json(400, {"error": "Plan approval requires an empty JSON object for one job"}); return
                     status, result = ui._approve_plan(parts[2])
                     self._json(status, result); return
+                if parsed.path.startswith("/api/jobs/") and parsed.path.endswith(("/pause", "/resume")):
+                    parts = parsed.path.strip("/").split("/")
+                    if len(parts) != 4 or not isinstance(data, dict) or data:
+                        self._json(400, {"error": "Run control requires an empty JSON object for one job"}); return
+                    action = parts[3]
+                    status, result = (ui._pause_job(parts[2]) if action == "pause"
+                                      else ui._resume_job(parts[2]))
+                    self._json(status, result); return
                 if parsed.path.startswith("/api/jobs/") and parsed.path.endswith("/cancel"):
-                    job_id = parsed.path.split("/")[3]
+                    parts = parsed.path.strip("/").split("/")
+                    if len(parts) != 4 or not isinstance(data, dict) or data:
+                        self._json(400, {"error": "Cancellation requires an empty JSON object for one job"}); return
+                    job_id = parts[2]
                     with ui._lock:
                         job = ui._jobs.get(job_id)
-                        if not job or job.get("status") != "running":
-                            self._json(404, {"error": "No running job with that id"}); return
+                        if (not job or job_id != ui._active_job
+                                or job.get("status") not in ("running", "pause_requested", "paused")):
+                            self._json(404, {"error": "No active job with that id"}); return
                         job["cancel_requested"] = True
-                    cancel = getattr(ui.agent, "cancel", None)
-                    if callable(cancel):
-                        cancel()
-                    with ui._lock:
+                        # Serialize cancellation with resume and the next job admission. If the
+                        # old run finishes now, its cancel signal must be delivered before a new
+                        # generation can clear/reuse the agent's cancellation event.
+                        cancel = getattr(ui.agent, "cancel", None)
+                        if callable(cancel):
+                            cancel()
                         for approval in ui._approvals.values():
                             approval["approved"] = False
                             approval["event"].set()
@@ -576,16 +590,56 @@ class NijiWebUI:
         host = "[::1]" if self.host == "::1" else ("127.0.0.1" if self.host == "localhost" else self.host)
         return f"http://{host}:{self.httpd.server_port}/?token={self.token}"
 
-    def _safe_event_message(self, value):
-        text = safe_terminal_text(str(value or ""))
+    def _known_secrets(self):
         secrets = [str(getattr(self.agent, "provider_cfg", {}).get("api_key", ""))]
         for client in getattr(self.agent, "mcp_clients", []):
             secrets.extend(str(item) for item in getattr(client, "_secrets", []) if item)
-        for secret in sorted((s for s in secrets if len(s) >= 6), key=len, reverse=True):
-            text = text.replace(secret, "[redacted]")
-        return text[:400]
+        return sorted({secret for secret in secrets if secret}, key=len, reverse=True)
+
+    def _redact_known_secrets(self, value):
+        text = safe_terminal_text(str(value or ""))
+        for secret in self._known_secrets():
+            if len(secret) >= 4:
+                text = text.replace(secret, "[redacted]")
+            else:
+                pattern = r"(?<![A-Za-z0-9])" + re.escape(secret) + r"(?![A-Za-z0-9])"
+                text = re.sub(pattern, "[redacted]", text)
+        return text
+
+    def _redact_visible(self, value):
+        if isinstance(value, str):
+            return self._redact_known_secrets(value)
+        if isinstance(value, dict):
+            return {key: self._redact_visible(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._redact_visible(item) for item in value]
+        return value
+
+    def _safe_event_message(self, value):
+        return self._redact_known_secrets(value)[:400]
+
+    @classmethod
+    def _redact_credential_fields(cls, value):
+        if isinstance(value, dict):
+            def sensitive_name(key):
+                compact = re.sub(r"[^a-z0-9]", "", str(key).lower())
+                return (compact in {"key", "apikey", "accesskey", "privatekey", "secretkey",
+                                    "auth", "authorization", "bearer", "secret", "password",
+                                    "passwd", "credential", "credentials", "connectionid",
+                                    "providerconfigkey"}
+                        or compact.endswith(("token", "secret", "password", "passwd", "credential",
+                                             "credentials", "connectionid", "providerconfigkey")))
+            return {key: ("[redacted]" if sensitive_name(key) else
+                          cls._redact_credential_fields(item))
+                    for key, item in value.items()}
+        if isinstance(value, list):
+            return [cls._redact_credential_fields(item) for item in value]
+        if isinstance(value, tuple):
+            return [cls._redact_credential_fields(item) for item in value]
+        return value
 
     def _record_activity(self, event):
+        event = self._redact_visible(event)
         callback = self._previous_activity_callback
         if callback:
             try:
@@ -602,13 +656,19 @@ class NijiWebUI:
             "COMPACT": "Making room in context",
             "DONE": "Wrapping up",
             "STOPPED": "Stopping the task",
+            "PAUSED": "Paused safely",
+            "RESUMED": "Resuming task",
             "ERROR": "Something needs attention",
             "LIMIT": "Reviewing the safety limit",
         }
         with self._lock:
             job = self._jobs.get(self._active_job) if self._active_job else None
-            if job and job.get("status") == "running":
+            if job and job.get("status") in ("running", "pause_requested", "paused"):
                 level = str(event.get("level", "INFO"))[:32]
+                if level == "PAUSED" and job.get("status") in ("running", "pause_requested"):
+                    job["status"] = "paused"
+                elif level == "RESUMED" and job.get("status") in ("paused", "pause_requested"):
+                    job["status"] = "running"
                 detail = self._safe_event_message(event.get("message", ""))
                 timestamp = safe_terminal_text(str(event.get("time", "")))[:24]
                 job["progress"] = labels.get(level, "Working")
@@ -617,15 +677,16 @@ class NijiWebUI:
                 activity = {"level": level, "message": visible_detail, "time": timestamp}
                 job["activity"] = activity
                 if level in {"THINKING", "PLAN", "TOOL", "TOOL_PROGRESS", "TOOL_DONE",
-                             "RETRY", "COMPACT", "DONE", "STOPPED", "ERROR", "LIMIT",
-                             "DENIED", "CHECKPOINT", "UNDO", "CONNECTOR", "INTERRUPTED"}:
+                             "RETRY", "COMPACT", "DONE", "STOPPED", "PAUSED", "RESUMED",
+                             "ERROR", "LIMIT", "DENIED", "CHECKPOINT", "UNDO", "CONNECTOR",
+                             "INTERRUPTED"}:
                     events = job.setdefault("events", [])
                     events.append(activity)
                     del events[:-120]
 
     def _record_plan(self, items, active_form=""):
         try:
-            plan = normalize_plan(items)
+            plan = self._redact_visible(normalize_plan(items))
             save_plan(self.agent.session_id, plan)
         except (OSError, ValueError, TypeError):
             return
@@ -637,36 +698,46 @@ class NijiWebUI:
                 pass
         with self._lock:
             job = self._jobs.get(self._active_job) if self._active_job else None
-            if job and job.get("status") == "running":
+            if job and job.get("status") in ("running", "pause_requested", "paused"):
                 job["plan"] = plan
                 job["plan_label"] = safe_terminal_text(str(active_form or ""))[:160]
 
     def _record_stream_chunk(self, chunk):
-        safe = safe_terminal_text(str(chunk))
+        safe = self._redact_known_secrets(chunk)
         if not safe:
             return
         with self._lock:
             job = self._jobs.get(self._active_job) if self._active_job else None
-            if job and job.get("status") == "running":
+            if job and job.get("status") in ("running", "pause_requested", "paused"):
                 job["streamed"] = (job.get("streamed", "") + safe)[-40_000:]
-                job["progress"] = "Writing the response"
-                job["progress_detail"] = "Live response · streaming"
+                if job.get("status") == "running":
+                    job["progress"] = "Writing the response"
+                    job["progress_detail"] = "Live response · streaming"
 
     def _request_approval(self, tool_name, args):
         approval_id = uuid.uuid4().hex
-        preview = json.dumps(args, ensure_ascii=False, default=str)[:1200]
-        api_key = str(getattr(self.agent, "provider_cfg", {}).get("api_key", ""))
-        if len(api_key) >= 6:
-            preview = preview.replace(api_key, "[redacted]")
+        safe_args = self._redact_credential_fields(args)
+        preview = self._redact_known_secrets(
+            json.dumps(safe_args, ensure_ascii=False, default=str))[:1200]
         event = threading.Event()
-        item = {"id": approval_id, "tool": tool_name, "preview": safe_terminal_text(preview),
+        item = {"id": approval_id, "tool": self._redact_known_secrets(tool_name), "preview": safe_terminal_text(preview),
                 "event": event, "approved": False}
         with self._lock:
             self._approvals[approval_id] = item
         decided = event.wait(180)
         with self._lock:
             self._approvals.pop(approval_id, None)
-        return bool(decided and item["approved"])
+        approved = bool(decided and item["approved"])
+        if approved:
+            # Approval is not permission to bypass a pause requested while the
+            # approval dialog was open. Hold the side effect at the same safe gate.
+            wait_at_boundary = getattr(self.agent, "_pause_at_safe_boundary", None)
+            if callable(wait_at_boundary):
+                try:
+                    approved = bool(wait_at_boundary())
+                except Exception:
+                    approved = False
+        return approved
 
     @staticmethod
     def _automation_time(value):
@@ -945,6 +1016,36 @@ class NijiWebUI:
             source["execution_job_id"] = result["id"]
             return 202, {"ok": True, "id": result["id"], "source_job_id": source_job_id}
 
+    def _pause_job(self, job_id: str):
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if (job is None or job_id != self._active_job or not self._busy
+                    or job.get("status") != "running"):
+                return 409, {"error": "Only the active running task can be paused"}
+            pause = getattr(self.agent, "request_pause", None)
+            if not callable(pause):
+                return 501, {"error": "This agent does not support cooperative pause"}
+            if pause() is False:
+                return 409, {"error": "The task is already stopping"}
+            job.update(status="pause_requested", progress="Pausing safely",
+                       progress_detail="Waiting for the current model or tool action to finish")
+            return 202, {"ok": True, "id": job_id, "status": "pause_requested"}
+
+    def _resume_job(self, job_id: str):
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if (job is None or job_id != self._active_job or not self._busy
+                    or job.get("status") not in ("pause_requested", "paused")):
+                return 409, {"error": "Only the active paused task can be resumed"}
+            resume = getattr(self.agent, "request_resume", None)
+            if not callable(resume):
+                return 501, {"error": "This agent does not support cooperative resume"}
+            if resume() is False:
+                return 409, {"error": "The task is already stopping"}
+            job.update(status="running", progress="Resuming task",
+                       progress_detail="Continuing from the next safe action boundary")
+            return 202, {"ok": True, "id": job_id, "status": "running"}
+
     def _start_job(self, message, plan_only=False, automation_id=None, approved_plan=None):
         try:
             approved_plan = normalize_plan(approved_plan) if approved_plan is not None else None
@@ -960,6 +1061,9 @@ class NijiWebUI:
             cancel_event = getattr(self.agent, "_cancel_event", None)
             if cancel_event is not None:
                 cancel_event.clear()
+            clear_pause = getattr(self.agent, "request_resume", None)
+            if callable(clear_pause):
+                clear_pause()
             job_id = uuid.uuid4().hex
             self._busy = True
             self._active_job = job_id
@@ -1057,7 +1161,7 @@ class NijiWebUI:
                 save_plan(self.agent.session_id, self.agent.todos["items"])
                 self._record_plan(self.agent.todos["items"], "Executing approved plan")
             response = self.agent.chat(message)
-            output = str(response or "[done]")[:40_000]
+            output = self._redact_known_secrets(response or "[done]")[:40_000]
             if plan_only:
                 proposed_steps = extract_plan_steps(output)
                 self.agent.todos = {"items": proposed_steps}
@@ -1087,11 +1191,7 @@ class NijiWebUI:
                     final_status, error, progress = "completed", "", "Complete"
                 job.update(status=final_status, response=output, error=error, progress=progress)
         except Exception as exc:
-            message = str(exc)
-            api_key = str(getattr(self.agent, "provider_cfg", {}).get("api_key", ""))
-            if len(api_key) >= 6:
-                message = message.replace(api_key, "[redacted]")
-            safe = safe_terminal_text(message)[:1500]
+            safe = self._redact_known_secrets(exc)[:1500]
             with self._lock:
                 job = self._jobs[job_id]
                 if job.get("cancel_requested"):
@@ -1467,7 +1567,8 @@ class NijiWebUI:
             raise ValueError("Saved session has an invalid message structure")
         # Exports contain visible user/assistant conversation only, never system
         # prompts, tool payloads, or connector credentials.
-        return [{"role": m["role"], "content": str(m.get("content", ""))}
+        return [{"role": m["role"],
+                 "content": self._redact_known_secrets(str(m.get("content", "")))}
                 for m in messages if isinstance(m, dict)
                 and m.get("role") in ("user", "assistant")
                 and m.get("content")
@@ -1490,7 +1591,7 @@ class NijiWebUI:
                 title = next((str(m.get("content", "")).strip() for m in messages
                               if isinstance(m, dict) and m.get("role") == "user"
                               and m.get("content") and not str(m["content"]).startswith("[Environment:")), "New thread")
-                results.append({"id": path.stem, "title": title[:100],
+                results.append({"id": path.stem, "title": self._redact_known_secrets(title[:100]),
                                 "updated": datetime.fromtimestamp(path.stat().st_mtime).strftime("%b %d · %H:%M"),
                                 "messages": sum(1 for m in messages if isinstance(m, dict) and m.get("role") in ("user", "assistant")),
                                 "pinned": path.stem in pinned})
@@ -1504,13 +1605,14 @@ class NijiWebUI:
                        for a in self._approvals.values()]
             busy, active = self._busy, self._active_job
         with getattr(self.agent, "_activity_lock", threading.RLock()):
-            activity = list(getattr(self.agent, "activity", []))[-30:]
+            activity = self._redact_visible(list(getattr(self.agent, "activity", []))[-30:])
             usage = dict(getattr(self.agent, "usage", {}))
             tool_usage = dict(getattr(self.agent, "tool_usage", {}))
         provider_cfg = getattr(self.agent, "provider_cfg", {})
         messages = getattr(self.agent, "messages", [])
         with self._lock:
-            active = self._jobs.get(self._active_job) if self._active_job else None
+            raw_active = self._jobs.get(self._active_job) if self._active_job else None
+            active = self._redact_visible(raw_active) if raw_active else None
             progress = ({"label": active.get("progress"),
                          "detail": active.get("progress_detail"),
                          "streamed": active.get("streamed", ""),
@@ -1528,7 +1630,8 @@ class NijiWebUI:
             if (msg.get("role") in ("user", "assistant") and content
                     and not msg.get("tool_calls")
                     and not str(content).startswith("[Environment:")):
-                transcript.append({"role": msg["role"], "content": str(content)[:10_000]})
+                transcript.append({"role": msg["role"],
+                                   "content": self._redact_known_secrets(str(content)[:10_000])})
         readonly = {"read_file", "list_files", "grep", "glob", "read_image", "read_document", "file_search",
                     "web_fetch", "web_search", "http_request", "database", "todo_read", "memory_read", "skill_read"}
         catalog = []
@@ -1544,7 +1647,8 @@ class NijiWebUI:
             "model": getattr(self.agent, "model", provider_cfg.get("model", "unknown")),
             "session_id": getattr(self.agent, "session_id", "local"), "approval": getattr(self.agent, "approval", "ask"),
             "busy": busy, "active_job": active, "pending_approvals": pending,
-            "progress": progress, "plan": list(getattr(self.agent, "todos", {}).get("items", [])),
+            "progress": progress, "plan": self._redact_visible(
+                list(getattr(self.agent, "todos", {}).get("items", []))),
             "file_changes": changes[-12:],
             "tool_policies": dict(getattr(self.agent, "tool_policies", {})),
             "tools": catalog,

@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.33.0
+# Niji Agent 🌈 — v2.34.0
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -15,6 +15,14 @@ niji
 Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, enter its API key (visible input is the Termux-friendly default; hidden entry is optional), and choose a model. The key is saved locally in `~/.niji/config.json` with private file permissions—no `export` command is needed. Ollama can be used without an API key.
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
+
+## What's new in 2.34.0
+
+- Added cooperative pause/resume controls for active local UI runs. Pausing takes effect at a safe model/tool boundary; an already-admitted provider/tool action may finish first.
+- Pending approvals are also held at the pause boundary so approving an action does not bypass a pause request. Stop wakes a paused run and prevents not-yet-admitted tool calls from starting.
+- The active job stays reserved while paused, preventing duplicate chat runs; browser reload reconnects to the same in-process job.
+- Pause/resume is process-local only in this release. If Niji itself exits or crashes, runs are not automatically recovered; interrupted external actions must be inspected before retrying.
+- Added regression coverage for action-admission races, pause/resume, stop while paused, pause during approval, reconnect state, and existing approved-plan guards.
 
 ## What's new in 2.33.0
 

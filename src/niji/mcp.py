@@ -24,10 +24,21 @@ class MCPServer:
         self.command = cfg["command"]
         self.args = cfg.get("args", [])
         self.env = cfg.get("env", {})
+        if self.env is None:
+            self.env = {}
+        if not isinstance(self.env, dict):
+            raise ValueError("MCP server environment must be an object")
+        secret_name = re.compile(
+            r"(?:API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|PROVIDER[_-]?CONFIG[_-]?KEY|"
+            r"CONNECTION[_-]?ID|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|"
+            r"(?:^|[_-])PAT(?:$|[_-]))", re.IGNORECASE)
+        self._secrets = [str(value) for key, value in self.env.items()
+                         if secret_name.search(str(key)) and value is not None and str(value)]
         self.proc = None
         self.tools = []
         self._id = 0
         self._pending = {}
+        self._pending_lock = threading.Lock()
         self._send_lock = threading.Lock()
 
     def start(self, timeout=20):
@@ -44,17 +55,31 @@ class MCPServer:
             "clientInfo": {"name": "niji-agent", "version": __version__},
         }, timeout=timeout)
         self._notify("notifications/initialized", {})
-        try:
-            self.tools = self._request("tools/list", {}, timeout=timeout).get("tools", [])
-        except Exception:
-            self.tools = []
+        listing = self._request("tools/list", {}, timeout=timeout)
+        if not isinstance(listing, dict) or not isinstance(listing.get("tools", []), list):
+            raise RuntimeError(f"MCP server '{self.name}' returned an invalid tool list")
+        self.tools = listing.get("tools", [])
 
     def stop(self):
+        proc = self.proc
+        if proc is None:
+            return
         try:
-            if self.proc:
-                self.proc.terminate()
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
         except Exception:
             pass
+        for stream in (proc.stdin, proc.stdout):
+            try:
+                if stream:
+                    stream.close()
+            except Exception:
+                pass
 
     def _read_loop(self):
         for line in self.proc.stdout:
@@ -66,25 +91,36 @@ class MCPServer:
             except Exception:
                 continue
             mid = msg.get("id")
-            if mid is not None and mid in self._pending:
-                self._pending[mid].put(msg)
+            if mid is not None:
+                # Keep the lookup and timeout cleanup atomic. A timed-out response may still
+                # arrive; it must never kill the sole reader thread with a KeyError.
+                with self._pending_lock:
+                    pending = self._pending.get(mid)
+                if pending is not None:
+                    pending.put(msg)
 
     def _request(self, method, params, timeout=60):
         with self._send_lock:
             self._id += 1
             mid = self._id
             q = queue.Queue()
-            self._pending[mid] = q
-            self.proc.stdin.write(json.dumps({
-                "jsonrpc": "2.0", "id": mid, "method": method, "params": params}) + "\n")
-            self.proc.stdin.flush()
+            with self._pending_lock:
+                self._pending[mid] = q
+            try:
+                self.proc.stdin.write(json.dumps({
+                    "jsonrpc": "2.0", "id": mid, "method": method, "params": params}) + "\n")
+                self.proc.stdin.flush()
+            except Exception:
+                with self._pending_lock:
+                    self._pending.pop(mid, None)
+                raise
         try:
             resp = q.get(timeout=timeout)
         except queue.Empty:
-            del self._pending[mid]
             raise TimeoutError(f"MCP server '{self.name}' did not respond to {method}")
         finally:
-            self._pending.pop(mid, None)
+            with self._pending_lock:
+                self._pending.pop(mid, None)
         if "error" in resp:
             raise RuntimeError(f"MCP error from '{self.name}': {resp['error']}")
         return resp.get("result", {})
@@ -95,13 +131,26 @@ class MCPServer:
                 "jsonrpc": "2.0", "method": method, "params": params}) + "\n")
             self.proc.stdin.flush()
 
+    def _redact(self, value):
+        text = str(value)
+        for secret in sorted((item for item in self._secrets if item), key=len, reverse=True):
+            if len(secret) >= 4:
+                text = text.replace(secret, "[redacted]")
+            else:
+                pattern = r"(?<![A-Za-z0-9])" + re.escape(secret) + r"(?![A-Za-z0-9])"
+                text = re.sub(pattern, "[redacted]", text)
+        return text[:1200]
+
     def to_openai_tools(self):
         return _to_openai_tools(self.name, self.tools)
 
     def call(self, tool_name, args):
-        result = self._request("tools/call", {
-            "name": tool_name, "arguments": args}, timeout=180)
-        return _format_tool_result(result)
+        try:
+            result = self._request("tools/call", {
+                "name": tool_name, "arguments": args}, timeout=180)
+        except Exception as exc:
+            raise RuntimeError(self._redact(exc)) from None
+        return self._redact(_format_tool_result(result))
 
 
 class HttpMCPServer:
@@ -175,8 +224,12 @@ class HttpMCPServer:
 
     def _redact(self, value):
         text = str(value)
-        for secret in sorted((s for s in self._secrets if s), key=len, reverse=True):
-            text = text.replace(secret, "[redacted]")
+        for secret in sorted((item for item in self._secrets if item), key=len, reverse=True):
+            if len(secret) >= 4:
+                text = text.replace(secret, "[redacted]")
+            else:
+                pattern = r"(?<![A-Za-z0-9])" + re.escape(secret) + r"(?![A-Za-z0-9])"
+                text = re.sub(pattern, "[redacted]", text)
         return text[:1200]
 
     def _request(self, method, params=None, *, notification=False, timeout=60):
@@ -306,6 +359,7 @@ def connect_all(servers_cfg: dict):
     """Start configured MCP servers; one failing connector never kills Niji."""
     clients = []
     for name, cfg in (servers_cfg or {}).items():
+        client = None
         try:
             if not isinstance(cfg, dict):
                 raise ValueError("connector configuration must be an object")
@@ -320,6 +374,11 @@ def connect_all(servers_cfg: dict):
             print(f"[niji] connector connected: {name} ({len(client.tools)} tools)")
             clients.append(client)
         except Exception as exc:
+            if client is not None:
+                try:
+                    client.stop()
+                except Exception:
+                    pass
             # Never echo a possibly credential-bearing connector exception.
             print(f"[niji] connector '{name}' failed to start ({type(exc).__name__}); "
                   "check its private configuration and network access")
