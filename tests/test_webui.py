@@ -216,6 +216,81 @@ class WebUITests(unittest.TestCase):
                        'async function togglePinnedSession', 'PINNED'):
             self.assertIn(marker, page)
 
+    def test_browser_automation_manager_controls_are_present(self):
+        page = urllib.request.urlopen(self.ui.url, timeout=3).read().decode()
+        for marker in ('data-view="automations"', 'id="view-automations"',
+                       'id="automation-form"', 'id="automation-run-at"',
+                       'id="automation-plan-only"', 'async function loadAutomations',
+                       'function renderAutomations', 'async function automationAction'):
+            self.assertIn(marker, page)
+        self.assertIn("local Niji workspace", page)
+        self.assertIn("Plan-only by default", page)
+
+    def test_automation_creation_persists_private_file_and_can_pause_delete(self):
+        from datetime import datetime, timedelta, timezone
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp)
+            with (patch("niji.webui.CONFIG_DIR", config),
+                  patch("niji.webui._AUTOMATION_FILE", config / "automations.json")):
+                run_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+                result = json.loads(self.request("/api/automations", {
+                    "action": "create", "name": "Daily review", "prompt": "Review the latest changes",
+                    "run_at": run_at, "mode": "interval", "interval_minutes": 1440,
+                    "plan_only": True,
+                }, self.ui.token).read())
+                item = result["automations"][0]
+                self.assertEqual(item["name"], "Daily review")
+                self.assertTrue(item["enabled"])
+                self.assertTrue(item["plan_only"])
+                saved = config / "automations.json"
+                self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
+                result = json.loads(self.request("/api/automations", {
+                    "action": "toggle", "id": item["id"], "enabled": False,
+                }, self.ui.token).read())
+                self.assertFalse(result["automations"][0]["enabled"])
+                result = json.loads(self.request("/api/automations", {
+                    "action": "delete", "id": item["id"],
+                }, self.ui.token).read())
+                self.assertEqual(result["automations"], [])
+
+    def test_automation_rejects_invalid_schedule_and_task(self):
+        from datetime import datetime, timedelta, timezone
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("niji.webui._AUTOMATION_FILE", Path(tmp) / "automations.json"), \
+             patch("niji.webui.CONFIG_DIR", Path(tmp)):
+            invalid = [
+                {"action": "create", "name": "x", "prompt": "task", "run_at": "soon", "mode": "once", "plan_only": True},
+                {"action": "create", "name": "x", "prompt": "task", "run_at": (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat(), "mode": "interval", "interval_minutes": 2, "plan_only": True},
+            ]
+            for body in invalid:
+                with self.assertRaises(urllib.error.HTTPError) as failure:
+                    self.request("/api/automations", body, self.ui.token)
+                self.assertEqual(failure.exception.code, 400)
+
+    def test_due_automation_runs_as_job_and_records_completion(self):
+        from datetime import datetime, timedelta, timezone
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp)
+            file = config / "automations.json"
+            with (patch("niji.webui.CONFIG_DIR", config),
+                  patch("niji.webui._AUTOMATION_FILE", file)):
+                run_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+                created = json.loads(self.request("/api/automations", {
+                    "action": "create", "name": "Scheduled check", "prompt": "Review staged changes",
+                    "run_at": run_at, "mode": "once", "plan_only": True,
+                }, self.ui.token).read())["automations"][0]
+                stored = json.loads(file.read_text())
+                stored[0]["next_run"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+                file.write_text(json.dumps(stored))
+                self.assertTrue(self.ui._dispatch_due_automations())
+                self.ui._job_thread.join(timeout=3)
+                result = json.loads(self.request("/api/automations", token=self.ui.token).read())
+                item = next(item for item in result["automations"] if item["id"] == created["id"])
+                self.assertEqual(item["last_status"], "completed")
+                self.assertFalse(item["enabled"])
+                self.assertTrue(self.agent.last_plan_only)
+                self.assertIn("Review staged changes", [m["content"] for m in self.agent.messages])
+
     def test_model_state_does_not_expose_credentials(self):
         with (patch("niji.webui.load_config", return_value={"api_keys": {"test": "private-test-secret"}}),
               patch("niji.webui.provider_names", return_value=["test", "openai"]),

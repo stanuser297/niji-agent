@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -29,6 +29,7 @@ _MAX_BODY = 32_000
 _MAX_PROMPT = 20_000
 _PROFILE_FILE = CONFIG_DIR / "project_profiles.json"
 _PIN_FILE = CONFIG_DIR / "pinned_sessions.json"
+_AUTOMATION_FILE = CONFIG_DIR / "automations.json"
 
 
 _PAGE = r'''<!doctype html>
@@ -98,6 +99,10 @@ class NijiWebUI:
         agent.approval = "ask" if getattr(agent, "approval", "ask") != "auto" else "auto"
         agent.approval_callback = self._request_approval
         self.httpd = self._create_server()
+        self._automation_stop = threading.Event()
+        self._automation_thread = threading.Thread(
+            target=self._automation_loop, name="niji-automation-scheduler", daemon=True)
+        self._automation_thread.start()
 
     def _create_server(self):
         ui = self
@@ -188,6 +193,8 @@ class NijiWebUI:
                     self._json(200, {"session_id": session_id, "messages": transcript}); return
                 if parsed.path == "/api/connectors":
                     self._json(200, {"connectors": ui._connector_state()}); return
+                if parsed.path == "/api/automations":
+                    self._json(200, ui._automation_state()); return
                 if parsed.path == "/api/profiles":
                     self._json(200, {"profiles": ui._load_profiles(),
                                      "workspace": str(Path.cwd()),
@@ -253,6 +260,9 @@ class NijiWebUI:
                     self._json(202, {"ok": True, "message": "Stop requested; an in-flight provider or tool call may finish first"}); return
                 if parsed.path == "/api/models":
                     status, result = ui._model_action(data)
+                    self._json(status, result); return
+                if parsed.path == "/api/automations":
+                    status, result = ui._automation_action(data)
                     self._json(status, result); return
                 if parsed.path == "/api/connectors":
                     action = data.get("action") if isinstance(data, dict) else None
@@ -454,27 +464,8 @@ class NijiWebUI:
                     plan_only = data.get("plan_only", False) if isinstance(data, dict) else False
                     if not isinstance(plan_only, bool):
                         self._json(400, {"error": "plan_only must be true or false"}); return
-                    with ui._lock:
-                        if ui._connector_mutating or ui._model_mutating:
-                            self._json(409, {"error": "Wait until model or connector setup finishes before starting a request"}); return
-                        if ui._busy:
-                            self._json(409, {"error": "Niji is already working on a request"}); return
-                        cancel_event = getattr(ui.agent, "_cancel_event", None)
-                        if cancel_event is not None:
-                            cancel_event.clear()
-                        job_id = uuid.uuid4().hex
-                        ui._busy = True
-                        ui._active_job = job_id
-                        ui._jobs[job_id] = {"id": job_id, "status": "running", "response": "", "error": "",
-                                             "streamed": "", "progress": "Thinking on it",
-                                             "progress_detail": "Preparing the model request", "activity": None,
-                                             "events": [], "plan_only": plan_only, "original_message": message.strip(),
-                                             "cancel_requested": False, "created": time.time()}
-                    ui._job_thread = threading.Thread(
-                        target=ui._run_job, args=(job_id, message.strip(), plan_only),
-                        name=f"niji-job-{job_id[:8]}", daemon=True)
-                    ui._job_thread.start()
-                    self._json(202, {"id": job_id}); return
+                    status, result = ui._start_job(message.strip(), plan_only=plan_only)
+                    self._json(status, result); return
                 if parsed.path == "/api/session/new":
                     try:
                         ui._new_session()
@@ -626,6 +617,253 @@ class NijiWebUI:
             self._approvals.pop(approval_id, None)
         return bool(decided and item["approved"])
 
+    @staticmethod
+    def _automation_time(value):
+        if not isinstance(value, str) or len(value) > 40:
+            raise ValueError("Choose a valid scheduled time")
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("Choose a valid scheduled time") from exc
+        if parsed.tzinfo is None:
+            raise ValueError("Scheduled time must include a timezone")
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _automation_iso(value):
+        return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    def _load_automations(self):
+        if (_AUTOMATION_FILE.is_symlink() or not _AUTOMATION_FILE.is_file()
+                or _AUTOMATION_FILE.stat().st_size > 100_000):
+            return []
+        try:
+            raw = json.loads(_AUTOMATION_FILE.read_text())
+        except (OSError, ValueError, TypeError):
+            return []
+        if not isinstance(raw, list):
+            return []
+        result = []
+        for item in raw[:50]:
+            if not isinstance(item, dict):
+                continue
+            ident, name, prompt = item.get("id"), item.get("name"), item.get("prompt")
+            if (not isinstance(ident, str) or not re.fullmatch(r"[a-f0-9]{32}", ident)
+                    or not isinstance(name, str) or not 1 <= len(name) <= 80
+                    or not isinstance(prompt, str) or not 1 <= len(prompt) <= 4000):
+                continue
+            try:
+                next_run = self._automation_time(item.get("next_run"))
+                interval = item.get("interval_minutes")
+                if interval is not None and (isinstance(interval, bool) or not isinstance(interval, int)
+                                             or not 15 <= interval <= 43_200):
+                    continue
+                if item.get("mode") not in ("once", "interval"):
+                    continue
+                if (item["mode"] == "once") != (interval is None):
+                    continue
+            except (ValueError, TypeError):
+                continue
+            result.append({
+                "id": ident, "name": name, "prompt": prompt, "mode": item["mode"],
+                "interval_minutes": interval, "next_run": self._automation_iso(next_run),
+                "enabled": item.get("enabled") is True, "plan_only": item.get("plan_only") is True,
+                "last_run": item.get("last_run") if isinstance(item.get("last_run"), str) else "",
+                "last_finished": item.get("last_finished") if isinstance(item.get("last_finished"), str) else "",
+                "last_status": item.get("last_status") if item.get("last_status") in
+                    ("scheduled", "running", "completed", "error", "cancelled", "waiting") else "scheduled",
+                "job_id": item.get("job_id") if isinstance(item.get("job_id"), str) else "",
+            })
+        return result
+
+    def _save_automations(self, items):
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        CONFIG_DIR.chmod(0o700)
+        if _AUTOMATION_FILE.is_symlink():
+            raise OSError("Refusing to replace a symlinked automation file")
+        temp = _AUTOMATION_FILE.with_suffix(".json.tmp")
+        if temp.is_symlink():
+            raise OSError("Refusing to write through a symlinked temporary file")
+        temp.write_text(json.dumps(items[:50], ensure_ascii=False, indent=2))
+        temp.chmod(0o600)
+        temp.replace(_AUTOMATION_FILE)
+        _AUTOMATION_FILE.chmod(0o600)
+
+    def _automation_state(self):
+        with self._lock:
+            automations = self._load_automations()
+            for item in automations:
+                job = self._jobs.get(item.get("job_id"))
+                if job and job.get("status") == "running":
+                    item["progress"] = job.get("progress", "Working")
+                    item["progress_detail"] = job.get("progress_detail", "")
+                else:
+                    item["progress"] = ""
+                    item["progress_detail"] = ""
+            return {"automations": automations, "runner_active": not self._automation_stop.is_set(),
+                    "server_busy": self._busy}
+
+    def _automation_action(self, data):
+        if not isinstance(data, dict):
+            return 400, {"error": "Automation action must be a JSON object"}
+        action = data.get("action")
+        try:
+            with self._lock:
+                items = self._load_automations()
+                if action == "create":
+                    name = data.get("name")
+                    prompt = data.get("prompt")
+                    plan_only = data.get("plan_only", True)
+                    if not isinstance(name, str) or not 1 <= len(name.strip()) <= 80:
+                        return 400, {"error": "Automation name must be 1–80 characters"}
+                    if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 4000:
+                        return 400, {"error": "Task must be 1–4,000 characters"}
+                    if not isinstance(plan_only, bool):
+                        return 400, {"error": "plan_only must be true or false"}
+                    mode = data.get("mode", "once")
+                    interval = data.get("interval_minutes")
+                    run_at = self._automation_time(data.get("run_at"))
+                    now = datetime.now(timezone.utc)
+                    if run_at < now + timedelta(seconds=30) or run_at > now + timedelta(days=366):
+                        return 400, {"error": "Schedule a run from 30 seconds to 366 days ahead"}
+                    if mode == "once":
+                        interval = None
+                    elif mode == "interval":
+                        if isinstance(interval, bool) or not isinstance(interval, int) or not 15 <= interval <= 43_200:
+                            return 400, {"error": "Repeat interval must be from 15 minutes to 30 days"}
+                    else:
+                        return 400, {"error": "Choose once or interval scheduling"}
+                    if len(items) >= 50:
+                        return 400, {"error": "Keep at most 50 automations"}
+                    record = {"id": uuid.uuid4().hex, "name": name.strip(), "prompt": prompt.strip(),
+                              "mode": mode, "interval_minutes": interval,
+                              "next_run": self._automation_iso(run_at), "enabled": True,
+                              "plan_only": plan_only, "last_run": "", "last_finished": "",
+                              "last_status": "scheduled", "job_id": ""}
+                    items.insert(0, record)
+                    self._save_automations(items)
+                    return 200, {"ok": True, **self._automation_state()}
+                ident = data.get("id")
+                if not isinstance(ident, str) or not re.fullmatch(r"[a-f0-9]{32}", ident):
+                    return 400, {"error": "Choose a valid automation"}
+                record = next((item for item in items if item["id"] == ident), None)
+                if record is None:
+                    return 404, {"error": "Automation not found"}
+                if action == "delete":
+                    job = self._jobs.get(record.get("job_id"))
+                    if job and job.get("status") == "running":
+                        return 409, {"error": "Stop the running task before deleting its automation"}
+                    items.remove(record)
+                elif action == "toggle":
+                    enabled = data.get("enabled")
+                    if not isinstance(enabled, bool):
+                        return 400, {"error": "enabled must be true or false"}
+                    if enabled and not record["enabled"]:
+                        next_run = self._automation_time(record["next_run"])
+                        if next_run <= datetime.now(timezone.utc):
+                            next_run = datetime.now(timezone.utc) + timedelta(minutes=1)
+                            record["next_run"] = self._automation_iso(next_run)
+                    record["enabled"] = enabled
+                elif action == "run_now":
+                    if record["last_status"] == "running":
+                        return 409, {"error": "This automation is already running"}
+                    record["enabled"] = True
+                    record["next_run"] = self._automation_iso(datetime.now(timezone.utc))
+                else:
+                    return 400, {"error": "Action must be create, toggle, run_now, or delete"}
+                self._save_automations(items)
+                return 200, {"ok": True, **self._automation_state()}
+        except (OSError, ValueError, TypeError) as exc:
+            return 400, {"error": str(exc)[:250]}
+
+    def _start_job(self, message, plan_only=False, automation_id=None):
+        with self._lock:
+            if self._connector_mutating or self._model_mutating:
+                return 409, {"error": "Wait for model or connector setup to finish before starting a request"}
+            if self._busy:
+                return 409, {"error": "Niji is already working on a request"}
+            cancel_event = getattr(self.agent, "_cancel_event", None)
+            if cancel_event is not None:
+                cancel_event.clear()
+            job_id = uuid.uuid4().hex
+            self._busy = True
+            self._active_job = job_id
+            self._jobs[job_id] = {"id": job_id, "status": "running", "response": "", "error": "",
+                                 "streamed": "", "progress": "Thinking on it",
+                                 "progress_detail": "Preparing the model request", "activity": None,
+                                 "events": [], "plan_only": bool(plan_only), "original_message": message,
+                                 "cancel_requested": False, "created": time.time(),
+                                 "automation_id": automation_id or ""}
+            self._job_thread = threading.Thread(
+                target=self._run_job, args=(job_id, message, plan_only),
+                name=f"niji-job-{job_id[:8]}", daemon=True)
+            try:
+                self._job_thread.start()
+            except Exception as exc:
+                self._busy = False
+                self._active_job = None
+                self._jobs.pop(job_id, None)
+                return 500, {"error": f"Could not start the task ({type(exc).__name__})"}
+            return 202, {"id": job_id}
+
+    def _dispatch_due_automations(self, now=None):
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        now = now.astimezone(timezone.utc)
+        with self._lock:
+            if self._busy or self._connector_mutating or self._model_mutating:
+                return False
+            items = self._load_automations()
+            due = next((item for item in items if item["enabled"]
+                        and self._automation_time(item["next_run"]) <= now), None)
+            if due is None:
+                return False
+            due["last_status"] = "waiting"
+            due["last_run"] = self._automation_iso(now)
+            if due["mode"] == "once":
+                due["enabled"] = False
+            else:
+                due["next_run"] = self._automation_iso(now + timedelta(minutes=due["interval_minutes"]))
+            try:
+                self._save_automations(items)
+            except OSError:
+                return False
+            status, result = self._start_job(due["prompt"], plan_only=due["plan_only"],
+                                             automation_id=due["id"])
+            if status != 202:
+                due["last_status"] = "waiting"
+                due["next_run"] = self._automation_iso(now + timedelta(minutes=1))
+                if due["mode"] == "once":
+                    due["enabled"] = True
+                self._save_automations(items)
+                return False
+            due["last_status"] = "running"
+            due["job_id"] = result["id"]
+            self._save_automations(items)
+            return True
+
+    def _automation_loop(self):
+        while not self._automation_stop.wait(1.0):
+            try:
+                self._dispatch_due_automations()
+            except Exception:
+                # A malformed or temporarily unwritable local file must not stop the UI.
+                continue
+
+    def _complete_automation(self, automation_id, status):
+        try:
+            with self._lock:
+                items = self._load_automations()
+                record = next((item for item in items if item["id"] == automation_id), None)
+                if record is None:
+                    return
+                record["last_status"] = status
+                record["last_finished"] = self._automation_iso(datetime.now(timezone.utc))
+                self._save_automations(items)
+        except (OSError, ValueError):
+            pass
+
     def _run_job(self, job_id, message, plan_only=False):
         started = time.monotonic()
         previous_plan_only = getattr(self.agent, "plan_only", False)
@@ -661,7 +899,12 @@ class NijiWebUI:
                 self.agent.request_seconds = max(0, int(time.monotonic() - started))
             except Exception:
                 pass
+            automation_id = ""
+            final_status = "error"
             with self._lock:
+                job = self._jobs.get(job_id, {})
+                automation_id = job.get("automation_id", "")
+                final_status = job.get("status", "error")
                 self._busy = False
                 if self._active_job == job_id:
                     self._active_job = None
@@ -669,6 +912,8 @@ class NijiWebUI:
                 if len(self._jobs) > 20:
                     for old_id in list(self._jobs)[:-20]:
                         self._jobs.pop(old_id, None)
+            if automation_id:
+                self._complete_automation(automation_id, final_status)
 
     def _new_session(self):
         with self._lock:
@@ -1060,7 +1305,10 @@ class NijiWebUI:
             self.close()
 
     def close(self):
-        """Stop the listener, deny approvals, cancel active work, and join briefly."""
+        """Stop the listener and scheduler, deny approvals, cancel work, and join briefly."""
+        self._automation_stop.set()
+        if self._automation_thread.is_alive():
+            self._automation_thread.join(timeout=2)
         with self._lock:
             busy = self._busy
             active_id = self._active_job

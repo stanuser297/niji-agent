@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.26.0
+# Niji Agent 🌈 — v2.27.0
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -15,6 +15,13 @@ niji
 Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, enter its API key (visible input is the Termux-friendly default; hidden entry is optional), and choose a model. The key is saved locally in `~/.niji/config.json` with private file permissions—no `export` command is needed. Ollama can be used without an API key.
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
+
+## What's new in 2.27.0
+
+- Added a loopback-only Automations page to schedule one-off or repeating tasks, pause/resume them, run now, and delete them.
+- Added a local scheduler that runs only while the Niji UI process is running. Schedules are persisted in `~/.niji/automations.json` with owner-only permissions; intervals are bounded from 15 minutes to 30 days and at most 50 automations are stored.
+- Scheduled tasks default to plan-only (no tools). If execution is enabled, existing tool approval settings still apply. Runs use the active local workspace, model, and current thread context; do not schedule sensitive prompts on a shared/untrusted device.
+- Added regression coverage for UI controls, persistence/permissions, validation, and scheduled job completion.
 
 ## What's new in 2.26.0
 
