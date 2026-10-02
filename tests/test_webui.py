@@ -167,9 +167,19 @@ class WebUITests(unittest.TestCase):
         self.assertIn(".message.live-status .msglabel{display:none}", page)
         self.assertIn(".message.live-status .msgbody{display:none}", page)
         self.assertIn(".message.live-status:before", page)
-        self.assertIn("Thinking…", page)
+        self.assertIn("Preparing next step…", page)
+        self.assertNotIn("Thinking…", page)
+        self.assertIn("Running a command…", page)
+        self.assertIn("still running", page)
+        self.assertIn("duration=detail.match", page)
+        self.assertIn("Planning the steps…", page)
+        self.assertIn("Checking your request and deciding what action is needed.", page)
+        self.assertIn("Running the requested command.", page)
+        self.assertIn("Still running · ${duration}s.", page)
         self.assertIn("workdetail", page)
-        self.assertIn("Understanding your request and choosing a next step.", page)
+        self.assertIn("Checking your request and deciding what action is needed.", page)
+        self.assertIn("Running the requested command.", page)
+        self.assertIn("Still running · ${duration}s.", page)
         self.assertIn("toolDescriptions", page)
         self.assertIn("Planning…", page)
         self.assertIn("Searching the web…", page)
@@ -251,6 +261,36 @@ class WebUITests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as invalid:
             self.request("/api/settings", {"compaction_threshold": 2000}, self.ui.token).read()
         self.assertEqual(invalid.exception.code, 400)
+
+    def test_live_tool_activity_and_elapsed_time_are_exposed_to_ui(self):
+        job_id = "live-progress-case"
+        self.ui._jobs[job_id] = {
+            "id": job_id, "status": "running", "response": "", "error": "",
+            "streamed": "", "progress": "Preparing the next step",
+            "progress_detail": "Preparing the model request", "activity": None,
+            "plan_only": False, "original_message": "run tests",
+            "cancel_requested": False,
+        }
+        self.ui._active_job = job_id
+        self.ui._busy = True
+        self.ui._record_activity({
+            "time": "12:03:00", "level": "TOOL",
+            "message": "Tool call: run_tests · Running project tests",
+        })
+        started = json.loads(self.request(
+            "/api/jobs/" + job_id, token=self.ui.token).read())
+        self.assertEqual(started["progress"], "Using a tool")
+        self.assertIn("Tool call: run_tests", started["progress_detail"])
+        self.ui._record_activity({
+            "time": "12:03:09", "level": "TOOL_PROGRESS",
+            "message": "Tool call: run_tests · still running (9s)",
+        })
+        progress = json.loads(self.request(
+            "/api/jobs/" + job_id, token=self.ui.token).read())
+        self.assertEqual(progress["activity"]["level"], "TOOL_PROGRESS")
+        self.assertIn("still running (9s)", progress["progress_detail"])
+        self.ui._active_job = None
+        self.ui._busy = False
 
     def test_cancelled_provider_exception_is_reported_as_cancelled(self):
         job_id = "cancelled-error-case"

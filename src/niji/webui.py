@@ -552,7 +552,7 @@ class NijiWebUI:
             except Exception:
                 pass
         labels = {
-            "THINKING": "Thinking on it",
+            "THINKING": "Preparing the next step",
             "PLAN": "Mapping it out",
             "TOOL": "Using a tool",
             "TOOL_PROGRESS": "Using a tool",

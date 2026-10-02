@@ -49,7 +49,7 @@ def _activity_notice(event):
     with OUTPUT_LOCK:
         console = Console()
         if level == "THINKING":
-            console.print(f"[dim bright_cyan]✧ {message}[/]")
+            console.print(f"[dim bright_cyan]↻ {message}[/]")
         elif level == "RETRY":
             console.print(f"[yellow]↻ {message}[/]")
         elif level == "LIMIT":

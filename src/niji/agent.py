@@ -338,7 +338,7 @@ class Agent:
                 self._record_activity("STOPPED", "Stopped by user")
                 return "[Stopped by user]"
             self.usage["turns"] += 1
-            self._record_activity("THINKING", f"Thinking · {self.provider_name}/{self.model} · turn {turn}")
+            self._record_activity("THINKING", f"Preparing the next step · turn {turn}")
             msg, text, tool_calls = self._chat()
             if self._cancel_event.is_set():
                 if text and not tool_calls:
