@@ -13,6 +13,8 @@ from .config import SESSION_DIR
 
 MAX_PLAN_ITEMS = 60
 MAX_PLAN_TEXT = 500
+MAX_ACCEPTANCE_CRITERIA = 400
+MAX_STEP_EVIDENCE = 800
 _STATUSES = {"pending", "in_progress", "completed", "blocked"}
 _SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 
@@ -30,6 +32,12 @@ def normalize_plan(items) -> list[dict]:
         content = item.get("content")
         status = item.get("status", "pending")
         active_form = item.get("activeForm", "")
+        acceptance_criteria = item.get("acceptance_criteria", "")
+        evidence = item.get("evidence", "")
+        if not isinstance(acceptance_criteria, str) or len(acceptance_criteria) > MAX_ACCEPTANCE_CRITERIA:
+            raise ValueError(f"acceptance_criteria must be text up to {MAX_ACCEPTANCE_CRITERIA} characters")
+        if not isinstance(evidence, str) or len(evidence) > MAX_STEP_EVIDENCE:
+            raise ValueError(f"evidence must be text up to {MAX_STEP_EVIDENCE} characters")
         if "id" not in item:
             step_id = f"step-{index}"
         elif isinstance(item["id"], str):
@@ -66,6 +74,10 @@ def normalize_plan(items) -> list[dict]:
             "status": status,
             "activeForm": active_form.strip()[:160],
         }
+        if acceptance_criteria.strip():
+            normalized["acceptance_criteria"] = acceptance_criteria.strip()
+        if evidence.strip():
+            normalized["evidence"] = evidence.strip()
         if dependencies:
             normalized["depends_on"] = dependencies
         result.append(normalized)
@@ -102,6 +114,17 @@ def normalize_plan(items) -> list[dict]:
     return result
 
 
+def has_concrete_step_evidence(value) -> bool:
+    """Return whether evidence is substantive enough for an approved-step report."""
+    if not isinstance(value, str):
+        return False
+    evidence = value.strip()
+    if len(evidence) < 8:
+        return False
+    return evidence.casefold().strip(" .!?") not in {
+        "ok", "done", "complete", "completed", "verified", "passed", "success"}
+
+
 def validate_approved_plan_progress(candidate, approved, previous) -> list[dict]:
     """Validate that checklist updates execute only the exact approved plan in order."""
     approved_plan = normalize_plan(approved)
@@ -110,11 +133,14 @@ def validate_approved_plan_progress(candidate, approved, previous) -> list[dict]
     if len(approved_plan) != len(updated) or len(current) != len(updated):
         raise ValueError("The checklist must keep the approved number of steps")
     for expected, before, after in zip(approved_plan, current, updated):
-        for field in ("id", "content", "depends_on"):
-            if (expected.get(field, []) != after.get(field, [])
-                    or expected.get(field, []) != before.get(field, [])):
-                raise ValueError("Approved step IDs, descriptions, order, and prerequisites cannot be changed")
+        for field in ("id", "content", "depends_on", "acceptance_criteria"):
+            default = [] if field == "depends_on" else ""
+            if (expected.get(field, default) != after.get(field, default)
+                    or expected.get(field, default) != before.get(field, default)):
+                raise ValueError("Approved step IDs, descriptions, order, criteria, and prerequisites cannot be changed")
         old_status, new_status = before["status"], after["status"]
+        if old_status == "completed" and after.get("evidence", "") != before.get("evidence", ""):
+            raise ValueError("Evidence for a completed approved step cannot be changed")
         allowed = {
             "pending": {"pending", "in_progress", "blocked"},
             "in_progress": {"in_progress", "completed", "blocked"},
@@ -133,6 +159,8 @@ def validate_approved_plan_progress(candidate, approved, previous) -> list[dict]
                 raise ValueError("Complete every prerequisite before starting or blocking this step")
         if new_status == "completed" and old_status not in {"in_progress", "completed"}:
             raise ValueError("Mark a step in progress before marking it complete")
+        if new_status == "completed" and not has_concrete_step_evidence(after.get("evidence", "")):
+            raise ValueError("Add concise, concrete evidence before marking an approved step complete")
     return updated
 
 

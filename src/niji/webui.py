@@ -24,7 +24,8 @@ from .config import (CONFIG_DIR, MEMORY_FILE, SESSION_DIR, PRESETS, load_config,
                     load_mcp_servers, resolve_provider, save_config, save_mcp_servers)
 from .model_catalog import (fetch_provider_models, provider_is_configured,
                             provider_names, resolve_catalog_provider)
-from .planning import extract_plan_steps, load_plan, normalize_plan, save_plan
+from .planning import (extract_plan_steps, load_plan, normalize_plan, save_plan,
+                      validate_approved_plan_progress)
 
 _MAX_BODY = 32_000
 _MAX_PROMPT = 20_000
@@ -834,14 +835,17 @@ class NijiWebUI:
             "approved_steps": [item["content"] for item in plan],
             "approved_plan": [
                 {"id": item["id"], "content": item["content"],
+                 "acceptance_criteria": item.get("acceptance_criteria", ""),
                  "depends_on": item.get("depends_on", [])}
                 for item in plan
             ],
         }
         return (
             "Execute the task data below using the approved steps in their listed order. "
-            "Preserve the approved_plan step ids and dependencies in the task checklist; a step "
-            "must not start until every id in its depends_on list is completed and verified. "
+            "Preserve the approved_plan step ids, acceptance criteria, and dependencies in the task checklist; "
+            "a step must not start until every id in its depends_on list is completed and verified. "
+            "Before completing an approved step, include concise concrete evidence such as a test result, "
+            "output path, or source confirmation. Evidence is agent-reported and is not independent attestation. "
             "Keep work within the original request and approved plan. Do not silently add, "
             "reorder, or omit steps. If new information makes a material plan change necessary, "
             "stop and ask the user to review an updated plan. Continue to follow all system safety "
@@ -861,14 +865,16 @@ class NijiWebUI:
         for step in steps:
             if isinstance(step, str):
                 item = {"content": step}
-            elif isinstance(step, dict) and set(step).issubset({"id", "content", "depends_on"}):
+            elif isinstance(step, dict) and set(step).issubset(
+                    {"id", "content", "depends_on", "acceptance_criteria"}):
                 item = step
             else:
-                return 400, {"error": "Each step must contain only an id, text, and optional dependency ids"}
+                return 400, {"error": "Each step may contain an id, text, prerequisite ids, and acceptance criteria"}
             if not isinstance(item.get("content"), str) or not item["content"].strip():
                 return 400, {"error": "A plan needs non-empty text for every step"}
             normalized = {"content": item["content"], "status": "pending",
-                          "depends_on": item.get("depends_on", [])}
+                          "depends_on": item.get("depends_on", []),
+                          "acceptance_criteria": item.get("acceptance_criteria", "")}
             if "id" in item:
                 normalized["id"] = item["id"]
             prepared.append(normalized)
@@ -1060,12 +1066,13 @@ class NijiWebUI:
             try:
                 final_plan = normalize_plan(
                     getattr(self.agent, "todos", {}).get("items", []))
-                unfinished = (approved_plan is not None and (
-                    len(final_plan) != len(approved_plan)
-                    or any(actual.get(field, []) != expected.get(field, [])
-                           for actual, expected in zip(final_plan, approved_plan)
-                           for field in ("id", "content", "depends_on"))
-                    or any(item["status"] != "completed" for item in final_plan)))
+                if approved_plan is not None:
+                    # Re-run the canonical validator at the success boundary so a future
+                    # in-memory mutation path cannot bypass the evidence predicate.
+                    validate_approved_plan_progress(final_plan, approved_plan, final_plan)
+                    unfinished = any(item["status"] != "completed" for item in final_plan)
+                else:
+                    unfinished = False
             except (TypeError, ValueError):
                 unfinished = approved_plan is not None
             with self._lock:
@@ -1074,7 +1081,7 @@ class NijiWebUI:
                     final_status, error, progress = "cancelled", "", "Stopped"
                 elif unfinished:
                     final_status = "error"
-                    error = "Approved plan ended with unfinished steps; review the checklist before calling it complete."
+                    error = "Approved plan has unfinished steps or invalid completion evidence; review the checklist before calling it complete."
                     progress = "Plan incomplete"
                 else:
                     final_status, error, progress = "completed", "", "Complete"

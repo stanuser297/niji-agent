@@ -59,21 +59,24 @@ class PlanningTests(unittest.TestCase):
 
     def test_approved_plan_progress_enforces_exact_steps_order_and_safe_transitions(self):
         approved = normalize_plan([
-            {"id": "inspect", "content": "Inspect repository"},
+            {"id": "inspect", "content": "Inspect repository",
+             "acceptance_criteria": "Relevant files have been read."},
             {"id": "test", "content": "Run focused tests", "depends_on": ["inspect"]},
         ])
         pending = approved
         active_first = validate_approved_plan_progress([
             {**approved[0], "status": "in_progress"}, approved[1]], approved, pending)
         done_first_active_second = validate_approved_plan_progress([
-            {**approved[0], "status": "completed"},
+            {**approved[0], "status": "completed",
+             "evidence": "Read source and confirmed the relevant call path."},
             {**approved[1], "status": "in_progress"},
         ], approved, active_first)
         self.assertEqual([step["status"] for step in done_first_active_second],
                          ["completed", "in_progress"])
         completed = validate_approved_plan_progress([
-            {**approved[0], "status": "completed"},
-            {**approved[1], "status": "completed"},
+            {**done_first_active_second[0]},
+            {**approved[1], "status": "completed",
+             "evidence": "Focused suite passed: 12 tests, zero failures."},
         ], approved, done_first_active_second)
         self.assertEqual(completed[1]["status"], "completed")
 
@@ -90,6 +93,43 @@ class PlanningTests(unittest.TestCase):
         for candidate in invalid:
             with self.subTest(candidate=candidate), self.assertRaises(ValueError):
                 validate_approved_plan_progress(candidate, approved, pending)
+
+    def test_approved_completion_requires_concrete_reported_evidence_and_locks_it(self):
+        approved = normalize_plan([{"id": "verify", "content": "Run checks",
+                                   "acceptance_criteria": "The focused test suite passes."}])
+        active = validate_approved_plan_progress(
+            [{**approved[0], "status": "in_progress"}], approved, approved)
+        for evidence in ("", "done", "verified", "ok"):
+            with self.subTest(evidence=evidence), self.assertRaisesRegex(ValueError, "evidence"):
+                validate_approved_plan_progress(
+                    [{**approved[0], "status": "completed", "evidence": evidence}],
+                    approved, active)
+        completed = validate_approved_plan_progress(
+            [{**approved[0], "status": "completed",
+              "evidence": "Focused tests passed: 9 tests, zero failures."}],
+            approved, active)
+        with self.assertRaisesRegex(ValueError, "cannot be changed"):
+            validate_approved_plan_progress(
+                [{**completed[0], "evidence": "Different evidence result."}],
+                approved, completed)
+        with self.assertRaisesRegex(ValueError, "criteria"):
+            validate_approved_plan_progress(
+                [{**approved[0], "status": "in_progress", "acceptance_criteria": "Changed"}],
+                approved, approved)
+
+    def test_step_criteria_and_evidence_are_bounded_and_shown_in_todo_read(self):
+        for criteria in ("x" * 401, " " * 401):
+            with self.subTest(criteria_size=len(criteria)), self.assertRaises(ValueError):
+                normalize_plan([{"content": "Step", "acceptance_criteria": criteria}])
+        for evidence in ("x" * 801, " " * 801):
+            with self.subTest(evidence_size=len(evidence)), self.assertRaises(ValueError):
+                normalize_plan([{"content": "Step", "evidence": evidence}])
+        plan = normalize_plan([{"id": "check", "content": "Run checks",
+                                "acceptance_criteria": "All focused tests pass.",
+                                "evidence": "9 tests passed with no failures."}])
+        text = todo_read({"todos": {"items": plan}})
+        self.assertIn("Check: All focused tests pass.", text)
+        self.assertIn("Reported evidence (agent-reported, not independently attested): 9 tests passed", text)
 
     def test_blocked_approved_step_can_be_reset_to_pending_for_resume(self):
         approved = normalize_plan([{"id": "work", "content": "Do work"}])
@@ -258,7 +298,8 @@ class PlanningTests(unittest.TestCase):
                 self.assertEqual(load_plan("approved-session", root=tmp), [])
                 active = [{**approved[0], "status": "in_progress"}, approved[1]]
                 todo_write(active, "Inspecting", ctx={"agent": agent, "todos": agent.todos})
-                finished_first = [{**approved[0], "status": "completed"}, approved[1]]
+                finished_first = [{**approved[0], "status": "completed",
+                                   "evidence": "Source inspection confirmed the target path."}, approved[1]]
                 todo_write(finished_first, "Inspect complete", ctx={"agent": agent, "todos": agent.todos})
                 with self.assertRaises(ValueError):
                     todo_write([{**approved[0], "status": "completed"},

@@ -44,6 +44,7 @@ class FakeAgent:
         self.last_plan_only = False
         self.approved_plan_seen = None
         self.leave_plan_incomplete = False
+        self.corrupt_completion_evidence = False
         self.todos = {"items": []}
         self.plan_callback = None
         self.pause_stream = False
@@ -79,10 +80,13 @@ class FakeAgent:
                     raise AssertionError(started)
                 completed = [dict(item) for item in self.todos["items"]]
                 completed[index]["status"] = "completed"
+                completed[index]["evidence"] = "Fixture observed a successful step result."
                 result = dispatch("todo_write", {"todos": completed, "activeForm": "Verified"},
                                   {"agent": self, "todos": self.todos})
                 if str(result).startswith("[error]"):
                     raise AssertionError(result)
+            if self.corrupt_completion_evidence and self.todos["items"]:
+                self.todos["items"][-1]["evidence"] = "ok"
         if self.require_approval:
             approved = self.approval_callback("write_file", {"path": "notes.txt"})
             answer = "approved" if approved else "denied"
@@ -140,6 +144,11 @@ class WebUITests(unittest.TestCase):
         req = urllib.request.Request(self.base + path, data=body, headers=headers)
         return urllib.request.urlopen(req, timeout=3)
 
+    def test_plan_editor_exposes_optional_completion_criteria(self):
+        self.assertIn("Optional completion criteria", PAGE)
+        self.assertIn("acceptance_criteria:x.acceptance_criteria.trim()", PAGE)
+        self.assertIn("maxLength=400", PAGE)
+
     def test_plan_editor_reordering_preserves_prerequisite_order(self):
         if not shutil.which("node"):
             self.skipTest("Node.js is not installed")
@@ -173,13 +182,15 @@ class FakeNode {
 }
 global.document={createElement:(tag)=>new FakeNode(tag)};
 const tree=buildTaskPlanList([
-  {id:'inspect',content:'Inspect <source>',status:'pending'},
-  {id:'build',content:'Build safely',status:'pending',depends_on:['inspect']}
+  {id:'inspect',content:'Inspect <source>',status:'pending',acceptance_criteria:'Only current files are reviewed.'},
+  {id:'build',content:'Build safely',status:'pending',depends_on:['inspect'],evidence:'Build completed without errors.'}
 ]);
 function walk(node){return [node,...node.children.flatMap(walk)]}
 const nodes=walk(tree);
 if(!nodes.some(n=>n.className==='task-plan-deps waiting' && n.textContent==='Waiting for: Inspect <source>')) throw new Error('waiting dependency label missing');
 if(!nodes.some(n=>n.className==='task-plan-state pending')) throw new Error('explicit pending status missing');
+if(!nodes.some(n=>n.className==='task-plan-criteria' && n.textContent==='Check: Only current files are reviewed.')) throw new Error('acceptance criteria missing');
+if(!nodes.some(n=>n.className==='task-plan-evidence' && n.textContent.includes('Build completed without errors.'))) throw new Error('completion evidence missing');
 if(nodes.some(n=>n.innerHTML)) throw new Error('renderer used unsafe HTML');
 """
         subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
@@ -726,7 +737,8 @@ if(nodes.some(n=>n.innerHTML)) throw new Error('renderer used unsafe HTML');
         plan_job = self._wait_for_job(preview["id"])
         original = list(plan_job["plan"])
         steps = [
-            {"id": "inspect", "content": "Inspect the source tree", "depends_on": []},
+            {"id": "inspect", "content": "Inspect the source tree",
+             "acceptance_criteria": "Only the active project tree is examined.", "depends_on": []}, 
             {"id": "tests", "content": "Run the full test suite", "depends_on": ["inspect"]},
             {"id": "review", "content": "Review the diff", "depends_on": ["tests"]},
         ]
@@ -736,6 +748,8 @@ if(nodes.some(n=>n.innerHTML)) throw new Error('renderer used unsafe HTML');
         self.assertTrue(edited["ok"])
         self.assertEqual([item["content"] for item in edited["plan"]],
                          [item["content"] for item in steps])
+        self.assertEqual(edited["plan"][0]["acceptance_criteria"],
+                         "Only the active project tree is examined.")
         self.assertEqual(edited["plan"][1]["depends_on"], ["inspect"])
         self.assertEqual(edited["plan"][2]["depends_on"], ["tests"])
         self.assertTrue(all(item["status"] == "pending" for item in edited["plan"]))
@@ -748,7 +762,7 @@ if(nodes.some(n=>n.innerHTML)) throw new Error('renderer used unsafe HTML');
         self.assertEqual(execution["status"], "completed")
         self.assertIn('"approved_steps":["Inspect the source tree","Run the full test suite","Review the diff"]',
                       execution["response"])
-        self.assertIn('"id":"tests","content":"Run the full test suite","depends_on":["inspect"]',
+        self.assertIn('"id":"tests","content":"Run the full test suite","acceptance_criteria":"","depends_on":["inspect"]',
                       execution["response"])
         with patch("niji.webui.load_plan", return_value=edited["plan"]):
             with self.assertRaises(urllib.error.HTTPError) as rejected:
@@ -870,6 +884,20 @@ if(nodes.some(n=>n.innerHTML)) throw new Error('renderer used unsafe HTML');
             with self.assertRaises(urllib.error.HTTPError) as duplicate:
                 self.request(f"/api/jobs/{preview['id']}/approve-plan", {}, self.ui.token)
         self.assertEqual(duplicate.exception.code, 409)
+
+    def test_final_success_guard_revalidates_evidence_after_in_memory_mutation(self):
+        preview = json.loads(self.request("/api/chat", {
+            "message": "inspect project", "plan_only": True,
+        }, self.ui.token).read())
+        plan_job = self._wait_for_job(preview["id"])
+        self.agent.corrupt_completion_evidence = True
+        with patch("niji.webui.load_plan", return_value=plan_job["plan"]):
+            submitted = json.loads(self.request(
+                f"/api/jobs/{preview['id']}/approve-plan", {}, self.ui.token).read())
+        result = self._wait_for_job(submitted["id"])
+        self.assertEqual(result["status"], "error")
+        self.assertIn("invalid completion evidence", result["error"])
+        self.agent.corrupt_completion_evidence = False
 
     def test_approved_plan_cannot_report_success_when_steps_remain_incomplete(self):
         preview = json.loads(self.request("/api/chat", {

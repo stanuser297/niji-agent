@@ -15,6 +15,12 @@ def todo_read(ctx: dict) -> str:
             line += " (depends on: " + ", ".join(dependencies) + ")"
         if waiting:
             line += " (waiting for: " + ", ".join(waiting) + ")"
+        criteria = item.get("acceptance_criteria")
+        if isinstance(criteria, str) and criteria:
+            line += "\n  Check: " + criteria
+        evidence = item.get("evidence")
+        if isinstance(evidence, str) and evidence:
+            line += "\n  Reported evidence (agent-reported, not independently attested): " + evidence
         lines.append(line)
     return "\n".join(lines)
 
