@@ -19,6 +19,7 @@ from .config import (CONFIG_DIR, CONFIG_FILE, MCP_FILE, PRESETS, SESSION_DIR,
                      save_config, save_mcp_servers)
 from .model_catalog import (fetch_provider_models, provider_is_configured,
                             provider_names, resolve_catalog_provider)
+from .planning import load_plan
 from .terminal import OUTPUT_LOCK
 
 
@@ -1001,6 +1002,7 @@ def main():
         agent, provider = _build_agent(args, mcp_path)
         agent.resume(json.loads(f.read_text()))
         agent.session_id = sid
+        agent.todos = {"items": load_plan(sid)}
         Console().print(f"[green]Resumed session[/] {sid} ({len(agent.messages)} messages)")
         try:
             _interactive_chat(agent, provider, args.quiet)

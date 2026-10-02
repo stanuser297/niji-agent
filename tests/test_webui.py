@@ -87,6 +87,10 @@ class WebUITests(unittest.TestCase):
 
     def setUp(self):
         self.agent = FakeAgent()
+        self._plan_load_patch = patch("niji.webui.load_plan", return_value=[])
+        self._plan_save_patch = patch("niji.webui.save_plan")
+        self._plan_load_patch.start()
+        self._plan_save_patch.start()
         self.ui = NijiWebUI(self.agent, port=0)
         self.thread = threading.Thread(target=self.ui.httpd.serve_forever, daemon=True)
         self.thread.start()
@@ -95,6 +99,8 @@ class WebUITests(unittest.TestCase):
     def tearDown(self):
         self.ui.close()
         self.thread.join(timeout=2)
+        self._plan_load_patch.stop()
+        self._plan_save_patch.stop()
 
     def request(self, path, data=None, token=None):
         body = json.dumps(data).encode() if data is not None else None
@@ -203,6 +209,9 @@ class WebUITests(unittest.TestCase):
         self.assertIn('id="add-connector"', page)
         self.assertIn("renderJobEvents(j.events,placeholder)", page)
         self.assertIn("className='execution-steps'", page)
+        self.assertIn("function renderJobPlan(items", page)
+        self.assertIn("function renderSavedPlan(items", page)
+        self.assertIn("Approve & run plan", page)
         self.assertIn('id="auto-compact-toggle"', page)
         self.assertIn('id="compaction-threshold"', page)
         self.assertIn("413 emergency recovery is still enabled", page)
@@ -583,6 +592,9 @@ class WebUITests(unittest.TestCase):
         self.assertEqual(job["status"], "completed")
         self.assertTrue(job["plan_only"])
         self.assertTrue(self.agent.last_plan_only)
+        self.assertEqual([item["content"] for item in job["plan"]],
+                         ["Inspect the project", "Run the tests"])
+        self.assertIn("plan", json.loads(self.request("/api/state", token=self.ui.token).read()))
         self.assertIn("Inspect the project", job["response"])
 
     def test_session_tool_policy_can_be_changed(self):

@@ -24,6 +24,7 @@ from .config import (CONFIG_DIR, MEMORY_FILE, SESSION_DIR, PRESETS, load_config,
                     load_mcp_servers, resolve_provider, save_config, save_mcp_servers)
 from .model_catalog import (fetch_provider_models, provider_is_configured,
                             provider_names, resolve_catalog_provider)
+from .planning import extract_plan_steps, load_plan, normalize_plan, save_plan
 
 _MAX_BODY = 32_000
 _MAX_PROMPT = 20_000
@@ -92,8 +93,10 @@ class NijiWebUI:
         self._previous_activity_callback = getattr(agent, "activity_callback", None)
         self._previous_approval_callback = getattr(agent, "approval_callback", None)
         self._previous_stream_callback = getattr(agent, "stream_callback", None)
+        self._previous_plan_callback = getattr(agent, "plan_callback", None)
         agent.activity_callback = self._record_activity
         agent.stream_callback = self._record_stream_chunk
+        agent.plan_callback = self._record_plan
         if not hasattr(agent, "tool_policies"):
             agent.tool_policies = {}
         agent.approval = "ask" if getattr(agent, "approval", "ask") != "auto" else "auto"
@@ -241,7 +244,7 @@ class NijiWebUI:
                             result = {k: job.get(k) for k in (
                                 "id", "status", "response", "error", "streamed", "progress",
                                 "progress_detail", "activity", "events", "plan_only", "original_message",
-                                "cancel_requested")}
+                                "cancel_requested", "plan", "plan_label")}
                         else:
                             result = None
                     if result is None:
@@ -607,6 +610,24 @@ class NijiWebUI:
                     events.append(activity)
                     del events[:-120]
 
+    def _record_plan(self, items, active_form=""):
+        try:
+            plan = normalize_plan(items)
+            save_plan(self.agent.session_id, plan)
+        except (OSError, ValueError, TypeError):
+            return
+        callback = self._previous_plan_callback
+        if callback:
+            try:
+                callback(plan, active_form)
+            except Exception:
+                pass
+        with self._lock:
+            job = self._jobs.get(self._active_job) if self._active_job else None
+            if job and job.get("status") == "running":
+                job["plan"] = plan
+                job["plan_label"] = safe_terminal_text(str(active_form or ""))[:160]
+
     def _record_stream_chunk(self, chunk):
         safe = safe_terminal_text(str(chunk))
         if not safe:
@@ -809,7 +830,8 @@ class NijiWebUI:
                                  "streamed": "", "progress": "Thinking on it",
                                  "progress_detail": "Preparing the model request", "activity": None,
                                  "events": [], "plan_only": bool(plan_only), "original_message": message,
-                                 "cancel_requested": False, "created": time.time(),
+                                 "plan": list(getattr(self.agent, "todos", {}).get("items", [])),
+                                 "plan_label": "", "cancel_requested": False, "created": time.time(),
                                  "automation_id": automation_id or ""}
             self._job_thread = threading.Thread(
                 target=self._run_job, args=(job_id, message, plan_only),
@@ -888,6 +910,11 @@ class NijiWebUI:
             self.agent.plan_only = bool(plan_only)
             response = self.agent.chat(message)
             output = str(response or "[done]")[:40_000]
+            if plan_only:
+                proposed_steps = extract_plan_steps(output)
+                if proposed_steps:
+                    self.agent.todos = {"items": proposed_steps}
+                    self._record_plan(proposed_steps, "Plan ready for review")
             with self._lock:
                 job = self._jobs[job_id]
                 final_status = "cancelled" if job.get("cancel_requested") else "completed"
@@ -945,6 +972,7 @@ class NijiWebUI:
             self.agent.tool_usage = {}
             self.agent._request_tool_calls = 0
             self.agent.todos = {"items": []}
+            save_plan(self.agent.session_id, [])
             self.agent.file_change_history = []
             self.agent.started_at = time.monotonic()
             self.agent.activity = []
@@ -971,6 +999,7 @@ class NijiWebUI:
                 self.agent._save_session()
             self.agent.resume(messages)
             self.agent.session_id = session_id
+            self.agent.todos = {"items": load_plan(session_id)}
             self.agent.activity = []
             self.agent.usage = {"prompt_tokens": 0, "completion_tokens": 0, "turns": 0}
             self.agent.tool_usage = {}
@@ -1339,7 +1368,8 @@ class NijiWebUI:
             "model": getattr(self.agent, "model", provider_cfg.get("model", "unknown")),
             "session_id": getattr(self.agent, "session_id", "local"), "approval": getattr(self.agent, "approval", "ask"),
             "busy": busy, "active_job": active, "pending_approvals": pending,
-            "progress": progress, "file_changes": changes[-12:],
+            "progress": progress, "plan": list(getattr(self.agent, "todos", {}).get("items", [])),
+            "file_changes": changes[-12:], 
             "tool_policies": dict(getattr(self.agent, "tool_policies", {})),
             "tools": catalog,
             "skills": [{"name": name, "description": meta.get("description", "Reusable workflow")}
@@ -1413,5 +1443,7 @@ class NijiWebUI:
                 self.agent.activity_callback = self._previous_activity_callback
             if self.agent.stream_callback == self._record_stream_chunk:
                 self.agent.stream_callback = self._previous_stream_callback
+            if getattr(self.agent, "plan_callback", None) == self._record_plan:
+                self.agent.plan_callback = self._previous_plan_callback
         except Exception:
             pass

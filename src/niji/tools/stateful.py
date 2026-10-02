@@ -10,9 +10,23 @@ def todo_read(ctx: dict) -> str:
 
 
 def todo_write(todos: list, activeForm: str = "", ctx: dict = None) -> str:
-    if ctx is not None and "todos" in ctx:
-        ctx["todos"]["items"] = todos
-    return f"[ok] plan saved: {len(todos)} tasks ({activeForm or 'n/a'})"
+    from ..planning import normalize_plan, save_plan
+    plan = normalize_plan(todos)
+    ctx = ctx or {}
+    state = ctx.get("todos")
+    if isinstance(state, dict):
+        state["items"] = plan
+    agent = ctx.get("agent")
+    if agent is not None:
+        agent.todos = state if isinstance(state, dict) else {"items": plan}
+        save_plan(agent.session_id, plan)
+        callback = getattr(agent, "plan_callback", None)
+        if callback:
+            try:
+                callback(plan, activeForm)
+            except Exception:
+                pass
+    return f"[ok] plan saved: {len(plan)} steps ({activeForm or 'n/a'})"
 
 
 def task(prompt: str, role: str = "coder", ctx: dict = None) -> str:

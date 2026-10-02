@@ -94,10 +94,10 @@ CORE_SCHEMAS = [
             {"path": _s("string", "Document path (.pdf, .docx, .pptx, or .xlsx)"),
              "max_chars": _s("integer", "Maximum text characters (default 30000)"),
              "max_pages": _s("integer", "Maximum PDF pages (default 100)")}, ["path"]),
-    _schema("todo_write", "Plan and track a multi-step task. Overwrite the full list each time; mark exactly one task in_progress.",
-            {"todos": _s("array", "The task list", items={"type": "object", "properties": {
-                "content": _s("string", "What to do"), "status": _s("string", "pending | in_progress | completed", enum=["pending", "in_progress", "completed"]),
-                "activeForm": _s("string", "Short form shown while working")}, "required": ["content", "status"]}),
+    _schema("todo_write", "Create or update the current session's ordered plan. Replace the full list; keep at most one step in_progress and mark work completed only after verification.",
+            {"todos": _s("array", "The full task plan (up to 60 steps)", items={"type": "object", "properties": {
+                "content": _s("string", "A concrete, checkable step"), "status": _s("string", "pending | in_progress | completed | blocked", enum=["pending", "in_progress", "completed", "blocked"]),
+                "activeForm": _s("string", "Short current-action label")}, "required": ["content", "status"]}),
              "activeForm": _s("string", "Current work")}, ["todos"]),
     _schema("todo_read", "Read the current task plan.", {}, []),
     _schema("task", "Launch a bounded, non-recursive subagent with a scoped role. explore and plan are read-only; coder can use the normal safe tool set.",

@@ -112,6 +112,7 @@ class CompactionTests(unittest.TestCase):
         agent._chat()
         self.assertEqual(captured["tools"], [])
         self.assertIn("planning-only turn", captured["messages"][-1]["content"])
+        self.assertIn("numbered list", captured["messages"][-1]["content"])
         self.assertEqual(agent.messages[-1]["content"], "fix my bug")
         self.assertEqual(len(agent.messages), 3)
 

@@ -21,16 +21,17 @@ def _system_prompt():
 class BenignRequestGuidanceTests(unittest.TestCase):
     def test_hinglish_and_benign_requests_are_not_generically_refused(self):
         prompt = _system_prompt().lower()
-        self.assertIn("ordinary, benign requests", prompt)
-        self.assertIn("generic refusal", prompt)
+        self.assertIn("simple task", prompt)
+        self.assertIn("ordinary, allowed requests", prompt)
         self.assertIn("hinglish", prompt)
+        self.assertIn("ask only when ambiguity materially changes", prompt)
 
     def test_current_github_trending_lookup_uses_public_web_source(self):
         prompt = _system_prompt().lower()
         tools = TOOLS_SOURCE.read_text()
         self.assertIn("github trending", prompt)
         self.assertIn("web_fetch", prompt)
-        self.assertIn("never claim a live lookup", prompt)
+        self.assertIn("never imply a live check", prompt)
         self.assertIn('_schema("web_fetch"', tools)
 
 
