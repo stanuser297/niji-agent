@@ -291,6 +291,40 @@ class WebUITests(unittest.TestCase):
                 self.assertTrue(self.agent.last_plan_only)
                 self.assertIn("Review staged changes", [m["content"] for m in self.agent.messages])
 
+    def test_browser_files_results_view_controls_are_present(self):
+        page = urllib.request.urlopen(self.ui.url, timeout=3).read().decode()
+        for marker in ('data-view="files"', 'id="view-files"', 'id="artifact-list"',
+                       'id="artifact-refresh"', 'async function loadArtifacts',
+                       'async function downloadArtifact', 'Preview diff'):
+            self.assertIn(marker, page)
+
+    def test_artifact_list_and_download_are_workspace_scoped(self):
+        old_cwd = Path.cwd()
+        self.addCleanup(os.chdir, old_cwd)
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as outside:
+            root = Path(tmp)
+            os.chdir(root)
+            artifact = root / "report.txt"
+            artifact.write_text("generated result\n")
+            external = Path(outside) / "secret.txt"
+            external.write_text("outside workspace\n")
+            link = root / "external-link.txt"
+            link.symlink_to(external)
+            self.agent.file_change_history = [
+                {"path": str(artifact), "before": b"", "operation": "write"},
+                {"path": str(external), "before": b"", "operation": "write"},
+                {"path": str(link), "before": b"", "operation": "write"},
+            ]
+            listed = json.loads(self.request("/api/artifacts", token=self.ui.token).read())["artifacts"]
+            self.assertEqual(len(listed), 1)
+            self.assertEqual(listed[0]["path"], "report.txt")
+            response = self.request("/api/artifacts/0", token=self.ui.token)
+            self.assertEqual(response.read(), b"generated result\n")
+            self.assertIn("attachment", response.headers.get("Content-Disposition", ""))
+            with self.assertRaises(urllib.error.HTTPError) as unsafe:
+                self.request("/api/artifacts/1", token=self.ui.token)
+            self.assertEqual(unsafe.exception.code, 400)
+
     def test_model_state_does_not_expose_credentials(self):
         with (patch("niji.webui.load_config", return_value={"api_keys": {"test": "private-test-secret"}}),
               patch("niji.webui.provider_names", return_value=["test", "openai"]),

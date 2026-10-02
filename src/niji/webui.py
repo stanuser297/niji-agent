@@ -15,7 +15,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 from . import __version__
 from .compaction import estimate_tokens
@@ -114,7 +114,7 @@ class NijiWebUI:
                 # Do not log request paths; the one-time bearer token is in the UI URL.
                 return
 
-            def _send(self, status, body, content_type="application/json; charset=utf-8"):
+            def _send(self, status, body, content_type="application/json; charset=utf-8", extra_headers=None):
                 payload = body.encode("utf-8") if isinstance(body, str) else body
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
@@ -124,6 +124,8 @@ class NijiWebUI:
                 self.send_header("Referrer-Policy", "no-referrer")
                 self.send_header("X-Frame-Options", "DENY")
                 self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:")
+                for key, value in (extra_headers or {}).items():
+                    self.send_header(key, value)
                 self.end_headers()
                 self.wfile.write(payload)
 
@@ -199,6 +201,21 @@ class NijiWebUI:
                     self._json(200, {"profiles": ui._load_profiles(),
                                      "workspace": str(Path.cwd()),
                                      "active": getattr(ui.agent, "active_profile", "")}); return
+                if parsed.path == "/api/artifacts":
+                    self._json(200, {"artifacts": ui._artifact_list()}); return
+                if parsed.path.startswith("/api/artifacts/"):
+                    raw_index = parsed.path.rsplit("/", 1)[-1]
+                    if not raw_index.isdigit():
+                        self._json(400, {"error": "Invalid artifact index"}); return
+                    try:
+                        artifact_path = ui._artifact_path(int(raw_index))
+                        payload = artifact_path.read_bytes()
+                    except (ValueError, OSError) as exc:
+                        self._json(400, {"error": str(exc)[:250]}); return
+                    encoded_name = quote(artifact_path.name, safe="")
+                    self._send(200, payload, "application/octet-stream",
+                               {"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"})
+                    return
                 if parsed.path.startswith("/api/changes/"):
                     raw_index = parsed.path.rsplit("/", 1)[-1]
                     if not raw_index.isdigit():
@@ -1177,6 +1194,60 @@ class NijiWebUI:
         if len(api_key) >= 6:
             diff = diff.replace(api_key, "[redacted]")
         return safe_terminal_text(diff)[:12_000] or "(No text diff available.)"
+
+    def _artifact_path(self, index: int):
+        history = getattr(self.agent, "file_change_history", [])
+        if not isinstance(index, int) or index < 0 or index >= len(history):
+            raise ValueError("That file result is no longer available")
+        entry = history[index]
+        raw = entry.get("path") if isinstance(entry, dict) else None
+        if not isinstance(raw, str) or not raw or len(raw) > 4096:
+            raise ValueError("Invalid artifact path")
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        try:
+            root = Path.cwd().resolve(strict=True)
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(root)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError("Only existing files inside the active workspace can be downloaded") from exc
+        if path.is_symlink() or not resolved.is_file():
+            raise ValueError("Artifact is missing or unsafe")
+        if resolved.stat().st_size > 10_000_000:
+            raise ValueError("Artifact exceeds the 10 MB download limit")
+        return resolved
+
+    def _artifact_list(self):
+        history = getattr(self.agent, "file_change_history", [])
+        if not isinstance(history, list):
+            return []
+        result = []
+        try:
+            root = Path.cwd().resolve(strict=True)
+        except (OSError, RuntimeError):
+            return []
+        for index in range(len(history) - 1, max(-1, len(history) - 21), -1):
+            entry = history[index]
+            raw = entry.get("path") if isinstance(entry, dict) else None
+            if not isinstance(raw, str) or not raw or len(raw) > 4096:
+                continue
+            path = Path(raw).expanduser()
+            if not path.is_absolute():
+                path = root / path
+            try:
+                resolved = path.resolve(strict=True)
+                relative = resolved.relative_to(root)
+                stat = resolved.stat()
+                if path.is_symlink() or not resolved.is_file():
+                    continue
+            except (OSError, RuntimeError, ValueError):
+                continue
+            result.append({"index": index, "name": resolved.name,
+                           "path": relative.as_posix(),
+                           "operation": str(entry.get("operation", "change"))[:24],
+                           "size": stat.st_size, "downloadable": stat.st_size <= 10_000_000})
+        return result
 
     def _export_session(self, session_id: str):
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", session_id):
