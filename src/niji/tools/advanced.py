@@ -1,7 +1,9 @@
 """Additional practical Niji tools with bounded output and conservative defaults."""
 from __future__ import annotations
 
+import functools
 import html
+import http.client
 import ipaddress
 import json
 import os
@@ -31,28 +33,106 @@ MAX_OUTPUT = 12000
 MAX_ARCHIVE_BYTES = 100_000_000
 
 
-def _public_url(url: str) -> str | None:
-    """Validate URL syntax and reject localhost/private/link-local destinations."""
+def _public_endpoint(url: str):
+    """Validate a public HTTP endpoint and return its vetted, pinned socket addresses."""
     try:
         parsed = urllib.parse.urlsplit(url)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
-            return "only http:// and https:// URLs are allowed"
+            return "only http:// and https:// URLs are allowed", ()
         if parsed.username or parsed.password:
-            return "URLs containing embedded credentials are not allowed"
+            return "URLs containing embedded credentials are not allowed", ()
         host = parsed.hostname.rstrip(".").lower()
         if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
-            return "local/private hosts are not allowed"
+            return "local/private hosts are not allowed", ()
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        if not addresses:
+            return "URL host could not be safely resolved", ()
+        # Pin the exact DNS results used for validation. The HTTP connection below
+        # connects to these IPs directly instead of resolving the hostname again.
+        for item in addresses:
+            address = ipaddress.ip_address(item[4][0].split("%", 1)[0])
+            if not address.is_global:
+                return "local/private IP addresses are not allowed", ()
+        return None, tuple(addresses)
+    except (TypeError, ValueError, OSError, socket.gaierror):
+        return "URL host could not be safely resolved", ()
+
+
+def _public_url(url: str) -> str | None:
+    """Validate URL syntax, DNS results and reject local/private destinations."""
+    return _public_endpoint(url)[0]
+
+
+def _connect_vetted(addresses, timeout, source_address):
+    errors = []
+    for family, socktype, proto, _canonname, sockaddr in addresses:
+        sock = socket.socket(family, socktype, proto)
         try:
-            addresses = [ipaddress.ip_address(host)]
-        except ValueError:
-            addresses = [ipaddress.ip_address(item[4][0]) for item in
-                         socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80),
-                                            type=socket.SOCK_STREAM)]
-        if not addresses or any(not address.is_global for address in addresses):
-            return "local/private IP addresses are not allowed"
-    except (ValueError, OSError, socket.gaierror):
-        return "URL host could not be safely resolved"
-    return None
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as exc:
+            errors.append(exc)
+            sock.close()
+    if errors:
+        raise errors[-1]
+    raise OSError("no vetted public address was available")
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host, *args, pinned_addresses, **kwargs):
+        self._pinned_addresses = pinned_addresses
+        super().__init__(host, *args, **kwargs)
+
+    def connect(self):
+        if self._tunnel_host:
+            raise OSError("proxy tunnels are disabled for guarded public requests")
+        self.sock = _connect_vetted(self._pinned_addresses, self.timeout, self.source_address)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, *args, pinned_addresses, **kwargs):
+        self._pinned_addresses = pinned_addresses
+        super().__init__(host, *args, **kwargs)
+
+    def connect(self):
+        if self._tunnel_host:
+            raise OSError("proxy tunnels are disabled for guarded public requests")
+        raw = _connect_vetted(self._pinned_addresses, self.timeout, self.source_address)
+        try:
+            # Keep the original hostname for certificate validation and TLS SNI
+            # while the TCP socket is pinned to its already-vetted public IP.
+            self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+        except Exception:
+            raw.close()
+            raise
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    handler_order = 499
+
+    def http_open(self, req):
+        problem, addresses = _public_endpoint(req.full_url)
+        if problem:
+            raise urllib.error.URLError(problem)
+        connection = functools.partial(_PinnedHTTPConnection, pinned_addresses=addresses)
+        return self.do_open(connection, req)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    handler_order = 499
+
+    def https_open(self, req):
+        problem, addresses = _public_endpoint(req.full_url)
+        if problem:
+            raise urllib.error.URLError(problem)
+        connection = functools.partial(_PinnedHTTPSConnection, pinned_addresses=addresses)
+        return self.do_open(connection, req, context=self._context,
+                            check_hostname=self._check_hostname)
 
 
 class _PublicRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -65,7 +145,10 @@ class _PublicRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 def _public_opener():
-    return urllib.request.build_opener(_PublicRedirectHandler())
+    # Do not let environment proxies hide the actual destination from validation.
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                       _PublicRedirectHandler(),
+                                       _PinnedHTTPHandler(), _PinnedHTTPSHandler())
 
 
 def web_search(query: str, limit: int = 5) -> str:

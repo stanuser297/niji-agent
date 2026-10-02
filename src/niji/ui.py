@@ -33,7 +33,7 @@ def _tool_groups(agent):
         name = _tool_name(schema)
         if "__" in name:
             category = "MCP Connectors"
-        elif name in {"read_file", "write_file", "edit_file", "list_files", "grep", "glob"}:
+        elif name in {"read_file", "read_document", "write_file", "edit_file", "list_files", "grep", "glob"}:
             category = "Workspace & Files"
         elif name in {"web_fetch", "read_image"}:
             category = "Web & Media"

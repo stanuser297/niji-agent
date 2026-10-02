@@ -116,7 +116,8 @@ class ChatPromptTests(unittest.TestCase):
                 time.sleep(0.15)
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline and (
-                    b"RESULT=" not in output or b"TERMIOS_RESTORED=" not in output):
+                    b"RESULT=" not in output or (b"TERMIOS_RESTORED=True" not in output
+                                               and b"TERMIOS_RESTORED=False" not in output)):
                 ready, _, _ = select.select([fd], [], [], 0.2)
                 if ready:
                     try:

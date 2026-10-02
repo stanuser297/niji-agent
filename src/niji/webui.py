@@ -864,7 +864,7 @@ class NijiWebUI:
                     and not msg.get("tool_calls")
                     and not str(content).startswith("[Environment:")):
                 transcript.append({"role": msg["role"], "content": str(content)[:10_000]})
-        readonly = {"read_file", "list_files", "grep", "glob", "read_image", "file_search",
+        readonly = {"read_file", "list_files", "grep", "glob", "read_image", "read_document", "file_search",
                     "web_fetch", "web_search", "http_request", "database", "todo_read", "memory_read", "skill_read"}
         catalog = []
         for schema in getattr(self.agent, "tool_schemas", []):

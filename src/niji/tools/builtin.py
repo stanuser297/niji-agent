@@ -153,31 +153,20 @@ def glob(pattern: str, path: str = ".", ctx: dict = None) -> str:
 def web_fetch(url: str, max_chars: int = 15000) -> str:
     max_chars = max(500, min(int(max_chars), 15000))
     import html
-    import ipaddress
     import re
     import urllib.request
-    from urllib.parse import urlsplit
-    parsed = urlsplit(url)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        return "[error] only http:// and https:// URLs are allowed"
-    if parsed.username or parsed.password:
-        return "[error] URLs containing embedded credentials are not allowed"
-    host = parsed.hostname.lower()
-    if host == "localhost" or host.endswith((".localhost", ".local")):
-        return "[error] local/private hosts are not allowed"
-    try:
-        address = ipaddress.ip_address(host)
-        if not address.is_global:
-            return "[error] local/private IP addresses are not allowed"
-    except ValueError:
-        pass
+    from .advanced import _public_opener, _public_url
+
+    problem = _public_url(url)
+    if problem:
+        return f"[error] {problem}"
     req = urllib.request.Request(url, headers={"User-Agent": "niji-agent/2.0"})
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            raw = r.read(500_000)
-            ctype = r.headers.get("Content-Type", "")
-    except Exception as e:
-        return f"[error] fetch failed: {e}"
+        with _public_opener().open(req, timeout=30) as response:
+            raw = response.read(500_000)
+            ctype = response.headers.get("Content-Type", "")
+    except Exception as exc:
+        return f"[error] fetch failed: {exc.__class__.__name__}: {str(exc)[:240]}"
     text = raw.decode("utf-8", errors="replace")
     if "html" in ctype or "<html" in text[:1000].lower():
         text = re.sub(r"(?is)<(script|style).*?</\1>", " ", text)

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "niji-agent"
-version = "2.23.0"
-description = "niji-agent — provider-agnostic coding agent CLI with interactive setup, custom providers, diagnostics, MCP connectors, memory, planning and subagents"
+version = "2.24.0"
+description = "Niji Agent — provider-agnostic coding agent with MCP connectors, memory, planning, subagents, and document reading"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -18,6 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 browser = ["playwright>=1.45,<2"]
+documents = ["pypdf>=5,<7"]
 
 [project.scripts]
 niji = "niji.cli:main"

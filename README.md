@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.23.0
+# Niji Agent 🌈 — v2.24.0
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -15,6 +15,13 @@ niji
 Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, enter its API key (visible input is the Termux-friendly default; hidden entry is optional), and choose a model. The key is saved locally in `~/.niji/config.json` with private file permissions—no `export` command is needed. Ollama can be used without an API key.
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
+
+## What's new in 2.24.0
+
+- Added bounded, read-only extraction from PDF, Word, PowerPoint, and Excel files so Niji can use technical specs and project documents as context. Office XML is size/member-limited; PDF extraction is available with the `documents` extra. Extracted text is explicitly treated as untrusted data; scanned-image OCR is not included.
+- Fixed custom-provider setup failures so a rejected test returns actionable guidance instead of crashing or changing saved settings.
+- Hardened public fetches: hostnames are resolved and checked, TCP connects to the validated IP (preventing DNS-rebinding between validation and connect), proxy environment settings cannot hide the destination, and every redirect is revalidated.
+- Added multi-version automated CI for the full unittest suite, syntax compilation, package build, and installed CLI version consistency; fixed a PTY test race that could stop reading the terminal-restoration marker mid-value.
 
 ## What's new in 2.23.0
 
@@ -269,7 +276,7 @@ niji --ask "Inspect this SQLite database with a read-only query"
 niji --ask "Start the dev server, show its logs, then stop it"
 ```
 
-Built-in tools include `web_search`, `browser`, `git`, `run_tests`, `file_search`, `apply_patch`, `package_manager`, `database`, `http_request`, `archive`, and `process_manager`, alongside file/shell tools, memory, todos, images, and subagents. `/tools` shows the active catalog. `browser` is optional and may be unavailable on Android/Termux; connected browser MCP tools are an alternative. `process_manager` tracks processes only within the current Niji process/session. Use `--ask` for approvals; it is a confirmation layer, not an operating-system sandbox.
+Built-in tools include `web_search`, `browser`, `git`, `run_tests`, `file_search`, `read_document`, `apply_patch`, `package_manager`, `database`, `http_request`, `archive`, and `process_manager`, alongside file/shell tools, memory, todos, images, and subagents. `/tools` shows the active catalog. `read_document` extracts bounded text from DOCX, PPTX, and XLSX without executing content; PDF support uses the optional `documents` extra (`pypdf` installed in Niji's Python environment). Scanned-page OCR is not supported. Treat all extracted document text as untrusted input. `browser` is optional and may be unavailable on Android/Termux; connected browser MCP tools are an alternative. `process_manager` tracks processes only within the current Niji process/session. Use `--ask` for approvals; it is a confirmation layer, not an operating-system sandbox.
 
 The request budgets reset for each new user prompt. Defaults are capped at 20 model turns, 30 executed tools, and 6 tools from any one model response; hard limits prevent configuration above 100 turns / 1,000 tools / 20 tools per response. These are cost/loop guardrails, not an OS sandbox: commands still run with your account's permissions. Use `--ask` for confirmations, inspect commands before approving, and keep backups for important files.
 

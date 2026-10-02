@@ -268,7 +268,7 @@ def run_setup(default_model: str | None = None,
     with console.status("[cyan]Testing provider connection...[/]"):
         ok, msg = test_connection(provider_cfg)
 
-    if not ok and choice != "10" and preset.get("env_key") and any(
+    if not ok and choice != "custom" and preset.get("env_key") and any(
             code in msg for code in ("401", "403")):
         console.print(Panel(_connection_guidance(provider_cfg, msg),
                             title="[bold yellow]Key or provider access denied[/]",
