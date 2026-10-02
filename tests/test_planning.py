@@ -57,6 +57,15 @@ class PlanningTests(unittest.TestCase):
                          ["Audit current behavior", "Implement and test the planner"])
         self.assertTrue(all(step["status"] == "pending" for step in steps))
 
+    def test_numbered_prose_is_not_mistaken_for_a_plan(self):
+        self.assertEqual(extract_plan_steps(
+            """My notes from the review:
+1. This is a quoted item, not a proposed plan
+2. Nor is this one"""), [])
+        self.assertEqual([step["content"] for step in extract_plan_steps(
+            """1. Inspect the project
+2. Run tests""")], ["Inspect the project", "Run tests"])
+
     def test_todo_write_persists_and_notifies_live_plan_callback(self):
         with tempfile.TemporaryDirectory() as tmp:
             agent = SimpleNamespace(session_id="session-abc", plan_callback=None,
@@ -75,3 +84,4 @@ class PlanningTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

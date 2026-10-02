@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.29.0
+# Niji Agent 🌈 — v2.30.0
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -15,6 +15,13 @@ niji
 Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, enter its API key (visible input is the Termux-friendly default; hidden entry is optional), and choose a model. The key is saved locally in `~/.niji/config.json` with private file permissions—no `export` command is needed. Ollama can be used without an API key.
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
+
+## What's new in 2.30.0
+
+- Plan approval now starts from the server-side saved plan only after confirming it is complete, unchanged, and belongs to the active thread; stale, cross-thread, and duplicate approvals are rejected.
+- Workspace status and Files & Results access now follow the agent's active workspace, not an unrelated process working directory.
+- Plan preview parsing no longer treats numbered prose embedded after unrelated text as an executable plan.
+- Added regressions for plan approval binding, stale/duplicate/cross-thread rejection, active-workspace artifact scope, and plan parsing.
 
 ## What's new in 2.29.0
 

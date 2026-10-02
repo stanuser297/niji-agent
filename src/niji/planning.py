@@ -103,20 +103,29 @@ def extract_plan_steps(markdown: str) -> list[dict[str, str]]:
     markdown = markdown.replace("\\n", "\n")
     lines = markdown.splitlines()
     started = False
+    first_nonempty_seen = False
     items = []
     for line in lines:
         stripped = line.strip()
+        if not stripped:
+            continue
         heading = stripped.lstrip("#* ").rstrip(":* ").lower()
         is_section = (stripped.startswith("#") or
                       (stripped.endswith(":") and len(stripped) < 100))
         if not started and ("step" in heading or heading in {"plan", "approach", "proposed plan"}):
             started = True
+            first_nonempty_seen = True
             continue
+        match = re.match(r"^(?:\d{1,2}[.)]|[-*])\s+(.+)$", stripped)
+        # Accept a standalone ordered/bulleted plan only when it starts the response.
+        # Do not mistake a numbered list embedded in unrelated prose for a task plan.
+        if not started and not first_nonempty_seen and match:
+            started = True
+        first_nonempty_seen = True
         if started and is_section and any(
                 key in heading for key in ("risk", "assumption", "verification", "check", "note")):
             break
-        match = re.match(r"^(?:\d{1,2}[.)]|[-*])\s+(.+)$", stripped)
-        if match and (started or re.match(r"^\d{1,2}[.)]", stripped)):
+        if match and started:
             value = re.sub(r"\s+", " ", match.group(1)).strip()
             if value:
                 items.append({"id": f"step-{len(items) + 1}", "content": value,

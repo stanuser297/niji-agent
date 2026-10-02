@@ -212,6 +212,8 @@ class WebUITests(unittest.TestCase):
         self.assertIn("function renderJobPlan(items", page)
         self.assertIn("function renderSavedPlan(items", page)
         self.assertIn("Approve & run plan", page)
+        self.assertIn("/approve-plan", page)
+        self.assertNotIn("Execute the approved numbered plan above", page)
         self.assertIn('id="auto-compact-toggle"', page)
         self.assertIn('id="compaction-threshold"', page)
         self.assertIn("413 emergency recovery is still enabled", page)
@@ -333,6 +335,32 @@ class WebUITests(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as unsafe:
                 self.request("/api/artifacts/1", token=self.ui.token)
             self.assertEqual(unsafe.exception.code, 400)
+
+    def test_workspace_state_and_artifacts_follow_agent_workspace_not_process_cwd(self):
+        old_cwd = Path.cwd()
+        self.addCleanup(os.chdir, old_cwd)
+        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as cwd_dir:
+            workspace = Path(workspace_dir).resolve()
+            process_cwd = Path(cwd_dir).resolve()
+            (workspace / "AGENTS.md").write_text("workspace instructions")
+            artifact = workspace / "result.txt"
+            artifact.write_text("from active workspace")
+            decoy = process_cwd / "decoy.txt"
+            decoy.write_text("not active")
+            self.agent.workspace = workspace
+            self.agent.file_change_history = [
+                {"path": str(artifact), "operation": "write"},
+                {"path": str(decoy), "operation": "write"},
+            ]
+            os.chdir(process_cwd)
+            state = json.loads(self.request("/api/state", token=self.ui.token).read())
+            self.assertEqual(state["runtime"]["workspace_path"], str(workspace))
+            self.assertTrue(state["runtime"]["project_guidance"])
+            listed = json.loads(self.request("/api/artifacts", token=self.ui.token).read())["artifacts"]
+            self.assertEqual([(item["name"], item["path"]) for item in listed],
+                             [("result.txt", "result.txt")])
+            response = self.request(f"/api/artifacts/{listed[0]['index']}", token=self.ui.token)
+            self.assertEqual(response.read(), b"from active workspace")
 
     def test_model_state_does_not_expose_credentials(self):
         with (patch("niji.webui.load_config", return_value={"api_keys": {"test": "private-test-secret"}}),
@@ -596,6 +624,57 @@ class WebUITests(unittest.TestCase):
                          ["Inspect the project", "Run the tests"])
         self.assertIn("plan", json.loads(self.request("/api/state", token=self.ui.token).read()))
         self.assertIn("Inspect the project", job["response"])
+
+    def _wait_for_job(self, job_id, timeout=3):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            job = json.loads(self.request("/api/jobs/" + job_id, token=self.ui.token).read())
+            if job["status"] != "running":
+                return job
+            time.sleep(0.03)
+        self.fail("job did not finish before timeout")
+
+    def test_approved_plan_runs_from_unchanged_server_saved_plan_once(self):
+        preview = json.loads(self.request("/api/chat", {
+            "message": "inspect project", "plan_only": True,
+        }, self.ui.token).read())
+        plan_job = self._wait_for_job(preview["id"])
+        self.assertEqual(plan_job["status"], "completed")
+        saved_plan = list(plan_job["plan"])
+        with patch("niji.webui.load_plan", return_value=saved_plan):
+            submitted = json.loads(self.request(
+                f"/api/jobs/{preview['id']}/approve-plan", {}, self.ui.token).read())
+        self.assertTrue(submitted["ok"])
+        run_job = self._wait_for_job(submitted["id"])
+        self.assertEqual(run_job["status"], "completed")
+        self.assertFalse(run_job["plan_only"])
+        self.assertIn('"original_request":"inspect project"', run_job["response"])
+        self.assertIn('"approved_steps":["Inspect the project","Run the tests"]', run_job["response"])
+        updated_source = json.loads(self.request(
+            f"/api/jobs/{preview['id']}", token=self.ui.token).read())
+        self.assertTrue(updated_source["plan_approved"])
+        with patch("niji.webui.load_plan", return_value=saved_plan):
+            with self.assertRaises(urllib.error.HTTPError) as duplicate:
+                self.request(f"/api/jobs/{preview['id']}/approve-plan", {}, self.ui.token)
+        self.assertEqual(duplicate.exception.code, 409)
+
+    def test_plan_approval_rejects_stale_saved_plan_and_wrong_thread(self):
+        preview = json.loads(self.request("/api/chat", {
+            "message": "inspect project", "plan_only": True,
+        }, self.ui.token).read())
+        plan_job = self._wait_for_job(preview["id"])
+        with patch("niji.webui.load_plan", return_value=[{"content": "changed after preview"}]):
+            with self.assertRaises(urllib.error.HTTPError) as stale:
+                self.request(f"/api/jobs/{preview['id']}/approve-plan", {}, self.ui.token)
+        self.assertEqual(stale.exception.code, 409)
+        self.assertFalse(json.loads(self.request(
+            f"/api/jobs/{preview['id']}", token=self.ui.token).read())["plan_approved"])
+        saved_plan = list(plan_job["plan"])
+        self.agent.session_id = "another-thread"
+        with patch("niji.webui.load_plan", return_value=saved_plan):
+            with self.assertRaises(urllib.error.HTTPError) as wrong_thread:
+                self.request(f"/api/jobs/{preview['id']}/approve-plan", {}, self.ui.token)
+        self.assertEqual(wrong_thread.exception.code, 409)
 
     def test_session_tool_policy_can_be_changed(self):
         state = json.loads(self.request("/api/tool-policy", {"name": "read_file", "policy": "block"}, self.ui.token).read())
