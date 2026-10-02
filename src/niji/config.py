@@ -5,6 +5,7 @@ from pathlib import Path
 CONFIG_DIR = Path.home() / ".niji"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 SESSION_DIR = CONFIG_DIR / "sessions"
+RUNS_DIR = CONFIG_DIR / "runs"
 MCP_FILE = CONFIG_DIR / "mcp.json"
 MEMORY_FILE = CONFIG_DIR / "MEMORY.md"
 

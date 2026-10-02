@@ -154,6 +154,9 @@ class WebUITests(unittest.TestCase):
 
     def setUp(self):
         self.agent = FakeAgent()
+        self._run_temp = tempfile.TemporaryDirectory()
+        self._runs_patch = patch("niji.webui.RUNS_DIR", Path(self._run_temp.name) / "runs")
+        self._runs_patch.start()
         self._plan_load_patch = patch("niji.webui.load_plan", return_value=[])
         self._plan_save_patch = patch("niji.webui.save_plan")
         self._stateful_plan_save_patch = patch("niji.planning.save_plan")
@@ -171,6 +174,8 @@ class WebUITests(unittest.TestCase):
         self._plan_load_patch.stop()
         self._plan_save_patch.stop()
         self._stateful_plan_save_patch.stop()
+        self._runs_patch.stop()
+        self._run_temp.cleanup()
 
     def request(self, path, data=None, token=None):
         body = json.dumps(data).encode() if data is not None else None
@@ -404,6 +409,15 @@ if(nodes.some(n=>n.innerHTML)) throw new Error('renderer used unsafe HTML');
                        'id="fetch-models"', 'id="apply-model"', 'pin-thread',
                        'async function fetchModelCatalog', 'async function applyModel',
                        'async function togglePinnedSession', 'PINNED'):
+            self.assertIn(marker, page)
+
+    def test_browser_run_history_and_manual_retry_controls_are_present(self):
+        page = urllib.request.urlopen(self.ui.url, timeout=3).read().decode()
+        for marker in ('data-view="history"', 'id="view-history"', 'id="run-history-list"',
+                       'id="run-detail"', 'async function loadRunHistory',
+                       'async function loadRunDetail', 'async function retrySelectedRun',
+                       "Previous actions may run again", "never replayed automatically",
+                       "Partial output:", "Origin context"):
             self.assertIn(marker, page)
 
     def test_browser_automation_manager_controls_are_present(self):
@@ -653,12 +667,153 @@ if(nodes.some(n=>n.innerHTML)) throw new Error('renderer used unsafe HTML');
         self.assertEqual(job["streamed"], "Hello from Niji: hello")
         self.assertTrue(job["plan_only"] is False)
 
+    def test_run_history_is_durable_redacted_and_requires_explicit_retry(self):
+        started = json.loads(self.request(
+            "/api/chat", {"message": "show private-test-secret safely"}, self.ui.token).read())
+        completed = self.wait_for_job_status(started["id"], "completed")
+        history = json.loads(self.request("/api/jobs", token=self.ui.token).read())
+        self.assertEqual(history["jobs"][0]["id"], started["id"])
+        self.assertEqual(history["jobs"][0]["status"], "completed")
+        self.assertNotIn("private-test-secret", json.dumps(history))
+        record_path = self.ui._run_store.directory / f"{started['id']}.json"
+        persisted_text = record_path.read_text(encoding="utf-8")
+        self.assertNotIn("private-test-secret", persisted_text)
+        self.assertIn("[redacted]", persisted_text)
+        detail = json.loads(self.request(f"/api/jobs/{started['id']}", token=self.ui.token).read())
+        self.assertEqual(detail["status"], "completed")
+        self.assertNotIn("private-test-secret", json.dumps(detail))
+        # The server—not only the browser—requires acknowledgement before repeating side effects.
+        with self.assertRaises(urllib.error.HTTPError) as repeat_not_confirmed:
+            self.request(f"/api/jobs/{started['id']}/retry", {}, self.ui.token)
+        self.assertEqual(repeat_not_confirmed.exception.code, 409)
+        self.assertTrue(json.loads(repeat_not_confirmed.exception.read())["repeat_confirmation_required"])
+        retried = json.loads(self.request(
+            f"/api/jobs/{started['id']}/retry", {"confirm_repeat": True}, self.ui.token).read())
+        self.assertEqual(retried["source_job_id"], started["id"])
+        second = self.wait_for_job_status(retried["id"], "completed")
+        self.assertNotIn("private-test-secret", second["original_message"])
+
+    def test_restart_marks_runs_interrupted_without_automatic_replay(self):
+        self.ui._run_store.save({"id": "crash-run", "status": "running",
+                                 "original_message": "perform a safe task",
+                                 "created": time.time(), "events": []})
+        restored_agent = FakeAgent()
+        restored = NijiWebUI(restored_agent, port=0)
+        restored_thread = threading.Thread(target=restored.httpd.serve_forever, daemon=True)
+        restored_thread.start()
+        try:
+            self.assertFalse(restored._busy)
+            self.assertIsNone(restored._active_job)
+            self.assertEqual(restored_agent.usage["turns"], 0)
+            detail = json.loads(urllib.request.urlopen(
+                urllib.request.Request(
+                    f"http://127.0.0.1:{restored.httpd.server_port}/api/jobs/crash-run",
+                    headers={"X-Niji-Token": restored.token}), timeout=3).read())
+            self.assertEqual(detail["status"], "interrupted")
+            self.assertIn("No action was replayed", detail["progress_detail"])
+            history = restored._job_history()
+            self.assertIn("crash-run", [item["id"] for item in history["jobs"]])
+        finally:
+            restored.close()
+            restored_thread.join(timeout=2)
+
+    def test_failed_run_history_preserves_partial_output_and_error(self):
+        def partial_then_fail(message):
+            self.agent.stream_callback("partial result before failure")
+            raise RuntimeError("provider interrupted")
+        with patch.object(self.agent, "chat", side_effect=partial_then_fail):
+            status, started = self.ui._start_job("collect partial result")
+        self.assertEqual(status, 202)
+        job = self.wait_for_job_status(started["id"], "error")
+        self.assertEqual(job["streamed"], "partial result before failure")
+        self.assertIn("provider interrupted", job["error"])
+        persisted = json.loads((self.ui._run_store.directory / f"{started['id']}.json").read_text())
+        self.assertEqual(persisted["streamed"], "partial result before failure")
+        self.assertIn("provider interrupted", persisted["error"])
+
+    def test_retry_requires_explicit_confirmation_when_session_changed(self):
+        started = json.loads(self.request(
+            "/api/chat", {"message": "safe context retry"}, self.ui.token).read())
+        self.wait_for_job_status(started["id"], "completed")
+        self.agent.session_id = "another-thread"
+        with self.assertRaises(urllib.error.HTTPError) as needs_confirmation:
+            self.request(f"/api/jobs/{started['id']}/retry", {}, self.ui.token)
+        self.assertEqual(needs_confirmation.exception.code, 409)
+        challenge = json.loads(needs_confirmation.exception.read())
+        self.assertTrue(challenge["context_confirmation_required"])
+        # A context switch invalidates the first token; approval must bind to the new target.
+        self.agent.session_id = "third-thread"
+        with self.assertRaises(urllib.error.HTTPError) as stale_confirmation:
+            self.request(f"/api/jobs/{started['id']}/retry", {
+                "confirm_repeat": True,
+                "context_confirmation_token": challenge["context_confirmation_token"],
+            }, self.ui.token)
+        fresh = json.loads(stale_confirmation.exception.read())
+        self.assertEqual(fresh["context_summary"]["target_session_id"], "third-thread")
+        self.assertIsNone(self.ui._active_job)
+        # The old token remains revoked even if its original target context returns.
+        self.agent.session_id = "another-thread"
+        with self.assertRaises(urllib.error.HTTPError) as replayed_old:
+            self.request(f"/api/jobs/{started['id']}/retry", {
+                "confirm_repeat": True,
+                "context_confirmation_token": challenge["context_confirmation_token"],
+            }, self.ui.token)
+        replacement = json.loads(replayed_old.exception.read())
+        self.assertEqual(replacement["context_summary"]["target_session_id"], "another-thread")
+        retried = json.loads(self.request(
+            f"/api/jobs/{started['id']}/retry", {
+                "confirm_repeat": True,
+                "context_confirmation_token": replacement["context_confirmation_token"],
+            }, self.ui.token).read())
+        self.assertEqual(retried["source_job_id"], started["id"])
+        self.assertEqual(self.wait_for_job_status(retried["id"], "completed")["session_id"], "another-thread")
+
+    def test_retry_with_missing_origin_metadata_requires_exact_context_confirmation(self):
+        run_id = "legacy-context"
+        with self.ui._lock:
+            self.ui._jobs[run_id] = {
+                "id": run_id, "status": "completed", "original_message": "inspect safely",
+                "workspace_path": "/private-test-secret/project", "plan_only": False,
+            }
+        with self.assertRaises(urllib.error.HTTPError) as needs_confirmation:
+            self.request(f"/api/jobs/{run_id}/retry", {"confirm_repeat": True}, self.ui.token)
+        self.assertEqual(needs_confirmation.exception.code, 409)
+        challenge = json.loads(needs_confirmation.exception.read())
+        summary = challenge["context_summary"]
+        self.assertEqual(summary["source_session_id"], "unknown")
+        self.assertEqual(summary["source_workspace"], "/[redacted]/project")
+        self.assertNotIn("private-test-secret", json.dumps(challenge))
+        self.assertIsNone(self.ui._active_job)
+        body = {"confirm_repeat": True,
+                "context_confirmation_token": challenge["context_confirmation_token"]}
+        retried = json.loads(self.request(f"/api/jobs/{run_id}/retry", body, self.ui.token).read())
+        self.assertEqual(retried["source_job_id"], run_id)
+        self.assertEqual(self.wait_for_job_status(retried["id"], "completed")["original_message"],
+                         "inspect safely")
+
+    def test_run_cache_evicts_oldest_timestamp_not_newest_restored_entry(self):
+        with self.ui._lock:
+            self.ui._jobs.clear()
+            # Startup loads newest-first; a newly finished run is newest of all.
+            for index in reversed(range(100)):
+                run_id = f"restored-{index}"
+                self.ui._jobs[run_id] = {"id": run_id, "status": "completed",
+                                         "created": index, "updated": index}
+            self.ui._jobs["new-run"] = {"id": "new-run", "status": "completed",
+                                         "created": 100, "updated": 100}
+            self.ui._prune_job_cache_locked()
+        self.assertEqual(len(self.ui._jobs), 100)
+        self.assertIn("new-run", self.ui._jobs)
+        self.assertIn("restored-99", self.ui._jobs)
+        self.assertNotIn("restored-0", self.ui._jobs)
+
     def test_mcp_secrets_are_redacted_from_streams_jobs_errors_and_exports(self):
         secret = "stdio-output-secret"
         self.agent.mcp_clients = [type("MCP", (), {"_secrets": [secret]})()]
 
         def chat_with_secret(message):
-            self.agent.stream_callback("streamed " + secret)
+            self.agent.stream_callback("streamed stdio-output-")
+            self.agent.stream_callback("secret")
             self.agent.messages.append({"role": "assistant", "content": "transcript " + secret})
             return "final " + secret
 
@@ -668,6 +823,10 @@ if(nodes.some(n=>n.innerHTML)) throw new Error('renderer used unsafe HTML');
         job = self.wait_for_job_status(started["id"], "completed")
         self.assertEqual(job["streamed"], "streamed [redacted]")
         self.assertEqual(job["response"], "final [redacted]")
+        persisted = (self.ui._run_store.directory / f"{started['id']}.json").read_text(encoding="utf-8")
+        self.assertNotIn(secret, persisted)
+        # Removing a connector must not make credentials already observed by this UI visible again.
+        self.agent.mcp_clients = []
         state = json.loads(self.request("/api/state", token=self.ui.token).read())
         serialized_state = json.dumps(state)
         self.assertNotIn(secret, serialized_state)
@@ -758,6 +917,28 @@ if(nodes.some(n=>n.innerHTML)) throw new Error('renderer used unsafe HTML');
         self.assertEqual(job["status"], "cancelled")
         self.assertEqual(job["response"], "partial output")
         self.assertEqual(job["error"], "")
+
+    def test_unfinished_secret_prefix_is_not_exposed_in_live_state(self):
+        entered = threading.Event()
+        release = threading.Event()
+        def emit_partial_secret(message):
+            self.agent.stream_callback("visible text private-test-")
+            entered.set()
+            release.wait(2)
+            return "done"
+        with patch.object(self.agent, "chat", side_effect=emit_partial_secret):
+            status, started = self.ui._start_job("wait for stream redaction")
+            self.assertEqual(status, 202)
+            self.assertTrue(entered.wait(2))
+            state = json.loads(self.request("/api/state", token=self.ui.token).read())
+            serialized = json.dumps(state)
+            self.assertNotIn("private-test-", serialized)
+            self.assertNotIn("_stream_redaction_pending", serialized)
+            self.assertIn("visible text", state["active_job"]["streamed"])
+            release.set()
+            completed = self.wait_for_job_status(started["id"], "completed")
+            self.assertEqual(completed["response"], "done")
+            self.assertEqual(completed["streamed"], "visible text [redacted]")
 
     def test_streamed_text_is_available_before_completion_and_stop_is_cooperative(self):
         self.agent.pause_stream = True
@@ -1321,7 +1502,7 @@ if(nodes.some(n=>n.innerHTML)) throw new Error('renderer used unsafe HTML');
             submitted = json.loads(self.request(
                 f"/api/jobs/{preview['id']}/approve-plan", {}, self.ui.token).read())
         self.assertTrue(submitted["ok"])
-        run_job = self._wait_for_job(submitted["id"])
+        run_job = self._wait_for_job(submitted["id"], timeout=5)
         self.assertEqual(run_job["status"], "completed")
         self.assertFalse(run_job["plan_only"])
         self.assertEqual(self.agent.approved_plan_seen, saved_plan)
@@ -1411,6 +1592,29 @@ if(nodes.some(n=>n.innerHTML)) throw new Error('renderer used unsafe HTML');
                 self.assertIn("Use unittest", self.agent.messages[0]["content"])
         os.chdir(old_cwd)
 
+    def test_workspace_profile_and_artifact_paths_redact_known_secrets(self):
+        secret = "private-test-secret"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / secret / "project"
+            root.mkdir(parents=True)
+            artifact = root / f"{secret}-notes.txt"
+            artifact.write_text("private artifact content")
+            self.agent.workspace = root
+            self.agent.file_change_history = [{
+                "path": str(artifact), "before": b"old\\n", "operation": "write",
+            }]
+            state = json.loads(self.request("/api/state", token=self.ui.token).read())
+            self.assertNotIn(secret, json.dumps(state))
+            with patch.object(self.ui, "_load_profiles", return_value=[
+                    {"name": "profile", "path": str(root)}]):
+                profiles = json.loads(self.request("/api/profiles", token=self.ui.token).read())
+            self.assertNotIn(secret, json.dumps(profiles))
+            artifacts_response = self.request("/api/artifacts", token=self.ui.token)
+            artifacts = json.loads(artifacts_response.read())
+            self.assertNotIn(secret, json.dumps(artifacts))
+            download = self.request("/api/artifacts/0", token=self.ui.token)
+            self.assertNotIn(secret, download.headers.get("Content-Disposition", ""))
+
     def test_file_diff_endpoint_returns_unified_diff_and_redacts_provider_key(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "notes.txt"
@@ -1424,6 +1628,27 @@ if(nodes.some(n=>n.innerHTML)) throw new Error('renderer used unsafe HTML');
             self.assertIn("-old value", result["diff"])
             self.assertIn("+new [redacted] value", result["diff"])
             self.assertNotIn("private-test-secret", result["diff"])
+
+    def test_file_diff_redacts_rotated_provider_and_removed_mcp_secrets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provider_secret = "rotated-provider-secret"
+            mcp_secret = "removed-mcp-secret"
+            path = Path(tmp) / "notes.txt"
+            path.write_text(f"provider={provider_secret} mcp={mcp_secret} short=xk\\n")
+            self.agent.provider_cfg["api_key"] = provider_secret
+            self.agent.mcp_clients = [type("MCP", (), {"_secrets": [mcp_secret, "xk"]})()]
+            self.ui._known_secrets()
+            self.agent.provider_cfg["api_key"] = "new-provider-secret"
+            self.agent.mcp_clients = []
+            self.agent.file_change_history = [{
+                "path": str(path), "before": b"old values\\n",
+                "after_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "operation": "write",
+            }]
+            diff = self.ui._change_diff(0)
+            for secret in (provider_secret, mcp_secret, "xk"):
+                self.assertNotIn(secret, diff)
+            self.assertGreaterEqual(diff.count("[redacted]"), 3)
 
     def test_file_diff_endpoint_rejects_symlink_and_bad_index(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1464,6 +1689,61 @@ if(nodes.some(n=>n.innerHTML)) throw new Error('renderer used unsafe HTML');
             self.assertEqual((Path(tmp) / "MEMORY.md").read_text(), "Use pytest.")
             self.request("/api/memory", {"action": "clear", "content": ""}, self.ui.token).read()
             self.assertFalse((Path(tmp) / "MEMORY.md").exists())
+
+    def test_agent_mutation_gate_blocks_jobs_and_state_mutation_endpoints(self):
+        self.ui._jobs["gate-plan"] = {
+            "id": "gate-plan", "status": "completed", "plan_only": True,
+            "plan_approved": False, "plan": [], "session_id": self.agent.session_id,
+        }
+        with self.ui._agent_mutation("test state"):
+            status, result = self.ui._start_job("must wait for state update")
+            self.assertEqual(status, 409)
+            self.assertIn("workspace operation", result["error"])
+            self.assertEqual(self.ui._edit_plan("gate-plan", ["new plan step"])[0], 409)
+            self.assertFalse(self.ui._dispatch_due_automations())
+            for path, body in (
+                ("/api/compact", {}),
+                ("/api/undo", {}),
+                ("/api/profiles", {"action": "delete", "name": "missing"}),
+                ("/api/session/new", {}),
+                ("/api/settings", {"approval": "auto"}),
+                ("/api/tool-policy", {"name": "read_file", "policy": "block"}),
+                ("/api/memory", {"action": "replace", "content": "memory update"}),
+            ):
+                with self.subTest(path=path), self.assertRaises(urllib.error.HTTPError) as rejected:
+                    self.request(path, body, self.ui.token)
+                self.assertEqual(rejected.exception.code, 409)
+        for flag in ("_connector_mutating", "_model_mutating"):
+            with self.ui._lock:
+                setattr(self.ui, flag, True)
+            try:
+                with self.subTest(flag=flag), self.assertRaises(urllib.error.HTTPError) as rejected:
+                    self.request("/api/tool-policy", {"name": "read_file", "policy": "block"}, self.ui.token)
+                self.assertEqual(rejected.exception.code, 409)
+            finally:
+                with self.ui._lock:
+                    setattr(self.ui, flag, False)
+        status, started = self.ui._start_job("starts after state update")
+        self.assertEqual(status, 202)
+        self.assertEqual(self.wait_for_job_status(started["id"], "completed")["status"], "completed")
+
+    def test_session_switch_waits_for_model_change(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("niji.webui.SESSION_DIR", Path(tmp)):
+            (Path(tmp) / "saved.json").write_text(json.dumps([
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "saved"},
+            ]))
+            with self.ui._lock:
+                self.ui._model_mutating = True
+            try:
+                with self.assertRaises(RuntimeError):
+                    self.ui._new_session()
+                with self.assertRaises(RuntimeError):
+                    self.ui._open_session("saved")
+            finally:
+                with self.ui._lock:
+                    self.ui._model_mutating = False
+        self.assertEqual(self.agent.session_id, "test-session")
 
     def test_browser_context_compaction_keeps_the_latest_request(self):
         self.agent.messages.extend([

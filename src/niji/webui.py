@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import difflib
 import hmac
+from contextlib import contextmanager
 import json
 import os
 import platform
@@ -20,8 +21,9 @@ from urllib.parse import parse_qs, quote, urlsplit
 from . import __version__
 from .compaction import estimate_tokens
 from .terminal import safe_terminal_text
-from .config import (CONFIG_DIR, MEMORY_FILE, SESSION_DIR, PRESETS, load_config,
+from .config import (CONFIG_DIR, MEMORY_FILE, SESSION_DIR, RUNS_DIR, PRESETS, load_config,
                     load_mcp_servers, resolve_provider, save_config, save_mcp_servers)
+from .run_store import RunStore
 from .model_catalog import (fetch_provider_models, provider_is_configured,
                             provider_names, resolve_catalog_provider)
 from .planning import (extract_plan_steps, load_plan, normalize_plan, save_plan,
@@ -84,11 +86,24 @@ class NijiWebUI:
         self.port = int(port)
         self.token = secrets.token_urlsafe(32)
         self._lock = threading.RLock()
+        self._secret_lock = threading.RLock()
+        self._redaction_secrets = set()
         self._busy = False
+        self._agent_mutating = False
         self._connector_mutating = False
         self._model_mutating = False
         self._active_job = None
         self._jobs = {}
+        self._retry_confirmations = {}
+        self._run_store = None
+        self._run_store_error = ""
+        self._known_secrets()
+        try:
+            self._run_store = RunStore(RUNS_DIR)
+            for record in self._run_store.load_recent():
+                self._jobs[record["id"]] = record
+        except (OSError, ValueError) as exc:
+            self._run_store_error = f"Run history unavailable ({type(exc).__name__})"
         self._approvals = {}
         self._job_thread = None
         self._previous_activity_callback = getattr(agent, "activity_callback", None)
@@ -134,7 +149,8 @@ class NijiWebUI:
                 self.wfile.write(payload)
 
             def _json(self, status, data):
-                self._send(status, json.dumps(data, ensure_ascii=False), "application/json; charset=utf-8")
+                safe = ui._redact_visible(ui._redact_credential_fields(data))
+                self._send(status, json.dumps(safe, ensure_ascii=False), "application/json; charset=utf-8")
 
             def _host_ok(self):
                 try:
@@ -202,11 +218,13 @@ class NijiWebUI:
                 if parsed.path == "/api/automations":
                     self._json(200, ui._automation_state()); return
                 if parsed.path == "/api/profiles":
-                    self._json(200, {"profiles": ui._load_profiles(),
+                    self._json(200, ui._redact_visible({"profiles": ui._load_profiles(),
                                      "workspace": str(ui._active_workspace()),
-                                     "active": getattr(ui.agent, "active_profile", "")}); return
+                                     "active": getattr(ui.agent, "active_profile", "")})); return
                 if parsed.path == "/api/artifacts":
-                    self._json(200, {"artifacts": ui._artifact_list()}); return
+                    self._json(200, ui._redact_visible({"artifacts": ui._artifact_list()})); return
+                if parsed.path == "/api/jobs":
+                    self._json(200, ui._job_history()); return
                 if parsed.path.startswith("/api/artifacts/"):
                     raw_index = parsed.path.rsplit("/", 1)[-1]
                     if not raw_index.isdigit():
@@ -215,8 +233,8 @@ class NijiWebUI:
                         artifact_path = ui._artifact_path(int(raw_index))
                         payload = artifact_path.read_bytes()
                     except (ValueError, OSError) as exc:
-                        self._json(400, {"error": str(exc)[:250]}); return
-                    encoded_name = quote(artifact_path.name, safe="")
+                        self._json(400, {"error": ui._redact_known_secrets(str(exc))[:250]}); return
+                    encoded_name = quote(ui._redact_known_secrets(artifact_path.name), safe="")
                     self._send(200, payload, "application/octet-stream",
                                {"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"})
                     return
@@ -242,10 +260,8 @@ class NijiWebUI:
                     with ui._lock:
                         job = ui._jobs.get(job_id)
                         if job:
-                            result = ui._redact_visible({k: job.get(k) for k in (
-                                "id", "status", "response", "error", "streamed", "progress",
-                                "progress_detail", "activity", "events", "plan_only", "original_message",
-                                "cancel_requested", "plan", "plan_label", "session_id", "plan_approved")})
+                            result = ui._redact_visible(
+                                ui._redact_credential_fields(ui._job_fields(job)))
                         else:
                             result = None
                     if result is None:
@@ -264,6 +280,21 @@ class NijiWebUI:
                 data = self._read_json()
                 if data is None:
                     self._json(400, {"error": "Invalid or oversized JSON body"}); return
+                if parsed.path.startswith("/api/jobs/") and parsed.path.endswith("/retry"):
+                    parts = parsed.path.strip("/").split("/")
+                    retry_fields = {"confirm_repeat", "context_confirmation_token"}
+                    confirmations_valid = isinstance(data, dict) and not (set(data) - retry_fields)
+                    if confirmations_valid:
+                        if "confirm_repeat" in data and not isinstance(data["confirm_repeat"], bool):
+                            confirmations_valid = False
+                        token = data.get("context_confirmation_token")
+                        if token is not None and (not isinstance(token, str) or len(token) > 128):
+                            confirmations_valid = False
+                    if len(parts) != 4 or not confirmations_valid:
+                        self._json(400, {"error": "Retry confirmations are malformed or contain unsupported fields"}); return
+                    status, result = ui._retry_job(parts[2], **{
+                        field: data[field] for field in retry_fields if field in data})
+                    self._json(status, result); return
                 if parsed.path.startswith("/api/jobs/") and parsed.path.endswith("/edit-plan"):
                     parts = parsed.path.strip("/").split("/")
                     if len(parts) != 4 or not isinstance(data, dict) or set(data) != {"steps"}:
@@ -304,6 +335,7 @@ class NijiWebUI:
                         for approval in ui._approvals.values():
                             approval["approved"] = False
                             approval["event"].set()
+                        ui._persist_job(job_id, force=True)
                     self._json(202, {"ok": True, "message": "Stop requested; an in-flight provider or tool call may finish first"}); return
                 if parsed.path == "/api/models":
                     status, result = ui._model_action(data)
@@ -315,8 +347,9 @@ class NijiWebUI:
                     action = data.get("action") if isinstance(data, dict) else None
                     name = data.get("name", "") if isinstance(data, dict) else ""
                     with ui._lock:
-                        if ui._busy or ui._connector_mutating:
-                            self._json(409, {"error": "Wait until the current request or connector operation finishes"}); return
+                        if (ui._busy or ui._agent_mutating or ui._connector_mutating
+                                or ui._model_mutating):
+                            self._json(409, {"error": "Wait until the current request or setup operation finishes"}); return
                         ui._connector_mutating = True
                     try:
                         servers = load_mcp_servers()
@@ -354,6 +387,7 @@ class NijiWebUI:
                                 self._json(500, {"error": f"Could not securely save connector configuration ({type(exc).__name__})"}); return
                             with ui._lock:
                                 ui.agent.mcp_clients = [*getattr(ui.agent, "mcp_clients", []), client]
+                                ui._known_secrets()
                             record = getattr(ui.agent, "_record_activity", None)
                             if callable(record):
                                 record("CONNECTOR", f"Connected {name} · {len(client.tools)} tool(s) available")
@@ -361,6 +395,9 @@ class NijiWebUI:
                         if action == "remove":
                             if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,32}", name) or name not in servers:
                                 self._json(404, {"error": "Choose a configured connector to remove"}); return
+                            # Preserve the removed connector's secrets in the redaction cache
+                            # before dropping the only in-memory client reference.
+                            ui._known_secrets()
                             del servers[name]
                             try:
                                 save_mcp_servers(servers)
@@ -395,114 +432,124 @@ class NijiWebUI:
                     if name not in known or policy not in ("ask", "allow", "block", "default"):
                         self._json(400, {"error": "Choose an available tool and policy ask, allow, block, or default"}); return
                     with ui._lock:
-                        if ui._busy:
-                            self._json(409, {"error": "Wait until the current request finishes before changing tool policy"}); return
+                        if (ui._busy or ui._agent_mutating or ui._connector_mutating
+                                or ui._model_mutating):
+                            self._json(409, {"error": "Wait until the current request or setup operation finishes before changing tool policy"}); return
                         if policy == "default":
                             ui.agent.tool_policies.pop(name, None)
                         else:
                             ui.agent.tool_policies[name] = policy
                     self._json(200, ui._state()); return
                 if parsed.path == "/api/undo":
-                    with ui._lock:
-                        if ui._busy:
-                            self._json(409, {"error": "Wait until the current request finishes before undoing a file change"}); return
-                    undo = getattr(ui.agent, "undo_last_file_change", None)
-                    if not callable(undo):
-                        self._json(400, {"error": "Undo is unavailable for this agent"}); return
-                    result = undo()
+                    try:
+                        with ui._agent_mutation("file changes"):
+                            undo = getattr(ui.agent, "undo_last_file_change", None)
+                            if not callable(undo):
+                                self._json(400, {"error": "Undo is unavailable for this agent"}); return
+                            result = undo()
+                    except RuntimeError as exc:
+                        self._json(409, {"error": str(exc)}); return
                     self._json(200 if result.get("ok") else 409, {"result": result, **ui._state()}); return
                 if parsed.path == "/api/compact":
-                    with ui._lock:
-                        if ui._busy:
-                            self._json(409, {"error": "Wait for the current task to finish before compacting context"}); return
-                    before = estimate_tokens(getattr(ui.agent, "messages", []))
-                    from .compaction import maybe_compact
-                    messages, changed = maybe_compact(ui.agent.messages, ui.agent.client,
-                                                       ui.agent.model, force=True, summarize=False)
-                    if changed:
-                        ui.agent.messages = messages
-                        if hasattr(ui.agent, "_save_session"):
-                            ui.agent._save_session()
+                    try:
+                        with ui._agent_mutation("conversation context"):
+                            before = estimate_tokens(getattr(ui.agent, "messages", []))
+                            from .compaction import maybe_compact
+                            messages, changed = maybe_compact(ui.agent.messages, ui.agent.client,
+                                                               ui.agent.model, force=True, summarize=False)
+                            if changed:
+                                ui.agent.messages = messages
+                                if hasattr(ui.agent, "_save_session"):
+                                    ui.agent._save_session()
+                            after = estimate_tokens(ui.agent.messages)
+                    except RuntimeError as exc:
+                        self._json(409, {"error": str(exc)}); return
                     self._json(200, {"changed": changed, "before": before,
-                                     "after": estimate_tokens(ui.agent.messages), **ui._state()}); return
+                                     "after": after, **ui._state()}); return
                 if parsed.path == "/api/profiles":
                     action = data.get("action") if isinstance(data, dict) else None
                     name = data.get("name", "") if isinstance(data, dict) else ""
                     if not isinstance(name, str) or len(name.strip()) > 60:
                         self._json(400, {"error": "Profile name must be at most 60 characters"}); return
                     name = name.strip()
-                    with ui._lock:
-                        if ui._busy:
-                            self._json(409, {"error": "Wait until the current task finishes before changing workspace profiles"}); return
-                    profiles = ui._load_profiles()
-                    if action == "save":
-                        raw_path = data.get("path", "") if isinstance(data, dict) else ""
-                        if not name or not isinstance(raw_path, str) or not raw_path.strip():
-                            self._json(400, {"error": "Provide a profile name and an existing directory path"}); return
-                        try:
-                            root = Path(raw_path).expanduser().resolve(strict=True)
-                            if not root.is_dir():
-                                raise ValueError("The selected workspace is not a directory")
-                        except (OSError, RuntimeError, ValueError) as exc:
-                            self._json(400, {"error": f"Invalid workspace directory: {exc}"[:250]}); return
-                        existing = next((p for p in profiles if p["name"].casefold() == name.casefold()), None)
-                        if existing:
-                            existing["path"] = str(root)
-                        else:
-                            if len(profiles) >= 20:
-                                self._json(400, {"error": "Keep at most 20 saved workspace profiles"}); return
-                            profiles.append({"name": name, "path": str(root)})
-                        try:
-                            ui._save_profiles(profiles)
-                        except OSError as exc:
-                            self._json(400, {"error": f"Could not save workspace profiles: {exc}"[:250]}); return
-                    elif action == "activate":
-                        profile = next((p for p in profiles if p["name"] == name), None)
-                        if not profile:
-                            self._json(404, {"error": "Unknown workspace profile"}); return
-                        try:
-                            root = Path(profile["path"]).resolve(strict=True)
-                            if not root.is_dir():
-                                raise ValueError("Workspace directory is missing")
-                            os.chdir(root)
-                            ui._refresh_workspace_guidance(root)
-                            ui.agent.active_profile = profile["name"]
-                            ui.agent._record_activity("PROJECT", f"Workspace profile activated: {profile['name']}")
-                        except (OSError, RuntimeError, ValueError) as exc:
-                            self._json(400, {"error": f"Could not activate workspace profile: {exc}"[:250]}); return
-                    elif action == "delete":
-                        profiles = [p for p in profiles if p["name"] != name]
-                        try:
-                            ui._save_profiles(profiles)
-                        except OSError as exc:
-                            self._json(400, {"error": f"Could not save workspace profiles: {exc}"[:250]}); return
-                        if getattr(ui.agent, "active_profile", "") == name:
-                            ui.agent.active_profile = ""
-                    else:
-                        self._json(400, {"error": "Profile action must be save, activate, or delete"}); return
-                    self._json(200, {"profiles": ui._load_profiles(),
-                                     "workspace": str(ui._active_workspace()),
-                                     "active": getattr(ui.agent, "active_profile", "")}); return
+                    try:
+                        with ui._agent_mutation("workspace profiles"):
+                            profiles = ui._load_profiles()
+                            if action == "save":
+                                raw_path = data.get("path", "") if isinstance(data, dict) else ""
+                                if not name or not isinstance(raw_path, str) or not raw_path.strip():
+                                    self._json(400, {"error": "Provide a profile name and an existing directory path"}); return
+                                try:
+                                    root = Path(raw_path).expanduser().resolve(strict=True)
+                                    if not root.is_dir():
+                                        raise ValueError("The selected workspace is not a directory")
+                                except (OSError, RuntimeError, ValueError) as exc:
+                                    self._json(400, {"error": f"Invalid workspace directory: {ui._redact_known_secrets(str(exc))}"[:250]}); return
+                                existing = next((p for p in profiles if p["name"].casefold() == name.casefold()), None)
+                                if existing:
+                                    existing["path"] = str(root)
+                                else:
+                                    if len(profiles) >= 20:
+                                        self._json(400, {"error": "Keep at most 20 saved workspace profiles"}); return
+                                    profiles.append({"name": name, "path": str(root)})
+                                try:
+                                    ui._save_profiles(profiles)
+                                except OSError as exc:
+                                    self._json(400, {"error": f"Could not save workspace profiles: {ui._redact_known_secrets(str(exc))}"[:250]}); return
+                            elif action == "activate":
+                                profile = next((p for p in profiles if p["name"] == name), None)
+                                if not profile:
+                                    self._json(404, {"error": "Unknown workspace profile"}); return
+                                try:
+                                    root = Path(profile["path"]).resolve(strict=True)
+                                    if not root.is_dir():
+                                        raise ValueError("Workspace directory is missing")
+                                    os.chdir(root)
+                                    ui._refresh_workspace_guidance(root)
+                                    ui.agent.active_profile = profile["name"]
+                                    ui.agent._record_activity("PROJECT", f"Workspace profile activated: {profile['name']}")
+                                except (OSError, RuntimeError, ValueError) as exc:
+                                    self._json(400, {"error": f"Could not activate workspace profile: {ui._redact_known_secrets(str(exc))}"[:250]}); return
+                            elif action == "delete":
+                                profiles = [p for p in profiles if p["name"] != name]
+                                try:
+                                    ui._save_profiles(profiles)
+                                except OSError as exc:
+                                    self._json(400, {"error": f"Could not save workspace profiles: {ui._redact_known_secrets(str(exc))}"[:250]}); return
+                                if getattr(ui.agent, "active_profile", "") == name:
+                                    ui.agent.active_profile = ""
+                            else:
+                                self._json(400, {"error": "Profile action must be save, activate, or delete"}); return
+                            payload = ui._redact_visible({"profiles": ui._load_profiles(),
+                                          "workspace": str(ui._active_workspace()),
+                                          "active": getattr(ui.agent, "active_profile", "")})
+                    except RuntimeError as exc:
+                        self._json(409, {"error": str(exc)}); return
+                    self._json(200, payload); return
                 if parsed.path == "/api/memory":
                     action = data.get("action") if isinstance(data, dict) else None
                     content = data.get("content", "") if isinstance(data, dict) else ""
                     if action not in ("replace", "clear") or not isinstance(content, str) or len(content) > 20_000:
                         self._json(400, {"error": "Memory update must be replace/clear with at most 20,000 characters"}); return
                     try:
-                        if MEMORY_FILE.is_symlink():
-                            self._json(400, {"error": "Refusing to replace a symlink memory file"}); return
-                        MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                        MEMORY_FILE.parent.chmod(0o700)
-                        if action == "clear":
-                            MEMORY_FILE.unlink(missing_ok=True)
-                        else:
-                            temp = MEMORY_FILE.with_suffix(".md.tmp")
-                            temp.write_text(content)
-                            temp.chmod(0o600)
-                            temp.replace(MEMORY_FILE)
-                            MEMORY_FILE.chmod(0o600)
-                    except OSError as exc:
-                        self._json(400, {"error": f"Could not update local memory: {exc}"[:250]}); return
+                        with ui._agent_mutation("agent memory"):
+                            try:
+                                if MEMORY_FILE.is_symlink():
+                                    self._json(400, {"error": "Refusing to replace a symlink memory file"}); return
+                                MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                                MEMORY_FILE.parent.chmod(0o700)
+                                if action == "clear":
+                                    MEMORY_FILE.unlink(missing_ok=True)
+                                else:
+                                    temp = MEMORY_FILE.with_suffix(".md.tmp")
+                                    temp.write_text(content)
+                                    temp.chmod(0o600)
+                                    temp.replace(MEMORY_FILE)
+                                    MEMORY_FILE.chmod(0o600)
+                            except OSError as exc:
+                                self._json(400, {"error": f"Could not update local memory: {exc}"[:250]}); return
+                    except RuntimeError as exc:
+                        self._json(409, {"error": str(exc)}); return
                     self._json(200, {"ok": True, "content": "" if action == "clear" else content}); return
                 if parsed.path == "/api/chat":
                     message = data.get("message") if isinstance(data, dict) else None
@@ -550,7 +597,7 @@ class NijiWebUI:
                     if approval_mode is None and auto_compact is None and threshold is None:
                         self._json(400, {"error": "No supported setting was provided"}); return
                     with ui._lock:
-                        if ui._busy or ui._connector_mutating or ui._model_mutating:
+                        if ui._busy or ui._agent_mutating or ui._connector_mutating or ui._model_mutating:
                             self._json(409, {"error": "Wait until the current request or setup operation finishes before changing settings"}); return
                         config = load_config()
                         if auto_compact is not None:
@@ -591,10 +638,16 @@ class NijiWebUI:
         return f"http://{host}:{self.httpd.server_port}/?token={self.token}"
 
     def _known_secrets(self):
-        secrets = [str(getattr(self.agent, "provider_cfg", {}).get("api_key", ""))]
+        """Remember observed credentials for this UI lifetime so rotation cannot unmask old logs."""
+        secrets = []
+        provider_cfg = getattr(self.agent, "provider_cfg", {})
+        if isinstance(provider_cfg, dict):
+            secrets.append(str(provider_cfg.get("api_key", "")))
         for client in getattr(self.agent, "mcp_clients", []):
             secrets.extend(str(item) for item in getattr(client, "_secrets", []) if item)
-        return sorted({secret for secret in secrets if secret}, key=len, reverse=True)
+        with self._secret_lock:
+            self._redaction_secrets.update(secret for secret in secrets if secret)
+            return sorted(self._redaction_secrets, key=len, reverse=True)
 
     def _redact_known_secrets(self, value):
         text = safe_terminal_text(str(value or ""))
@@ -618,11 +671,149 @@ class NijiWebUI:
     def _safe_event_message(self, value):
         return self._redact_known_secrets(value)[:400]
 
+    def _persist_job(self, job_id, *, force=False):
+        """Persist a redacted snapshot; storage failure must never crash an active run."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            store = self._run_store
+            if job is None or store is None:
+                return False
+            now = time.monotonic()
+            if not force and now - float(job.get("_persisted_at", 0)) < 0.5:
+                return False
+            job["updated"] = time.time()
+            safe_job = self._redact_visible(self._redact_credential_fields(job))
+            try:
+                store.save(safe_job)
+                job["_persisted_at"] = now
+                self._run_store_error = ""
+                return True
+            except Exception as exc:
+                self._run_store_error = f"Run history could not be saved ({type(exc).__name__})"
+                return False
+
+    @staticmethod
+    def _job_fields(job):
+        fields = ("id", "status", "response", "error", "streamed", "progress",
+                  "progress_detail", "activity", "events", "plan_only", "original_message",
+                  "cancel_requested", "plan", "plan_label", "session_id", "plan_approved",
+                  "created", "updated", "automation_id", "execution_job_id", "workspace_path")
+        return {key: job.get(key) for key in fields}
+
+    def _prune_job_cache_locked(self):
+        """Keep the most recently updated 100 jobs, independent of insertion order."""
+        if len(self._jobs) <= 100:
+            return
+        newest = sorted(self._jobs.values(),
+                        key=lambda item: float(item.get("updated", item.get("created", 0)) or 0),
+                        reverse=True)[:100]
+        self._jobs = {item["id"]: item for item in newest}
+
+    def _job_history(self):
+        with self._lock:
+            records = sorted((dict(job) for job in self._jobs.values()),
+                             key=lambda item: float(item.get("updated", item.get("created", 0)) or 0),
+                             reverse=True)[:100]
+            warning = self._run_store_error
+        jobs = []
+        for record in records:
+            safe = self._redact_visible(self._redact_credential_fields(self._job_fields(record)))
+            summary = {key: safe.get(key) for key in (
+                "id", "status", "progress", "progress_detail", "original_message", "response",
+                "error", "plan_only", "session_id", "created", "updated", "plan_approved",
+                "execution_job_id", "automation_id", "workspace_path")}
+            for key, limit in (("progress", 100), ("progress_detail", 240),
+                               ("original_message", 220), ("response", 400),
+                               ("error", 300), ("session_id", 100), ("workspace_path", 240)):
+                if isinstance(summary.get(key), str):
+                    summary[key] = summary[key][:limit]
+            jobs.append(summary)
+        return {"jobs": jobs, "storage_warning": warning}
+
+    def _retry_context_challenge(self, job_id, context):
+        now = time.monotonic()
+        # A new challenge for the same run invalidates every prior token, including
+        # one that was presented after its bound context changed.
+        self._retry_confirmations = {
+            key: value for key, value in self._retry_confirmations.items()
+            if value.get("expires", 0) > now and value.get("job_id") != job_id
+        }
+        while len(self._retry_confirmations) >= 100:
+            self._retry_confirmations.pop(next(iter(self._retry_confirmations)))
+        token = secrets.token_urlsafe(32)
+        self._retry_confirmations[token] = {
+            "job_id": job_id,
+            "context": tuple(context[key] for key in (
+                "source_session_id", "target_session_id", "source_workspace", "target_workspace")),
+            "expires": now + 300,
+        }
+        safe_context = {
+            key: (self._redact_known_secrets(str(value)) if value is not None else "unknown")
+            for key, value in context.items()
+        }
+        return 409, {
+            "error": "Run context differs or is unknown; review the displayed origin and confirm the current context",
+            "context_confirmation_required": True,
+            "context_confirmation_token": token,
+            "context_summary": safe_context,
+        }
+
+    def _retry_job(self, job_id, *, confirm_repeat=False, context_confirmation_token=None):
+        with self._lock:
+            source = self._jobs.get(job_id)
+            if source is None:
+                return 404, {"error": "Run history was not found or has expired"}
+            if source.get("status") in ("running", "pause_requested", "paused"):
+                return 409, {"error": "An active run cannot be retried"}
+            message = source.get("original_message")
+            if not isinstance(message, str) or not message.strip() or len(message) > _MAX_PROMPT:
+                return 409, {"error": "This run has no safe, retryable prompt"}
+            source_session = source.get("session_id")
+            current_session = getattr(self.agent, "session_id", None)
+            source_workspace = source.get("workspace_path")
+            current_workspace = str(self._active_workspace())
+            context_known = all((source_session, current_session, source_workspace, current_workspace))
+            context_changed = (not context_known or source_session != current_session
+                               or source_workspace != current_workspace)
+            context = {
+                "source_session_id": source_session,
+                "target_session_id": current_session,
+                "source_workspace": source_workspace,
+                "target_workspace": current_workspace,
+            }
+            confirmation = None
+            if context_changed:
+                confirmation = self._retry_confirmations.get(context_confirmation_token)
+                expected_context = tuple(context[key] for key in (
+                    "source_session_id", "target_session_id", "source_workspace", "target_workspace"))
+                if (not isinstance(context_confirmation_token, str) or confirmation is None
+                        or confirmation.get("job_id") != job_id
+                        or confirmation.get("expires", 0) <= time.monotonic()
+                        or confirmation.get("context") != expected_context):
+                    return self._retry_context_challenge(job_id, context)
+            if not source.get("plan_only") and not confirm_repeat:
+                return 409, {"error": "Retrying this run may repeat external side effects; explicitly confirm repeating its actions",
+                             "repeat_confirmation_required": True}
+            status, result = self._start_job(message, plan_only=bool(source.get("plan_only")))
+            if status == 202:
+                if confirmation is not None:
+                    self._retry_confirmations.pop(context_confirmation_token, None)
+                self._retry_confirmations = {
+                    key: value for key, value in self._retry_confirmations.items()
+                    if value.get("job_id") != job_id
+                }
+                return status, {"ok": True, "id": result["id"], "source_job_id": job_id}
+            return status, result
+
     @classmethod
     def _redact_credential_fields(cls, value):
         if isinstance(value, dict):
             def sensitive_name(key):
                 compact = re.sub(r"[^a-z0-9]", "", str(key).lower())
+                # This short-lived server-issued capability is intentionally returned to
+                # the authorized browser so it can confirm the exact retry context.
+                if compact == "contextconfirmationtoken":
+                    return False
                 return (compact in {"key", "apikey", "accesskey", "privatekey", "secretkey",
                                     "auth", "authorization", "bearer", "secret", "password",
                                     "passwd", "credential", "credentials", "connectionid",
@@ -683,6 +874,7 @@ class NijiWebUI:
                     events = job.setdefault("events", [])
                     events.append(activity)
                     del events[:-120]
+                self._persist_job(job["id"])
 
     def _record_plan(self, items, active_form=""):
         try:
@@ -701,18 +893,53 @@ class NijiWebUI:
             if job and job.get("status") in ("running", "pause_requested", "paused"):
                 job["plan"] = plan
                 job["plan_label"] = safe_terminal_text(str(active_form or ""))[:160]
+                self._persist_job(job["id"])
+
+    def _flush_stream_redaction_locked(self, job):
+        pending = job.pop("_stream_redaction_pending", "")
+        if pending:
+            cutoff = len(pending)
+            for secret in self._known_secrets():
+                upper = min(len(secret) - 1, len(pending))
+                for size in range(upper, 0, -1):
+                    if pending.endswith(secret[:size]):
+                        cutoff = min(cutoff, len(pending) - size)
+                        break
+            safe = self._redact_known_secrets(pending[:cutoff])
+            if cutoff < len(pending):
+                safe += "[redacted]"
+            job["streamed"] = (job.get("streamed", "") + safe)[-40_000:]
 
     def _record_stream_chunk(self, chunk):
-        safe = self._redact_known_secrets(chunk)
-        if not safe:
+        text = str(chunk or "")
+        if not text:
             return
+        secrets = self._known_secrets()
         with self._lock:
             job = self._jobs.get(self._active_job) if self._active_job else None
             if job and job.get("status") in ("running", "pause_requested", "paused"):
-                job["streamed"] = (job.get("streamed", "") + safe)[-40_000:]
-                if job.get("status") == "running":
-                    job["progress"] = "Writing the response"
-                    job["progress_detail"] = "Live response · streaming"
+                combined = job.get("_stream_redaction_pending", "") + text
+                # Buffer only a suffix that could still become a secret, preserving
+                # real-time streaming for ordinary text while detecting split secrets.
+                cutoff = len(combined)
+                for secret in secrets:
+                    upper = min(len(secret) - 1, len(combined))
+                    for size in range(upper, 0, -1):
+                        if combined.endswith(secret[:size]):
+                            cutoff = min(cutoff, len(combined) - size)
+                            break
+                    # For short secrets, wait for the trailing word-boundary character
+                    # instead of treating a chunk boundary as end-of-text.
+                    if len(secret) < 4 and combined.endswith(secret):
+                        cutoff = min(cutoff, len(combined) - len(secret))
+                safe = self._redact_known_secrets(combined[:cutoff])
+                job["_stream_redaction_pending"] = combined[cutoff:]
+                if safe:
+                    job["streamed"] = (job.get("streamed", "") + safe)[-40_000:]
+                    if job.get("status") == "running":
+                        job["progress"] = "Writing the response"
+                        job["progress_detail"] = "Live response · streaming"
+                    self._persist_job(job["id"])
 
     def _request_approval(self, tool_name, args):
         approval_id = uuid.uuid4().hex
@@ -965,8 +1192,8 @@ class NijiWebUI:
             session_id = source.get("session_id")
             if not isinstance(session_id, str) or session_id != getattr(self.agent, "session_id", None):
                 return 409, {"error": "This plan belongs to a different thread; reopen that thread to edit it"}
-            if self._busy:
-                return 409, {"error": "Wait for the current task to finish before editing this plan"}
+            if self._busy or self._agent_mutating or self._connector_mutating or self._model_mutating:
+                return 409, {"error": "Wait for the current task or setup operation to finish before editing this plan"}
             try:
                 current = normalize_plan(source.get("plan", []))
             except (TypeError, ValueError):
@@ -979,6 +1206,7 @@ class NijiWebUI:
                 return 500, {"error": f"Could not save the edited plan: {str(exc)[:200]}"}
             source["plan"] = plan
             self.agent.todos = {"items": plan}
+            self._persist_job(source_job_id, force=True)
             callback = self._previous_plan_callback
         if callback:
             try:
@@ -1014,6 +1242,7 @@ class NijiWebUI:
                 return status, result
             source["plan_approved"] = True
             source["execution_job_id"] = result["id"]
+            self._persist_job(source_job_id, force=True)
             return 202, {"ok": True, "id": result["id"], "source_job_id": source_job_id}
 
     def _pause_job(self, job_id: str):
@@ -1029,6 +1258,7 @@ class NijiWebUI:
                 return 409, {"error": "The task is already stopping"}
             job.update(status="pause_requested", progress="Pausing safely",
                        progress_detail="Waiting for the current model or tool action to finish")
+            self._persist_job(job_id, force=True)
             return 202, {"ok": True, "id": job_id, "status": "pause_requested"}
 
     def _resume_job(self, job_id: str):
@@ -1044,7 +1274,21 @@ class NijiWebUI:
                 return 409, {"error": "The task is already stopping"}
             job.update(status="running", progress="Resuming task",
                        progress_detail="Continuing from the next safe action boundary")
+            self._persist_job(job_id, force=True)
             return 202, {"ok": True, "id": job_id, "status": "running"}
+
+    @contextmanager
+    def _agent_mutation(self, label="agent state"):
+        """Reserve agent/workspace state so requests and automations cannot race it."""
+        with self._lock:
+            if self._busy or self._agent_mutating or self._connector_mutating or self._model_mutating:
+                raise RuntimeError(f"Wait for the current task or setup operation before changing {label}")
+            self._agent_mutating = True
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._agent_mutating = False
 
     def _start_job(self, message, plan_only=False, automation_id=None, approved_plan=None):
         try:
@@ -1054,8 +1298,8 @@ class NijiWebUI:
         except (TypeError, ValueError) as exc:
             return 400, {"error": f"Invalid approved plan: {str(exc)[:200]}"}
         with self._lock:
-            if self._connector_mutating or self._model_mutating:
-                return 409, {"error": "Wait for model or connector setup to finish before starting a request"}
+            if self._connector_mutating or self._model_mutating or self._agent_mutating:
+                return 409, {"error": "Wait for the current setup or workspace operation to finish before starting a request"}
             if self._busy:
                 return 409, {"error": "Niji is already working on a request"}
             cancel_event = getattr(self.agent, "_cancel_event", None)
@@ -1077,8 +1321,10 @@ class NijiWebUI:
                                  "approved_plan": approved_plan,
                                  "plan_label": "", "plan_approved": False,
                                  "session_id": getattr(self.agent, "session_id", "local"),
+                                 "workspace_path": str(self._active_workspace()),
                                  "cancel_requested": False, "created": time.time(),
                                  "automation_id": automation_id or ""}
+            self._persist_job(job_id, force=True)
             self._job_thread = threading.Thread(
                 target=self._run_job, args=(job_id, message, plan_only, approved_plan),
                 name=f"niji-job-{job_id[:8]}", daemon=True)
@@ -1087,7 +1333,9 @@ class NijiWebUI:
             except Exception as exc:
                 self._busy = False
                 self._active_job = None
-                self._jobs.pop(job_id, None)
+                self._jobs[job_id].update(status="error", progress="Could not start",
+                                          error=f"Worker startup failed ({type(exc).__name__})")
+                self._persist_job(job_id, force=True)
                 return 500, {"error": f"Could not start the task ({type(exc).__name__})"}
             return 202, {"id": job_id}
 
@@ -1097,7 +1345,7 @@ class NijiWebUI:
             now = now.replace(tzinfo=timezone.utc)
         now = now.astimezone(timezone.utc)
         with self._lock:
-            if self._busy or self._connector_mutating or self._model_mutating:
+            if self._busy or self._agent_mutating or self._connector_mutating or self._model_mutating:
                 return False
             items = self._load_automations()
             due = next((item for item in items if item["enabled"]
@@ -1153,6 +1401,10 @@ class NijiWebUI:
         started = time.monotonic()
         previous_plan_only = getattr(self.agent, "plan_only", False)
         previous_approved_plan = getattr(self.agent, "approved_plan", None)
+        terminal_status = "error"
+        terminal_response = ""
+        terminal_error = ""
+        terminal_progress = "Error"
         try:
             self.agent.plan_only = bool(plan_only)
             self.agent.approved_plan = approved_plan
@@ -1182,24 +1434,26 @@ class NijiWebUI:
             with self._lock:
                 job = self._jobs[job_id]
                 if job.get("cancel_requested"):
-                    final_status, error, progress = "cancelled", "", "Stopped"
+                    terminal_status, terminal_error, terminal_progress = "cancelled", "", "Stopped"
                 elif unfinished:
-                    final_status = "error"
-                    error = "Approved plan has unfinished steps or invalid completion evidence; review the checklist before calling it complete."
-                    progress = "Plan incomplete"
+                    terminal_status = "error"
+                    terminal_error = "Approved plan has unfinished steps or invalid completion evidence; review the checklist before calling it complete."
+                    terminal_progress = "Plan incomplete"
                 else:
-                    final_status, error, progress = "completed", "", "Complete"
-                job.update(status=final_status, response=output, error=error, progress=progress)
+                    terminal_status, terminal_error, terminal_progress = "completed", "", "Complete"
+                terminal_response = output
         except Exception as exc:
             safe = self._redact_known_secrets(exc)[:1500]
             with self._lock:
                 job = self._jobs[job_id]
                 if job.get("cancel_requested"):
-                    job.update(status="cancelled",
-                               response=job.get("streamed") or "[Stopped by user]",
-                               error="", progress="Stopped")
+                    terminal_status, terminal_error, terminal_progress = "cancelled", "", "Stopped"
+                    terminal_response = job.get("streamed") or "[Stopped by user]"
                 else:
-                    job.update(status="error", response="", error=f"{exc.__class__.__name__}: {safe}")
+                    terminal_status = "error"
+                    terminal_response = ""
+                    terminal_error = f"{exc.__class__.__name__}: {safe}"
+                    terminal_progress = job.get("progress", "Error")
         finally:
             try:
                 self.agent.plan_only = previous_plan_only
@@ -1214,22 +1468,29 @@ class NijiWebUI:
             final_status = "error"
             with self._lock:
                 job = self._jobs.get(job_id, {})
-                automation_id = job.get("automation_id", "")
-                final_status = job.get("status", "error")
+                self._flush_stream_redaction_locked(job)
+                if job.get("cancel_requested"):
+                    terminal_status, terminal_error, terminal_progress = "cancelled", "", "Stopped"
+                    if not terminal_response:
+                        terminal_response = job.get("streamed") or "[Stopped by user]"
+                job.update(status=terminal_status, response=terminal_response,
+                           error=terminal_error, progress=terminal_progress)
+                # Publish the terminal result and release the run gate under the same lock.
                 self._busy = False
                 if self._active_job == job_id:
                     self._active_job = None
+                self._persist_job(job_id, force=True)
+                automation_id = job.get("automation_id", "")
+                final_status = job.get("status", "error")
                 # Keep only a small recent job cache for this private UI session.
-                if len(self._jobs) > 20:
-                    for old_id in list(self._jobs)[:-20]:
-                        self._jobs.pop(old_id, None)
+                self._prune_job_cache_locked()
             if automation_id:
                 self._complete_automation(automation_id, final_status)
 
     def _new_session(self):
         with self._lock:
-            if self._busy:
-                raise RuntimeError("Wait until the current request finishes before starting a new thread")
+            if self._busy or self._agent_mutating or self._connector_mutating or self._model_mutating:
+                raise RuntimeError("Wait until the current request or setup operation finishes before starting a new thread")
             if hasattr(self.agent, "_save_session"):
                 self.agent._save_session()
             messages = list(getattr(self.agent, "messages", []))
@@ -1260,8 +1521,8 @@ class NijiWebUI:
                        for m in messages)):
             raise ValueError("Saved session has an invalid message structure")
         with self._lock:
-            if self._busy:
-                raise RuntimeError("Wait until the current request finishes before switching threads")
+            if self._busy or self._agent_mutating or self._connector_mutating or self._model_mutating:
+                raise RuntimeError("Wait until the current request or setup operation finishes before switching threads")
             if hasattr(self.agent, "_save_session"):
                 self.agent._save_session()
             self.agent.resume(messages)
@@ -1333,7 +1594,7 @@ class NijiWebUI:
         if not provider_is_configured(name):
             return 400, {"error": "Connect this provider in `niji setup` first"}
         with self._lock:
-            if self._busy or self._connector_mutating or self._model_mutating:
+            if self._busy or self._agent_mutating or self._connector_mutating or self._model_mutating:
                 return 409, {"error": "Wait until the current task or setup operation finishes"}
             self._model_mutating = True
         try:
@@ -1359,6 +1620,7 @@ class NijiWebUI:
                 save_config(cfg)
             except Exception as exc:
                 return 500, {"error": f"Could not safely activate this model ({type(exc).__name__})"}
+            self._known_secrets()
             old_client = getattr(self.agent, "client", None)
             self.agent.client = client
             self.agent.model = model_id
@@ -1486,10 +1748,7 @@ class NijiWebUI:
         diff = "\n".join(difflib.unified_diff(
             before_text.splitlines(), after_text.splitlines(),
             fromfile=f"before/{path.name}", tofile=f"after/{path.name}", lineterm=""))
-        api_key = str(getattr(self.agent, "provider_cfg", {}).get("api_key", ""))
-        if len(api_key) >= 6:
-            diff = diff.replace(api_key, "[redacted]")
-        return safe_terminal_text(diff)[:12_000] or "(No text diff available.)"
+        return self._redact_known_secrets(safe_terminal_text(diff))[:12_000] or "(No text diff available.)"
 
     def _active_workspace(self) -> Path:
         """Return the agent's resolved workspace instead of relying on process cwd."""
@@ -1612,7 +1871,8 @@ class NijiWebUI:
         messages = getattr(self.agent, "messages", [])
         with self._lock:
             raw_active = self._jobs.get(self._active_job) if self._active_job else None
-            active = self._redact_visible(raw_active) if raw_active else None
+            active = (self._redact_visible(self._redact_credential_fields(self._job_fields(raw_active)))
+                      if raw_active else None)
             progress = ({"label": active.get("progress"),
                          "detail": active.get("progress_detail"),
                          "streamed": active.get("streamed", ""),
@@ -1642,7 +1902,7 @@ class NijiWebUI:
                             "access": "Read-only" if name in readonly else "Confirmation recommended"})
         uptime = max(0, int(time.monotonic() - getattr(self.agent, "started_at", time.monotonic())))
         workspace = self._active_workspace()
-        return {
+        return self._redact_visible({
             "version": __version__, "provider": getattr(self.agent, "provider_name", provider_cfg.get("provider", "unknown")),
             "model": getattr(self.agent, "model", provider_cfg.get("model", "unknown")),
             "session_id": getattr(self.agent, "session_id", "local"), "approval": getattr(self.agent, "approval", "ask"),
@@ -1668,7 +1928,7 @@ class NijiWebUI:
             "limits": {"max_turns": getattr(self.agent, "max_turns", 20),
                        "max_tool_calls": getattr(self.agent, "max_tool_calls", 30),
                        "max_tool_calls_per_turn": getattr(self.agent, "max_tool_calls_per_turn", 6)},
-        }
+        })
 
     def serve_forever(self, open_browser: bool = False):
         print(f"Niji local UI: {self.url}")
@@ -1696,6 +1956,7 @@ class NijiWebUI:
             job_thread = self._job_thread
             if active_id and active_id in self._jobs and busy:
                 self._jobs[active_id]["cancel_requested"] = True
+                self._persist_job(active_id, force=True)
             approvals = list(self._approvals.values())
             for item in approvals:
                 item["approved"] = False

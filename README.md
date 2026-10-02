@@ -1,4 +1,4 @@
-# Niji Agent 🌈 — v2.34.0
+# Niji Agent 🌈 — v2.35.0
 
 A provider-agnostic terminal coding agent with interactive setup, plain-language tasks, slash commands, MCP connectors, planning, memory, sessions, and subagents.
 
@@ -16,12 +16,22 @@ Requires Python 3.10+. First launch opens the setup wizard. Pick a provider, ent
 
 For other systems, the installer is also available as `install.sh`. It installs the GitHub `main` branch and prints the installed version.
 
+## What's new in 2.35.0
+
+- Added a private local run journal with atomic, bounded snapshots and restart recovery; in-progress work is marked interrupted and is never replayed automatically.
+- Added Run history UI/API for completed, failed, cancelled, and interrupted jobs, with saved plans, outputs, events, and explicit review-before-retry.
+- Retry requires a server-validated acknowledgement before repeating side effects. Cross-thread/workspace retries use a short-lived opaque confirmation bound to the exact source and current context; unknown legacy context cannot bypass the gate.
+- Workspace changes, compaction, undo, plan edits, memory updates, session switches, and provider/connector setup are serialized against active jobs to prevent state races; final run status is published together with releasing the task gate.
+- Persisted job snapshots redact known secrets and credential-shaped fields, restrict file/directory permissions, reject symlinks, and cap retention/record size. Legacy run files are hardened before being read.
+- Secret redaction remembers credentials observed during the UI process lifetime, including after connector/model changes, and detects secrets split across streamed chunks without delaying ordinary text. Known secrets are also masked in runtime paths, profile/artifact metadata, download filenames, and file diffs.
+- Added regression coverage for file safety, crash recovery, cache retention, credential rotation, chunk-boundary redaction, repeat confirmation, and retry-context privacy.
+
 ## What's new in 2.34.0
 
 - Added cooperative pause/resume controls for active local UI runs. Pausing takes effect at a safe model/tool boundary; an already-admitted provider/tool action may finish first.
 - Pending approvals are also held at the pause boundary so approving an action does not bypass a pause request. Stop wakes a paused run and prevents not-yet-admitted tool calls from starting.
 - The active job stays reserved while paused, preventing duplicate chat runs; browser reload reconnects to the same in-process job.
-- Pause/resume is process-local only in this release. If Niji itself exits or crashes, runs are not automatically recovered; interrupted external actions must be inspected before retrying.
+- Pause/resume is process-local only. If Niji exits or crashes, an active run is restored in history as interrupted but is never automatically resumed or replayed; inspect it before any manual retry.
 - Added regression coverage for action-admission races, pause/resume, stop while paused, pause during approval, reconnect state, and existing approved-plan guards.
 
 ## What's new in 2.33.0
