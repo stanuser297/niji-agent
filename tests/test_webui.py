@@ -277,12 +277,12 @@ const recentEvents=visibleJobEvents([{level:'THINKING',message:'Thinking through
 updateProgress({label:'Using a tool',detail:'Tool call: bash · still running (12s)'},true,placeholder);
 const timedAction=meta.textContent;
 setLiveTaskLabel(placeholder,'Auditing Niji cloud readiness and runtime');const planAction=meta.textContent;
-setLiveTaskLabel(placeholder,'Running tests');meta.textContent='Paused safely';setLiveTaskLabel(placeholder,'Running tests');const recoveredStatus=meta.textContent;
+setLiveTaskLabel(placeholder,'Running tests');meta.textContent='Paused safely';setLiveTaskLabel(placeholder,'Running tests');const recoveredStatus=meta.textContent;setLiveTaskLabel(placeholder,'Paused safely');const pausedAria=meta.getAttribute('aria-label');setLiveTaskLabel(placeholder,'Pausing after the current action…');const pausingAria=meta.getAttribute('aria-label');
 console.log(JSON.stringify({
   tasks:[summarizeLiveTask('  Fix\\n  the bug  '),summarizeLiveTask(''),summarizeLiveTask(null),summarizeLiveTask(longTask)],
   toolAction,connectorAction,timedAction,planAction,recentEvents:recentEvents.map(e=>e.level),
   activityLabels:[formatJobEventMessage({message:'Tool call: list_files · Listing workspace files'}),formatJobEventMessage({message:'run_tests completed'}),formatJobEventMessage({message:'Tool call: bash · still running (9s)'}),formatJobEventMessage({message:'Tool call: slack.search.messages · Searching Slack messages'})],
-  recoveredStatus,
+  recoveredStatus,pausedAria,pausingAria,
   times:[formatRunElapsed(now/1000-75,now),formatRunElapsed(now/1000-3661,now),formatRunElapsed(true,now),formatRunElapsed([123],now),formatRunElapsed('bad',now),formatRunElapsed(now/1000+30,now)],
   progress:[taskCompletionPercent([{status:'pending'},{status:'completed'}]),taskCompletionPercent([{status:'completed'},{status:'completed'}]),taskCompletionPercent([{status:'pending'}]),taskCompletionPercent([]),taskCompletionPercent(null)]
 }));
@@ -299,6 +299,8 @@ console.log(JSON.stringify({
         self.assertEqual(data["recentEvents"], ["TOOL"])
         self.assertEqual(data["activityLabels"], ["Listing workspace files", "Finished run tests", "Still running · 9s", "Searching Slack messages"])
         self.assertEqual(data["recoveredStatus"], "Running tests")
+        self.assertEqual(data["pausedAria"], "Current action: Paused safely")
+        self.assertEqual(data["pausingAria"], "Current action: Pausing after the current action…")
         self.assertEqual(data["timedAction"], "Running a command… · 12s")
         self.assertEqual(data["planAction"], "Auditing Niji cloud readiness and runtime")
         self.assertEqual(data["times"], ["Total elapsed · 01:15", "Total elapsed · 01:01:01",
