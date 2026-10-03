@@ -19,7 +19,11 @@ def provider_is_configured(name, config=None):
     if preset:
         env_key = preset.get("env_key")
         if not env_key:
-            return name == cfg.get("provider") or bool(os.environ.get("NIJI_BASE_URL"))
+            models = cfg.get("models", {})
+            if not isinstance(models, dict):
+                models = {}
+            return (name == cfg.get("provider") or bool(os.environ.get("NIJI_BASE_URL"))
+                    or bool(models.get(name)))
         generic_key_provider = os.environ.get("NIJI_PROVIDER") or cfg.get("provider")
         return bool(cfg.get("api_keys", {}).get(name)
                     or os.environ.get(env_key)

@@ -14,6 +14,7 @@ import urllib.request
 from unittest.mock import patch
 
 from niji.webui import NijiWebUI
+from niji import setup_wizard  # Ensure its lazy provider tester is patchable in tests.
 from niji.webui_frontend import PAGE
 from niji.planning import save_plan as REAL_SAVE_PLAN
 
@@ -698,6 +699,166 @@ if(emoji.textContent!=='✅ done 😂')throw new Error('emoji or escaped punctua
         self.assertTrue(next(p for p in state["providers"] if p["name"] == "test")["configured"])
         self.assertNotIn("private-test-secret", json.dumps(state))
 
+    def test_keyless_provider_sentinel_is_not_redacted_as_a_secret(self):
+        self.agent.provider_cfg = {"provider": "ollama", "api_key": "ollama"}
+        visible = self.ui._redact_visible({"provider": "ollama"})
+        self.assertEqual(visible["provider"], "ollama")
+
+    def test_provider_add_tests_builtin_endpoint_before_saving_and_never_returns_key(self):
+        secret = "provider-secret-never-return-this"
+        with (patch("niji.webui.load_config", return_value={}),
+              patch("niji.setup_wizard.test_connection", return_value=(True, "ok")) as test,
+              patch("niji.webui.save_config") as save):
+            result = json.loads(self.request("/api/models", {
+                "action": "add-provider", "provider": "openai", "api_key": secret,
+                "model": "gpt-test-model",
+            }, self.ui.token).read())
+        self.assertEqual(result["provider"], "openai")
+        self.assertNotIn(secret, json.dumps(result))
+        test.assert_called_once_with({"provider": "openai", "base_url": "https://api.openai.com/v1",
+                                      "api_key": secret, "model": "gpt-test-model"})
+        saved = save.call_args.args[0]
+        self.assertEqual(saved["api_keys"]["openai"], secret)
+        self.assertEqual(saved["models"]["openai"], "gpt-test-model")
+
+    def test_provider_add_rejects_unknown_custom_endpoint_and_invalid_fields(self):
+        with patch("niji.webui.save_config") as save:
+            for payload in (
+                {"action": "add-provider", "provider": "custom", "base_url": "https://attacker.example", "api_key": "secret", "model": "m"},
+                {"action": "add-provider", "provider": "bad/name", "api_key": "secret", "model": "m"},
+                {"action": "add-provider", "provider": "openai", "api_key": "secret", "model": ""},
+            ):
+                with self.subTest(payload=payload), self.assertRaises(urllib.error.HTTPError) as invalid:
+                    self.request("/api/models", payload, self.ui.token)
+                self.assertEqual(invalid.exception.code, 400)
+        save.assert_not_called()
+
+    def test_provider_add_fails_closed_and_local_ollama_needs_no_key(self):
+        with (patch("niji.webui.load_config", return_value={}),
+              patch("niji.setup_wizard.test_connection", return_value=(False, "secret details")),
+              patch("niji.webui.save_config") as save):
+            with self.assertRaises(urllib.error.HTTPError) as failed:
+                self.request("/api/models", {"action": "add-provider", "provider": "openai",
+                    "api_key": "secret", "model": "m"}, self.ui.token)
+            self.assertEqual(failed.exception.code, 400)
+            self.assertNotIn("secret details", failed.exception.read().decode())
+        save.assert_not_called()
+        with (patch("niji.webui.load_config", return_value={}),
+              patch("niji.setup_wizard.test_connection", return_value=(True, "ok")),
+              patch("niji.webui.save_config") as save_local):
+            result = json.loads(self.request("/api/models", {"action": "add-provider", "provider": "ollama",
+                "model": "qwen2.5"}, self.ui.token).read())
+        self.assertTrue(result["ok"])
+        self.assertNotIn("ollama", save_local.call_args.args[0].get("api_keys", {}))
+
+    def test_provider_state_lists_presets_and_exposes_saved_keyless_ollama(self):
+        secret = "provider-secret-never-return-this"
+        cfg = {"api_keys": {"openai": secret}, "models": {"ollama": "qwen2.5"}}
+        with patch("niji.webui.load_config", return_value=cfg):
+            state = json.loads(self.request("/api/models", token=self.ui.token).read())
+        self.assertTrue(any(item["name"] == "openai" for item in state["available_providers"]))
+        ollama = next(item for item in state["providers"] if item["name"] == "ollama")
+        self.assertTrue(ollama["configured"])
+        self.assertTrue(ollama["removable"])
+        self.assertNotIn(secret, json.dumps(state))
+
+    def test_provider_settings_removal_rejects_active_and_clears_saved_key_and_model(self):
+        cfg = {"api_keys": {"openai": "saved-secret"},
+               "models": {"openai": "old-model", "anthropic": "keep-model"}}
+        with patch("niji.webui.load_config", return_value=cfg), patch("niji.webui.save_config") as save:
+            with self.assertRaises(urllib.error.HTTPError) as active:
+                self.request("/api/models", {"action": "remove-provider", "provider": "test"}, self.ui.token)
+            self.assertEqual(active.exception.code, 409)
+            result = json.loads(self.request("/api/models", {"action": "remove-provider", "provider": "openai"}, self.ui.token).read())
+        self.assertTrue(result["ok"])
+        self.assertNotIn("openai", cfg["api_keys"])
+        self.assertNotIn("openai", cfg["models"])
+        self.assertEqual(cfg["models"]["anthropic"], "keep-model")
+        save.assert_called_once_with(cfg)
+
+    def test_provider_removal_clears_keyless_ollama_and_environment_provider_models(self):
+        cfg = {"models": {"ollama": "qwen2.5", "openai": "gpt-env"}}
+        with patch("niji.webui.load_config", return_value=cfg), patch("niji.webui.save_config") as save:
+            ollama = json.loads(self.request("/api/models", {
+                "action": "remove-provider", "provider": "ollama",
+            }, self.ui.token).read())
+            self.assertTrue(ollama["ok"])
+            self.assertNotIn("ollama", cfg["models"])
+            openai = json.loads(self.request("/api/models", {
+                "action": "remove-provider", "provider": "openai",
+            }, self.ui.token).read())
+        self.assertTrue(openai["ok"])
+        self.assertNotIn("openai", cfg.get("models", {}))
+        self.assertNotIn("models", cfg)
+        self.assertEqual(save.call_count, 2)
+
+    def test_simultaneous_provider_additions_are_serialized_without_lost_config(self):
+        cfg = {}
+        first_started = threading.Event()
+        release_first = threading.Event()
+        first_result = {}
+
+        def delayed_test(_provider_cfg):
+            first_started.set()
+            self.assertTrue(release_first.wait(3))
+            return True, "ok"
+
+        def add_first():
+            try:
+                first_result["body"] = self.request("/api/models", {
+                    "action": "add-provider", "provider": "openai",
+                    "api_key": "openai-secret", "model": "gpt-test",
+                }, self.ui.token).read()
+            except Exception as exc:
+                first_result["error"] = exc
+
+        with (patch("niji.webui.load_config", return_value=cfg),
+              patch("niji.setup_wizard.test_connection", side_effect=delayed_test)):
+            worker = threading.Thread(target=add_first)
+            worker.start()
+            self.assertTrue(first_started.wait(2), "first provider test did not start")
+            with self.assertRaises(urllib.error.HTTPError) as competing:
+                self.request("/api/models", {
+                    "action": "add-provider", "provider": "anthropic",
+                    "api_key": "anthropic-secret", "model": "claude-test",
+                }, self.ui.token)
+            self.assertEqual(competing.exception.code, 409)
+            release_first.set()
+            worker.join(timeout=4)
+            self.assertFalse(worker.is_alive())
+            self.assertNotIn("error", first_result)
+            self.assertTrue(json.loads(first_result["body"])["ok"])
+            second = json.loads(self.request("/api/models", {
+                "action": "add-provider", "provider": "anthropic",
+                "api_key": "anthropic-secret", "model": "claude-test",
+            }, self.ui.token).read())
+        self.assertTrue(second["ok"])
+        self.assertEqual(cfg["models"], {"openai": "gpt-test", "anthropic": "claude-test"})
+        self.assertEqual(cfg["api_keys"], {"openai": "openai-secret", "anthropic": "anthropic-secret"})
+
+    def test_provider_manager_ui_and_sent_prompt_anchor_are_available(self):
+        self.assertIn('id="provider-manager"', PAGE)
+        self.assertIn('id="provider-api-key" type="password"', PAGE)
+        self.assertIn('id="provider-name" aria-label="Provider to connect"', PAGE)
+        self.assertNotIn('id="provider-base-url"', PAGE)
+        self.assertIn("action:'add-provider'", PAGE)
+        self.assertIn("action:'remove-provider'", PAGE)
+        self.assertIn("requestAnimationFrame(()=>anchorSentMessage(sentMessage))", PAGE)
+        self.assertIn("function anchorSentMessage(message)", PAGE)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        start = PAGE.index("function anchorSentMessage(")
+        end = PAGE.index("\nfunction summarizeLiveTask(", start)
+        helper = PAGE[start:end]
+        probe = helper + """
+const target={getBoundingClientRect(){return {top:510}}};
+const container={scrollTop:200,scrollTo(value){this.next=value.top},getBoundingClientRect(){return {top:300}}};
+global.el=id=>id==='messages'?container:null;
+anchorSentMessage(target);
+if(container.next!==400)throw new Error('sent message not anchored near the top of the chat viewport: '+container.next);
+"""
+        subprocess.run(["node", "-e", probe], check=True, capture_output=True, text=True)
+
     def test_model_catalog_returns_models_for_configured_provider(self):
         with (patch("niji.webui.load_config", return_value={}),
               patch("niji.webui.provider_names", return_value=["demo"]),
@@ -708,6 +869,31 @@ if(emoji.textContent!=='✅ done 😂')throw new Error('emoji or escaped punctua
                 "action": "catalog", "provider": "demo"
             }, self.ui.token).read())
         self.assertEqual(result["models"], ["demo-fast", "demo-pro"])
+
+    def test_saved_model_only_ollama_can_fetch_catalog_and_switch(self):
+        cfg = {"models": {"ollama": "qwen2.5"}, "api_keys": {}, "custom_providers": {}}
+        provider_cfg = {"provider": "ollama", "base_url": "http://localhost:11434/v1",
+                        "api_key": "ollama", "model": "qwen2.5"}
+        with (patch("niji.webui.load_config", return_value=cfg),
+              patch("niji.model_catalog.load_config", return_value=cfg),
+              patch("niji.webui.resolve_catalog_provider", return_value=(provider_cfg, None)),
+              patch("niji.webui.fetch_provider_models", return_value=(["qwen2.5"], ""))):
+            catalog = json.loads(self.request("/api/models", {
+                "action": "catalog", "provider": "ollama",
+            }, self.ui.token).read())
+        self.assertEqual(catalog["models"], ["qwen2.5"])
+        with (patch("niji.webui.load_config", return_value=cfg),
+              patch("niji.model_catalog.load_config", return_value=cfg),
+              patch("niji.webui.resolve_provider", return_value=dict(provider_cfg)),
+              patch("niji.setup_wizard.test_connection", return_value=(True, "ok")),
+              patch("niji.webui.save_config"),
+              patch("openai.OpenAI", return_value=object())):
+            switched = json.loads(self.request("/api/models", {
+                "action": "switch", "provider": "ollama", "model": "qwen2.5",
+            }, self.ui.token).read())
+        self.assertTrue(switched["ok"])
+        self.assertEqual(switched["provider"], "ollama")
+        self.assertEqual(self.agent.provider_name, "ollama")
 
     def test_model_switch_requires_successful_chat_test_before_persisting(self):
         cfg = {"api_key": "key-for-test", "base_url": "https://example.invalid/v1",

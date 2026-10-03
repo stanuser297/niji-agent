@@ -672,8 +672,12 @@ class NijiWebUI:
             secrets.append(str(provider_cfg.get("api_key", "")))
         for client in getattr(self.agent, "mcp_clients", []):
             secrets.extend(str(item) for item in getattr(client, "_secrets", []) if item)
+        # Local/mock provider clients use these public sentinel values in place
+        # of credentials. Redacting them hides provider names in UI/API state.
+        placeholders = {"ollama", "niji", "custom"}
         with self._secret_lock:
-            self._redaction_secrets.update(secret for secret in secrets if secret)
+            self._redaction_secrets.update(secret for secret in secrets
+                                           if secret and secret.casefold() not in placeholders)
             return sorted(self._redaction_secrets, key=len, reverse=True)
 
     def _redact_known_secrets(self, value):
@@ -1663,22 +1667,158 @@ class NijiWebUI:
     def _model_state(self):
         cfg = load_config()
         active_provider = str(getattr(self.agent, "provider_name", ""))
-        providers = []
+        saved_keys = cfg.get("api_keys", {})
+        if not isinstance(saved_keys, dict):
+            saved_keys = {}
+        custom_providers = cfg.get("custom_providers", {})
+        if not isinstance(custom_providers, dict):
+            custom_providers = {}
+        saved_models = cfg.get("models", {})
+        if not isinstance(saved_models, dict):
+            saved_models = {}
         names = provider_names(cfg)
         if active_provider and active_provider not in names:
             names.append(active_provider)
+        providers = []
         for name in names:
-            providers.append({"name": name,
-                              "configured": bool(provider_is_configured(name, cfg)) or name == active_provider,
-                              "active": name == active_provider})
+            is_configured = (bool(provider_is_configured(name, cfg))
+                             or name == active_provider
+                             or (name == "ollama" and name in saved_models))
+            removable = (name in custom_providers
+                         or (name in PRESETS and (name in saved_keys or name in saved_models)))
+            providers.append({"name": name, "configured": is_configured,
+                              "active": name == active_provider, "removable": removable})
         return {"providers": providers,
+                "available_providers": [{"name": name, "model": preset["model"],
+                                          "requires_api_key": bool(preset.get("env_key"))}
+                                         for name, preset in PRESETS.items()],
                 "provider": active_provider,
                 "model": str(getattr(self.agent, "model", ""))}
+
+    def _add_model_provider(self, data):
+        name = data.get("provider")
+        model_id = data.get("model")
+        raw_key = data.get("api_key", "")
+        if not isinstance(name, str) or name not in PRESETS:
+            return 400, {"error": "Choose one of the supported providers in Settings"}
+        if not isinstance(model_id, str):
+            return 400, {"error": "Enter a model ID"}
+        model_id = model_id.strip()
+        if not 1 <= len(model_id) <= 200 or any(ord(ch) < 32 for ch in model_id):
+            return 400, {"error": "Model ID must be 1–200 visible characters"}
+        if not isinstance(raw_key, str) or len(raw_key) > 4096 or any(ord(ch) < 32 for ch in raw_key):
+            return 400, {"error": "API key is invalid or too long"}
+        preset = PRESETS[name]
+        with self._lock:
+            if self._busy or self._agent_mutating or self._connector_mutating or self._model_mutating:
+                return 409, {"error": "Wait until the current task or setup operation finishes"}
+            self._model_mutating = True
+        try:
+            # Read after claiming the mutation gate so simultaneous provider
+            # additions cannot overwrite one another with stale config copies.
+            cfg = load_config()
+            api_key = raw_key.strip()
+            if not api_key:
+                api_keys = cfg.get("api_keys", {})
+                if not isinstance(api_keys, dict):
+                    api_keys = {}
+                api_key = (api_keys.get(name)
+                           or (preset.get("env_key") and os.environ.get(preset["env_key"]))
+                           or (name == (os.environ.get("NIJI_PROVIDER") or cfg.get("provider")
+                                        or getattr(self.agent, "provider_name", None)
+                                        or "") and os.environ.get("NIJI_API_KEY"))
+                           or "")
+            if preset.get("env_key") and not api_key:
+                return 400, {"error": "Enter the provider API key"}
+            provider_cfg = {"provider": name, "base_url": preset["base_url"],
+                            "api_key": api_key or "ollama", "model": model_id}
+            try:
+                from .setup_wizard import test_connection
+                ok, _message = test_connection(provider_cfg)
+            except Exception:
+                ok = False
+            if not ok:
+                return 400, {"error": "Provider chat test failed; nothing was saved. Check the API key and model ID."}
+            try:
+                api_keys = cfg.get("api_keys", {})
+                if not isinstance(api_keys, dict):
+                    api_keys = {}
+                if api_key and preset.get("env_key"):
+                    api_keys[name] = api_key
+                    cfg["api_keys"] = api_keys
+                models = cfg.get("models", {})
+                if not isinstance(models, dict):
+                    models = {}
+                models[name] = model_id
+                cfg["models"] = models
+                save_config(cfg)
+                self._known_secrets()
+            except Exception as exc:
+                return 500, {"error": f"Could not safely save provider settings ({type(exc).__name__})"}
+            return 200, {"ok": True, "provider": name, "model": model_id,
+                         "configured": True}
+        finally:
+            with self._lock:
+                self._model_mutating = False
+
+    def _remove_model_provider(self, data):
+        name = data.get("provider")
+        if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{1,31}", name):
+            return 400, {"error": "Choose a valid provider"}
+        with self._lock:
+            if self._busy or self._agent_mutating or self._connector_mutating or self._model_mutating:
+                return 409, {"error": "Wait until the current task or setup operation finishes"}
+            if name == getattr(self.agent, "provider_name", None):
+                return 409, {"error": "Switch to another provider before removing its saved credentials"}
+            self._model_mutating = True
+        try:
+            cfg = load_config()
+            if name in PRESETS:
+                api_keys = cfg.get("api_keys", {})
+                if not isinstance(api_keys, dict):
+                    api_keys = {}
+                models = cfg.get("models", {})
+                if not isinstance(models, dict):
+                    models = {}
+                if name not in api_keys and name not in models:
+                    return 404, {"error": "No saved settings for this provider; environment credentials are unchanged"}
+                api_keys.pop(name, None)
+                cfg["api_keys"] = api_keys
+            else:
+                custom = cfg.get("custom_providers", {})
+                if not isinstance(custom, dict) or name not in custom:
+                    return 404, {"error": "Provider not found"}
+                del custom[name]
+                if not custom:
+                    cfg.pop("custom_providers", None)
+                api_keys = cfg.get("api_keys", {})
+                if isinstance(api_keys, dict):
+                    api_keys.pop(name, None)
+            models = cfg.get("models", {})
+            if isinstance(models, dict):
+                models.pop(name, None)
+                if models:
+                    cfg["models"] = models
+                else:
+                    cfg.pop("models", None)
+            try:
+                save_config(cfg)
+                self._known_secrets()
+            except Exception as exc:
+                return 500, {"error": f"Could not safely remove provider settings ({type(exc).__name__})"}
+            return 200, {"ok": True, "provider": name}
+        finally:
+            with self._lock:
+                self._model_mutating = False
 
     def _model_action(self, data):
         if not isinstance(data, dict):
             return 400, {"error": "Model action must be a JSON object"}
         action = data.get("action")
+        if action == "add-provider":
+            return self._add_model_provider(data)
+        if action == "remove-provider":
+            return self._remove_model_provider(data)
         name = data.get("provider")
         if not isinstance(name, str) or name not in provider_names(load_config()):
             return 400, {"error": "Choose a known provider"}

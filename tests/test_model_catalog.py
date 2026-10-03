@@ -24,6 +24,14 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertFalse(provider_is_configured(
             "groq", {"api_keys": {}, "custom_providers": {}}))
 
+    def test_keyless_local_provider_is_configured_from_saved_model(self):
+        self.assertTrue(provider_is_configured("ollama", {
+            "api_keys": {}, "models": {"ollama": "qwen2.5"}, "custom_providers": {},
+        }))
+        self.assertFalse(provider_is_configured("ollama", {
+            "api_keys": {}, "models": {}, "custom_providers": {},
+        }))
+
     def test_fetch_provider_models_sorts_ids_and_keeps_active_model_visible(self):
         fake_openai = types.ModuleType("openai")
 
