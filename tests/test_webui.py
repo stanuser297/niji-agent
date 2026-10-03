@@ -290,6 +290,8 @@ if(nodes.some(n=>n.innerHTML)) throw new Error('renderer used unsafe HTML');
         self.assertIn("renderAssistantMarkdown(body,j.streamed||'')", PAGE)
         self.assertIn("renderAssistantMarkdown(body,j.response||j.streamed", PAGE)
         self.assertIn(".msgbody ul,.msgbody ol", PAGE)
+        self.assertIn(".md-table-wrap{max-width:100%;overflow-x:auto", PAGE)
+        self.assertIn(".md-table th,.md-table td", PAGE)
         self.assertIn(".msgbody pre code", PAGE)
         if not shutil.which("node"):
             self.skipTest("Node.js is not installed")
@@ -297,7 +299,7 @@ if(nodes.some(n=>n.innerHTML)) throw new Error('renderer used unsafe HTML');
         end = PAGE.index("\nfunction addBubble", start)
         helper = PAGE[start:end]
         script = helper + r"""
-class TestNode{constructor(tag){this.tagName=tag.toUpperCase();this.children=[];this._text=''}append(...nodes){this.children.push(...nodes)}replaceChildren(...nodes){this.children=[...nodes];this._text=''}set textContent(value){this._text=String(value);this.children=[]}get textContent(){return this._text+this.children.map(node=>node.textContent).join('')}}
+class TestNode{constructor(tag){this.tagName=tag.toUpperCase();this.children=[];this.style={};this._text=''}append(...nodes){this.children.push(...nodes)}replaceChildren(...nodes){this.children=[...nodes];this._text=''}set textContent(value){this._text=String(value);this.children=[]}get textContent(){return this._text+this.children.map(node=>node.textContent).join('')}}
 global.document={createElement:tag=>new TestNode(tag),createTextNode:text=>{const node=new TestNode('#text');node._text=String(text);return node}};
 const slash=String.fromCharCode(92);
 const nl=String.fromCharCode(10);const bold=slash+'*'+slash+'*मैं ठीक हूँ, धन्यवाद!'+slash+'*'+slash+'*';const italic=slash+'*मैं कहां से हूँ?'+slash+'*';const codeItem=slash+'- '+slash+'`nvidia'+slash+'`';const input=[bold,'',slash+'- '+italic,codeItem,'','<script>alert(1)</script>'].join(nl);
@@ -308,6 +310,9 @@ if(!nodes.some(node=>node.tagName==='STRONG'&&node.textContent==='मैं ठ�
 if(!nodes.some(node=>node.tagName==='EM'&&node.textContent==='मैं कहां से हूँ?'))throw new Error('escaped italic text was not rendered');
 if(nodes.filter(node=>node.tagName==='LI').length!==2)throw new Error('escaped bullets were not rendered as a list');
 if(!nodes.some(node=>node.tagName==='CODE'&&node.textContent==='nvidia'))throw new Error('inline code was not rendered');
+const table=new TestNode('div');const tableInput=['| **क्षेत्र** | क्या कर सकता है | उदाहरण |','| :--- | :---: | ---: |','| **कोडिंग** | लेख और `code` | Python |','| _सुरक्षा_ | <script>alert(1)</script> | `--ask` |'].join(nl);renderAssistantMarkdown(table,tableInput);const tableNodes=walk(table);const tableElement=tableNodes.find(node=>node.tagName==='TABLE');if(!tableElement)throw new Error('Markdown table was not rendered');if(tableNodes.filter(node=>node.tagName==='TH').length!==3||tableNodes.filter(node=>node.tagName==='TD').length!==6)throw new Error('table cells are missing');if(tableNodes.filter(node=>node.tagName==='TH')[1].style.textAlign!=='center'||tableNodes.filter(node=>node.tagName==='TH')[2].style.textAlign!=='right')throw new Error('table column alignment was ignored');if(tableElement.textContent.includes('|'))throw new Error('table delimiter pipes leaked into display');if(tableNodes.some(node=>node.tagName==='SCRIPT'))throw new Error('HTML inside a table became executable');
+const escapedTable=new TestNode('div');renderAssistantMarkdown(escapedTable,['| Name | Note |','| --- | --- |','| A | left '+slash+'| right |'].join(nl));const escapedCells=walk(escapedTable).filter(node=>node.tagName==='TD');if(escapedCells.length!==2||!escapedCells[1].textContent.includes('left | right'))throw new Error('escaped table separator was split');
+const numbered=new TestNode('div');renderAssistantMarkdown(numbered,['1. first','2) second'].join(nl));if(walk(numbered).filter(node=>node.tagName==='LI').length!==2)throw new Error('ordered list markers were not rendered');
 if(nodes.some(node=>node.tagName==='SCRIPT'||node.tagName==='IMG'))throw new Error('untrusted HTML became an element');
 if(!target.textContent.includes('<script>alert(1)</script>'))throw new Error('HTML input was not preserved as safe text');
 const unsafe=new TestNode('div');renderAssistantMarkdown(unsafe,'[bad](javascript:alert(1))');
