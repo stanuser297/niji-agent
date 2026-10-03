@@ -219,6 +219,32 @@ class WebUITests(unittest.TestCase):
         self.assertIn("j.status==='paused'", PAGE)
         self.assertIn("Paused safely", PAGE)
 
+    @unittest.skipUnless(shutil.which("node"), "Node.js is needed for frontend logic tests")
+    def test_live_run_elapsed_and_plan_progress_logic(self):
+        self.assertIn("updateRunElapsed(j.created,placeholder)", PAGE)
+        self.assertIn("role','progressbar'", PAGE)
+        self.assertIn("aria-valuenow", PAGE)
+        self.assertIn("Task plan · ${done}/${items.length} complete · ${percent}%", PAGE)
+        script = PAGE.split("<script>", 1)[1].split("</script>", 1)[0]
+        def function_source(start, end):
+            return script[script.index(start):script.index(end, script.index(start))]
+        helpers = function_source("function taskCompletionPercent(", "function renderJobPlan(")
+        helpers += function_source("function formatRunElapsed(", "function updateRunElapsed(")
+        probe = helpers + """
+const now=Date.UTC(2026,0,1);
+console.log(JSON.stringify({
+  times:[formatRunElapsed(now/1000-75,now),formatRunElapsed(now/1000-3661,now),formatRunElapsed(true,now),formatRunElapsed([123],now),formatRunElapsed('bad',now),formatRunElapsed(now/1000+30,now)],
+  progress:[taskCompletionPercent([{status:'pending'},{status:'completed'}]),taskCompletionPercent([{status:'completed'},{status:'completed'}]),taskCompletionPercent([{status:'pending'}]),taskCompletionPercent([]),taskCompletionPercent(null)]
+}));
+"""
+        result = subprocess.run(["node", "-e", probe], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["times"], ["Total elapsed · 01:15", "Total elapsed · 01:01:01",
+                                          "Total elapsed · —", "Total elapsed · —",
+                                          "Total elapsed · —", "Total elapsed · 00:00"])
+        self.assertEqual(data["progress"], [50, 100, 0, None, None])
+
     def test_frontend_expired_job_status_is_terminal_and_http_status_is_preserved(self):
         self.assertIn("err.status=r.status", PAGE)
         self.assertIn("if(e.status===404)", PAGE)
