@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import os
@@ -42,6 +43,7 @@ class FakeAgent:
         self.require_approval = require_approval
         self.tool_policies = {}
         self.last_plan_only = False
+        self.last_images = []
         self.approved_plan_seen = None
         self.leave_plan_incomplete = False
         self.corrupt_completion_evidence = False
@@ -97,7 +99,8 @@ class FakeAgent:
     def _record_activity(self, level, message):
         self.activity.append({"time": "12:01:00", "level": level, "message": message})
 
-    def chat(self, message):
+    def chat(self, message, image_attachments=None):
+        self.last_images = list(image_attachments or [])
         self.last_plan_only = bool(getattr(self, "plan_only", False))
         approved_plan = getattr(self, "approved_plan", None)
         self.approved_plan_seen = list(approved_plan) if approved_plan is not None else None
@@ -212,6 +215,33 @@ class WebUITests(unittest.TestCase):
         self.assertIn("Optional completion criteria", PAGE)
         self.assertIn("acceptance_criteria:x.acceptance_criteria.trim()", PAGE)
         self.assertIn("maxLength=400", PAGE)
+
+    def test_completed_runs_remove_live_plan_card_but_plan_previews_keep_it(self):
+        self.assertIn("cleanupRunArtifacts(placeholder,j.plan_only&&j.status==='completed'&&!j.plan_approved)", PAGE)
+        self.assertIn("cleanupRunArtifacts(placeholder,false)", PAGE)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        start = PAGE.index("function cleanupRunArtifacts(")
+        end = PAGE.index("\nfunction renderAttachments", start)
+        helper = PAGE[start:end]
+        script = helper + """
+function node(){return {removed:false,remove(){this.removed=true}}}
+const plan=node(),events=node(),placeholder={querySelector(selector){return selector==='.plan-progress'?plan:events}};
+cleanupRunArtifacts(placeholder,false);
+if(!plan.removed||!events.removed)throw new Error('finished run retained live plan or event cards');
+const saved=node(),savedEvents=node(),preview={querySelector(selector){return selector==='.plan-progress'?saved:savedEvents}};
+cleanupRunArtifacts(preview,true);
+if(saved.removed||savedEvents.removed)throw new Error('plan-only preview was removed');
+"""
+        subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+    def test_frontend_image_upload_controls_are_present(self):
+        self.assertIn("image/png,image/jpeg,image/webp", PAGE)
+        self.assertIn("async function uploadImage(file,mime)", PAGE)
+        self.assertIn("api('/api/uploads'", PAGE)
+        self.assertIn("image_ids:imageIds", PAGE)
+        self.assertIn("vision-capable model", PAGE)
+        self.assertIn("attachment-preview", PAGE)
 
     def test_frontend_exposes_pause_resume_and_paused_status(self):
         self.assertIn('id="pause-resume"', PAGE)
@@ -1441,6 +1471,66 @@ if(emoji.textContent!=='✅ done 😂')throw new Error('emoji or escaped punctua
         self.assertTrue(removed["ok"])
         self.assertEqual(saved, {})
         self.assertEqual(self.agent.mcp_clients, [])
+
+    def test_authenticated_image_upload_is_validated_and_consumed_once_by_chat(self):
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/B7sAAAAASUVORK5CYII=")
+        image = {"name": "diagram.png", "mime": "image/png",
+                 "data": base64.b64encode(png).decode("ascii")}
+        with self.assertRaises(urllib.error.HTTPError) as unauthorized:
+            self.request("/api/uploads", image).read()
+        self.assertEqual(unauthorized.exception.code, 403)
+        saved_response = self.request("/api/uploads", image, self.ui.token)
+        self.assertEqual(saved_response.status, 201)
+        saved = json.loads(saved_response.read())
+        self.assertEqual(saved["name"], "diagram.png")
+        started = json.loads(self.request("/api/chat", {
+            "message": "Describe this image", "image_ids": [saved["id"]]
+        }, self.ui.token).read())
+        job = self.wait_for_job_status(started["id"], "completed")
+        self.assertEqual(self.agent.last_images[0]["name"], "diagram.png")
+        self.assertEqual(self.agent.last_images[0]["mime"], "image/png")
+        self.assertEqual(self.agent.last_images[0]["data"], png)
+        self.assertEqual(self.agent.messages[-2]["content"], "Describe this image")
+        self.assertNotIn(image["data"], json.dumps(job))
+        self.assertEqual(self.ui._uploads, {})
+        with self.assertRaises(urllib.error.HTTPError) as reused:
+            self.request("/api/chat", {"message": "try again", "image_ids": [saved["id"]]},
+                         self.ui.token).read()
+        self.assertEqual(reused.exception.code, 400)
+
+    def test_image_upload_rejects_spoofed_mime_secret_name_and_unknown_fields(self):
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/B7sAAAAASUVORK5CYII=")
+        encoded = base64.b64encode(png).decode("ascii")
+        for data in (
+            {"name": "fake.png", "mime": "image/png", "data": base64.b64encode(b"not an image").decode()},
+            {"name": "secret-photo.png", "mime": "image/png", "data": encoded},
+            {"name": "photo.png", "mime": "image/png", "data": encoded, "path": "/tmp/x"},
+        ):
+            with self.assertRaises(urllib.error.HTTPError) as rejected:
+                self.request("/api/uploads", data, self.ui.token).read()
+            self.assertIn(rejected.exception.code, (400, 415))
+
+    def test_chat_rejects_malformed_and_duplicate_image_ids(self):
+        for ids in (["bad", "bad"], [1], ["x"] * 6):
+            with self.assertRaises(urllib.error.HTTPError) as rejected:
+                self.request("/api/chat", {"message": "look", "image_ids": ids},
+                             self.ui.token).read()
+            self.assertEqual(rejected.exception.code, 400)
+
+    def test_only_a_completed_unapproved_plan_only_run_restores_saved_plan_card(self):
+        self.assertFalse(self.ui._state()["saved_plan_preview"])
+        self.ui._jobs["plan-run"] = {
+            "id": "plan-run", "session_id": self.agent.session_id,
+            "status": "completed", "plan_only": True, "plan_approved": False,
+            "created": 100,
+        }
+        self.assertTrue(self.ui._state()["saved_plan_preview"])
+        self.ui._jobs["plan-run"].update(plan_approved=True)
+        self.assertFalse(self.ui._state()["saved_plan_preview"])
+        self.ui._jobs["plan-run"].update(plan_approved=False, status="error")
+        self.assertFalse(self.ui._state()["saved_plan_preview"])
 
     def test_plan_only_does_not_execute_tools_and_is_visible_in_job(self):
         started = json.loads(self.request("/api/chat", {"message": "inspect project", "plan_only": True}, self.ui.token).read())

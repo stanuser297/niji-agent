@@ -1,6 +1,8 @@
 """Token-protected, loopback-only browser UI for Niji Agent."""
 from __future__ import annotations
 
+import base64
+import binascii
 import difflib
 import hmac
 from contextlib import contextmanager
@@ -30,6 +32,11 @@ from .planning import (extract_plan_steps, load_plan, normalize_plan, save_plan,
                       validate_approved_plan_progress)
 
 _MAX_BODY = 32_000
+_MAX_UPLOAD_BODY = 6 * 1024 * 1024
+_MAX_IMAGE_BYTES = 4 * 1024 * 1024
+_MAX_IMAGE_TOTAL = 8 * 1024 * 1024
+_MAX_IMAGE_COUNT = 5
+_UPLOAD_TTL_SECONDS = 30 * 60
 _MAX_PROMPT = 20_000
 _PROFILE_FILE = CONFIG_DIR / "project_profiles.json"
 _PIN_FILE = CONFIG_DIR / "pinned_sessions.json"
@@ -94,6 +101,7 @@ class NijiWebUI:
         self._model_mutating = False
         self._active_job = None
         self._jobs = {}
+        self._uploads = {}
         self._retry_confirmations = {}
         self._run_store = None
         self._run_store_error = ""
@@ -182,7 +190,8 @@ class NijiWebUI:
                     size = int(self.headers.get("Content-Length", "0"))
                 except ValueError:
                     return None
-                if size < 1 or size > _MAX_BODY:
+                limit = _MAX_UPLOAD_BODY if urlsplit(self.path).path == "/api/uploads" else _MAX_BODY
+                if size < 1 or size > limit:
                     return None
                 try:
                     return json.loads(self.rfile.read(size))
@@ -280,6 +289,17 @@ class NijiWebUI:
                 data = self._read_json()
                 if data is None:
                     self._json(400, {"error": "Invalid or oversized JSON body"}); return
+                if parsed.path == "/api/uploads":
+                    status, result = ui._store_uploaded_image(data)
+                    self._json(status, result); return
+                if parsed.path.startswith("/api/uploads/") and parsed.path.endswith("/delete"):
+                    parts = parsed.path.strip("/").split("/")
+                    if len(parts) != 4 or not isinstance(data, dict) or data:
+                        self._json(400, {"error": "Upload removal requires an empty JSON object"}); return
+                    with ui._lock:
+                        removed = ui._uploads.pop(parts[2], None) is not None
+                    self._json(200 if removed else 404,
+                               {"ok": removed, "error": "Upload expired or not found" if not removed else ""}); return
                 if parsed.path.startswith("/api/jobs/") and parsed.path.endswith("/retry"):
                     parts = parsed.path.strip("/").split("/")
                     retry_fields = {"confirm_repeat", "context_confirmation_token"}
@@ -552,13 +572,20 @@ class NijiWebUI:
                         self._json(409, {"error": str(exc)}); return
                     self._json(200, {"ok": True, "content": "" if action == "clear" else content}); return
                 if parsed.path == "/api/chat":
-                    message = data.get("message") if isinstance(data, dict) else None
+                    if not isinstance(data, dict) or set(data) - {"message", "plan_only", "image_ids"}:
+                        self._json(400, {"error": "Chat request contains unsupported fields"}); return
+                    message = data.get("message")
                     if not isinstance(message, str) or not message.strip() or len(message) > _MAX_PROMPT:
                         self._json(400, {"error": f"Message must contain 1-{_MAX_PROMPT} characters"}); return
-                    plan_only = data.get("plan_only", False) if isinstance(data, dict) else False
+                    plan_only = data.get("plan_only", False)
                     if not isinstance(plan_only, bool):
                         self._json(400, {"error": "plan_only must be true or false"}); return
-                    status, result = ui._start_job(message.strip(), plan_only=plan_only)
+                    image_ids = data.get("image_ids", [])
+                    if (not isinstance(image_ids, list) or len(image_ids) > _MAX_IMAGE_COUNT
+                            or any(not isinstance(item, str) for item in image_ids)):
+                        self._json(400, {"error": f"image_ids must be a list of at most {_MAX_IMAGE_COUNT} upload IDs"}); return
+                    status, result = ui._start_job(message.strip(), plan_only=plan_only,
+                                                   image_ids=image_ids)
                     self._json(status, result); return
                 if parsed.path == "/api/session/new":
                     try:
@@ -1290,7 +1317,73 @@ class NijiWebUI:
             with self._lock:
                 self._agent_mutating = False
 
-    def _start_job(self, message, plan_only=False, automation_id=None, approved_plan=None):
+    def _prune_uploads_locked(self, now=None):
+        now = time.time() if now is None else now
+        self._uploads = {key: item for key, item in self._uploads.items()
+                         if now - item.get("created", 0) <= _UPLOAD_TTL_SECONDS}
+
+    def _store_uploaded_image(self, payload):
+        if (not isinstance(payload, dict) or set(payload) != {"name", "mime", "data"}
+                or not all(isinstance(payload.get(key), str) for key in ("name", "mime", "data"))):
+            return 400, {"error": "Image upload requires a name, MIME type, and base64 data"}
+        name, mime, encoded = payload["name"], payload["mime"], payload["data"]
+        if not 1 <= len(name) <= 120 or Path(name).name != name or any(ord(char) < 32 for char in name):
+            return 400, {"error": "Image filename is invalid"}
+        lower_name = name.casefold()
+        if (lower_name.startswith(".env") or any(word in lower_name for word in
+                ("secret", "credential", "private", "id_rsa")) or lower_name.endswith(".pem")):
+            return 400, {"error": "Image filename was rejected because it may contain secrets"}
+        allowed = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                   ".webp": "image/webp"}
+        expected_mime = allowed.get(Path(name).suffix.casefold())
+        if expected_mime is None or mime != expected_mime:
+            return 415, {"error": "Only PNG, JPEG, and WebP images are supported"}
+        if len(encoded) > ((_MAX_IMAGE_BYTES + 2) // 3) * 4:
+            return 413, {"error": "Image is over 4 MiB"}
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            return 400, {"error": "Image data is not valid base64"}
+        if not raw or len(raw) > _MAX_IMAGE_BYTES:
+            return 413, {"error": "Image must be between 1 byte and 4 MiB"}
+        signatures = {
+            "image/png": raw.startswith(bytes((137, 80, 78, 71, 13, 10, 26, 10))),
+            "image/jpeg": raw.startswith(bytes((255, 216, 255))),
+            "image/webp": len(raw) >= 12 and raw.startswith(b"RIFF") and raw[8:12] == b"WEBP",
+        }
+        if not signatures.get(mime, False):
+            return 415, {"error": "Image bytes do not match the declared file type"}
+        with self._lock:
+            self._prune_uploads_locked()
+            if len(self._uploads) >= _MAX_IMAGE_COUNT:
+                return 413, {"error": f"Keep at most {_MAX_IMAGE_COUNT} pending image uploads"}
+            stored_bytes = sum(len(item["data"]) for item in self._uploads.values())
+            if stored_bytes + len(raw) > _MAX_IMAGE_TOTAL:
+                return 413, {"error": "Pending images are limited to 8 MiB total"}
+            upload_id = secrets.token_urlsafe(18)
+            self._uploads[upload_id] = {"name": name, "mime": mime, "data": raw,
+                                        "created": time.time()}
+        return 201, {"id": upload_id, "name": name, "mime": mime, "size": len(raw)}
+
+    def _resolve_uploads_locked(self, image_ids):
+        if not isinstance(image_ids, list) or len(image_ids) > _MAX_IMAGE_COUNT:
+            return 400, None, "Choose at most five images"
+        if any(not isinstance(item, str) for item in image_ids):
+            return 400, None, "Image upload references must be strings"
+        if len(set(image_ids)) != len(image_ids):
+            return 400, None, "The same image upload cannot be attached twice"
+        if any(not re.fullmatch(r"[A-Za-z0-9_-]{20,40}", item) for item in image_ids):
+            return 400, None, "Image upload reference is malformed"
+        self._prune_uploads_locked()
+        records = [self._uploads.get(item) for item in image_ids]
+        if any(item is None for item in records):
+            return 400, None, "An image upload expired or is no longer available; attach it again"
+        if sum(len(item["data"]) for item in records) > _MAX_IMAGE_TOTAL:
+            return 413, None, "Images are limited to 8 MiB total"
+        return 200, records, ""
+
+    def _start_job(self, message, plan_only=False, automation_id=None, approved_plan=None,
+                   image_ids=None):
         try:
             approved_plan = normalize_plan(approved_plan) if approved_plan is not None else None
             if approved_plan is not None and any(item["status"] != "pending" for item in approved_plan):
@@ -1302,6 +1395,13 @@ class NijiWebUI:
                 return 409, {"error": "Wait for the current setup or workspace operation to finish before starting a request"}
             if self._busy:
                 return 409, {"error": "Niji is already working on a request"}
+            upload_status, upload_records, upload_error = self._resolve_uploads_locked(
+                [] if image_ids is None else image_ids)
+            if upload_status != 200:
+                return upload_status, {"error": upload_error}
+            consumed_ids = list(image_ids or [])
+            image_attachments = [{"name": item["name"], "mime": item["mime"],
+                                  "data": item["data"]} for item in upload_records]
             cancel_event = getattr(self.agent, "_cancel_event", None)
             if cancel_event is not None:
                 cancel_event.clear()
@@ -1326,7 +1426,8 @@ class NijiWebUI:
                                  "automation_id": automation_id or ""}
             self._persist_job(job_id, force=True)
             self._job_thread = threading.Thread(
-                target=self._run_job, args=(job_id, message, plan_only, approved_plan),
+                target=self._run_job,
+                args=(job_id, message, plan_only, approved_plan, image_attachments),
                 name=f"niji-job-{job_id[:8]}", daemon=True)
             try:
                 self._job_thread.start()
@@ -1337,6 +1438,8 @@ class NijiWebUI:
                                           error=f"Worker startup failed ({type(exc).__name__})")
                 self._persist_job(job_id, force=True)
                 return 500, {"error": f"Could not start the task ({type(exc).__name__})"}
+            for upload_id in consumed_ids:
+                self._uploads.pop(upload_id, None)
             return 202, {"id": job_id}
 
     def _dispatch_due_automations(self, now=None):
@@ -1397,7 +1500,8 @@ class NijiWebUI:
         except (OSError, ValueError):
             pass
 
-    def _run_job(self, job_id, message, plan_only=False, approved_plan=None):
+    def _run_job(self, job_id, message, plan_only=False, approved_plan=None,
+                 image_attachments=None):
         started = time.monotonic()
         previous_plan_only = getattr(self.agent, "plan_only", False)
         previous_approved_plan = getattr(self.agent, "approved_plan", None)
@@ -1412,7 +1516,10 @@ class NijiWebUI:
                 self.agent.todos = {"items": normalize_plan(approved_plan)}
                 save_plan(self.agent.session_id, self.agent.todos["items"])
                 self._record_plan(self.agent.todos["items"], "Executing approved plan")
-            response = self.agent.chat(message)
+            if image_attachments:
+                response = self.agent.chat(message, image_attachments=image_attachments)
+            else:
+                response = self.agent.chat(message)
             output = self._redact_known_secrets(response or "[done]")[:40_000]
             if plan_only:
                 proposed_steps = extract_plan_steps(output)
@@ -1863,6 +1970,16 @@ class NijiWebUI:
             pending = [{"id": a["id"], "tool": a["tool"], "preview": a["preview"]}
                        for a in self._approvals.values()]
             busy, active = self._busy, self._active_job
+            current_session = getattr(self.agent, "session_id", "local")
+            session_runs = [job for job in self._jobs.values()
+                            if job.get("session_id") == current_session]
+            latest_session_run = max(session_runs,
+                                     key=lambda job: float(job.get("created", 0) or 0),
+                                     default=None)
+            saved_plan_preview = bool(
+                latest_session_run and latest_session_run.get("status") == "completed"
+                and latest_session_run.get("plan_only") is True
+                and not latest_session_run.get("plan_approved"))
         with getattr(self.agent, "_activity_lock", threading.RLock()):
             activity = self._redact_visible(list(getattr(self.agent, "activity", []))[-30:])
             usage = dict(getattr(self.agent, "usage", {}))
@@ -1907,6 +2024,7 @@ class NijiWebUI:
             "model": getattr(self.agent, "model", provider_cfg.get("model", "unknown")),
             "session_id": getattr(self.agent, "session_id", "local"), "approval": getattr(self.agent, "approval", "ask"),
             "busy": busy, "active_job": active, "pending_approvals": pending,
+            "saved_plan_preview": saved_plan_preview,
             "progress": progress, "plan": self._redact_visible(
                 list(getattr(self.agent, "todos", {}).get("items", []))),
             "file_changes": changes[-12:],
@@ -1954,6 +2072,7 @@ class NijiWebUI:
             busy = self._busy
             active_id = self._active_job
             job_thread = self._job_thread
+            self._uploads.clear()
             if active_id and active_id in self._jobs and busy:
                 self._jobs[active_id]["cancel_requested"] = True
                 self._persist_job(active_id, force=True)

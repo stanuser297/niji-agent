@@ -150,7 +150,7 @@ For other systems, the installer is also available as `install.sh`. It installs 
 ## What's new in 2.18.0
 
 - Removed the Chat/Ready strip from the chat page to keep more room for conversation.
-- Added the requested composer toolbar: bounded non-secret text/code file attachments, a public GitHub repository reference helper, a read-only Low/locked provider indicator, and optional browser speech dictation.
+- Added the requested composer toolbar: bounded non-secret text/code attachments plus authenticated, short-lived PNG/JPEG/WebP image uploads for vision-capable provider/models (4 MiB each, 8 MiB total); image bytes are never written to session history. Also includes a public GitHub repository reference helper, a read-only Low/locked provider indicator, and optional browser speech dictation.
 - Kept Send/Stop behavior and mobile-friendly layout; unsupported microphone browsers show a clear message. Private GitHub repositories are not authenticated by this helper.
 - Added regression checks for the new controls and hidden chat header.
 
