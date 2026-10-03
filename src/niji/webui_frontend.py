@@ -23,11 +23,10 @@ body.light{color-scheme:light;--bg:#edf1f8;--sidebar:#e5ebf5;--surface:#fff;--su
 </style><style>
 .run-history{display:grid;gap:9px}.run-card{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;padding:12px;border:1px solid var(--line);border-radius:11px;background:var(--surface)}.run-card strong{display:block;font-size:12px;line-height:1.45;overflow-wrap:anywhere}.run-card small{display:block;margin-top:4px;color:var(--muted);font-size:10px}.run-status{display:inline-flex;border:1px solid var(--line);border-radius:99px;padding:3px 8px;color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.08em}.run-status.completed{color:var(--green);border-color:#34624e}.run-status.error,.run-status.interrupted{color:var(--amber);border-color:#755e36}.run-status.cancelled{color:#c2cde0}.run-detail{margin-top:14px}.run-detail pre{max-height:320px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:#0c1320;border:1px solid var(--line);border-radius:9px;padding:12px;color:var(--text);font:11px/1.55 ui-monospace,monospace}.run-plan-wrap{margin:12px 0}.run-plan-wrap h3{margin:0 0 7px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}.run-plan{display:grid;gap:6px;padding-left:25px;color:var(--muted);font-size:11px}.run-plan li{padding:7px 9px;border:1px solid var(--line);border-radius:8px;background:var(--surface2);overflow-wrap:anywhere}.run-warning{margin:0 0 12px}.run-card-actions{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}.run-filter.active{color:#dfffff;border-color:#398494;background:#16323d}@media(max-width:560px){.run-card{grid-template-columns:1fr}.run-card-actions{justify-content:flex-start}}
 </style><style>
-/* Full-width, unmistakable user turns; keep their text readable on either theme. */
-.message.user{align-self:flex-end;width:100%;max-width:100%;border:1px solid #7867b255;border-radius:16px 16px 4px 16px;background:linear-gradient(120deg,#172237,#201b33);padding:11px 15px;direction:ltr}
-.message.user .msglabel{justify-content:flex-end;color:#d3c4ff}
+/* Right-align user turns and wrap long prompts at the chat midpoint without a bubble. */
+.message.user{align-self:flex-end;width:fit-content;max-width:min(52%,680px);border:0;border-radius:0;background:transparent;padding:0;direction:ltr}
+.message.user .msglabel{justify-content:flex-end;color:#d3c4ff;margin-bottom:2px}
 .message.user .msgbody{text-align:right;unicode-bidi:plaintext}
-body.light .message.user{background:linear-gradient(120deg,#eef4ff,#f4efff);border-color:#c8c3e0}
 body.light .message.user .msglabel{color:#584a89}
 </style></head><body><div class="app">
 <aside class="sidebar" id="sidebar"><div class="brand"><div class="brandmark">✧</div><div><div class="brandname">NIJI AGENT</div><div class="brandtag">Your ideas, in motion</div></div></div>
