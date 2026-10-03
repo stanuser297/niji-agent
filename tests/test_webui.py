@@ -283,6 +283,25 @@ if(nodes.some(n=>n.innerHTML)) throw new Error('renderer used unsafe HTML');
 """
         subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
+    def test_message_text_keeps_unicode_emoji_and_removes_escape_slashes_safely(self):
+        self.assertIn("function displayMessageText(text)", PAGE)
+        self.assertIn("body.dir='auto'", PAGE)
+        self.assertIn("body.textContent=role==='assistant'?displayMessageText(text)", PAGE)
+        self.assertIn("body.textContent=displayMessageText(j.response||j.streamed", PAGE)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        start = PAGE.index("function displayMessageText(")
+        end = PAGE.index("\nfunction addBubble", start)
+        helper = PAGE[start:end]
+        script = helper + r"""
+const slash=String.fromCharCode(92);
+const input='✅ '+slash+'*done'+slash+'* 😂';
+const output=displayMessageText(input);
+if(output!=='✅ *done* 😂') throw new Error('escaped punctuation or emoji was corrupted: '+output);
+if(displayMessageText('<script>alert(1)</script>')!=='<script>alert(1)</script>') throw new Error('text should remain text, not be transformed as HTML');
+"""
+        subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
     def test_page_requires_private_one_time_token(self):
         with self.assertRaises(urllib.error.HTTPError) as missing:
             urllib.request.urlopen(self.base + "/", timeout=3)
@@ -294,7 +313,10 @@ if(nodes.some(n=>n.innerHTML)) throw new Error('renderer used unsafe HTML');
         self.assertNotIn("\\nfunction renderSessions", page)
         self.assertIn(".chatcard{background:transparent;border:0;border-radius:0;box-shadow:none}", page)
         self.assertIn(".message{width:fit-content;max-width:min(88%,840px);border:0;border-radius:0;background:transparent;padding:0;", page)
-        self.assertIn(".message.user{align-self:flex-end;background:transparent;border-color:transparent}", page)
+        self.assertIn(".message.user{align-self:flex-end;width:100%;max-width:100%;border:1px solid #7867b255", page)
+        self.assertIn(".message.user .msgbody{text-align:right;unicode-bidi:plaintext}", page)
+        self.assertIn("body.light .message.user{background:linear-gradient(120deg,#eef4ff,#f4efff)", page)
+        self.assertIn('"Apple Color Emoji"', page)
         self.assertIn("body.light .chatcard{background:transparent}", page)
         self.assertIn(".chathead{display:none}", page)
         self.assertIn('id="attach-button"', page)
@@ -365,7 +387,7 @@ if(nodes.some(n=>n.innerHTML)) throw new Error('renderer used unsafe HTML');
         self.assertIn("Planning…", page)
         self.assertIn("Searching the web…", page)
         self.assertIn("Running tests…", page)
-        self.assertIn("body.textContent=j.streamed||''", page)
+        self.assertIn("body.textContent=displayMessageText(j.streamed||'')", page)
         self.assertIn("placeholder.classList.toggle('has-stream',!!j.streamed)", page)
         self.assertIn("pollFailures++", page)
         self.assertIn("Math.min(4000,380*Math.pow(2", page)
