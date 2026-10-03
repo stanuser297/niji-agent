@@ -283,22 +283,37 @@ if(nodes.some(n=>n.innerHTML)) throw new Error('renderer used unsafe HTML');
 """
         subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
-    def test_message_text_keeps_unicode_emoji_and_removes_escape_slashes_safely(self):
+    def test_assistant_markdown_formats_common_text_safely(self):
         self.assertIn("function displayMessageText(text)", PAGE)
-        self.assertIn("body.dir='auto'", PAGE)
-        self.assertIn("body.textContent=role==='assistant'?displayMessageText(text)", PAGE)
-        self.assertIn("body.textContent=displayMessageText(j.response||j.streamed", PAGE)
+        self.assertIn("function renderAssistantMarkdown(target,text)", PAGE)
+        self.assertIn("if(role==='assistant')renderAssistantMarkdown(body,text)", PAGE)
+        self.assertIn("renderAssistantMarkdown(body,j.streamed||'')", PAGE)
+        self.assertIn("renderAssistantMarkdown(body,j.response||j.streamed", PAGE)
+        self.assertIn(".msgbody ul,.msgbody ol", PAGE)
+        self.assertIn(".msgbody pre code", PAGE)
         if not shutil.which("node"):
             self.skipTest("Node.js is not installed")
         start = PAGE.index("function displayMessageText(")
         end = PAGE.index("\nfunction addBubble", start)
         helper = PAGE[start:end]
         script = helper + r"""
+class TestNode{constructor(tag){this.tagName=tag.toUpperCase();this.children=[];this._text=''}append(...nodes){this.children.push(...nodes)}replaceChildren(...nodes){this.children=[...nodes];this._text=''}set textContent(value){this._text=String(value);this.children=[]}get textContent(){return this._text+this.children.map(node=>node.textContent).join('')}}
+global.document={createElement:tag=>new TestNode(tag),createTextNode:text=>{const node=new TestNode('#text');node._text=String(text);return node}};
 const slash=String.fromCharCode(92);
-const input='✅ '+slash+'*done'+slash+'* 😂';
-const output=displayMessageText(input);
-if(output!=='✅ *done* 😂') throw new Error('escaped punctuation or emoji was corrupted: '+output);
-if(displayMessageText('<script>alert(1)</script>')!=='<script>alert(1)</script>') throw new Error('text should remain text, not be transformed as HTML');
+const nl=String.fromCharCode(10);const bold=slash+'*'+slash+'*मैं ठीक हूँ, धन्यवाद!'+slash+'*'+slash+'*';const italic=slash+'*मैं कहां से हूँ?'+slash+'*';const codeItem=slash+'- '+slash+'`nvidia'+slash+'`';const input=[bold,'',slash+'- '+italic,codeItem,'','<script>alert(1)</script>'].join(nl);
+const target=new TestNode('div');renderAssistantMarkdown(target,input);
+function walk(node){return [node,...node.children.flatMap(walk)]}
+const nodes=walk(target);
+if(!nodes.some(node=>node.tagName==='STRONG'&&node.textContent==='मैं ठीक हूँ, धन्यवाद!'))throw new Error('escaped bold text was not rendered');
+if(!nodes.some(node=>node.tagName==='EM'&&node.textContent==='मैं कहां से हूँ?'))throw new Error('escaped italic text was not rendered');
+if(nodes.filter(node=>node.tagName==='LI').length!==2)throw new Error('escaped bullets were not rendered as a list');
+if(!nodes.some(node=>node.tagName==='CODE'&&node.textContent==='nvidia'))throw new Error('inline code was not rendered');
+if(nodes.some(node=>node.tagName==='SCRIPT'||node.tagName==='IMG'))throw new Error('untrusted HTML became an element');
+if(!target.textContent.includes('<script>alert(1)</script>'))throw new Error('HTML input was not preserved as safe text');
+const unsafe=new TestNode('div');renderAssistantMarkdown(unsafe,'[bad](javascript:alert(1))');
+if(walk(unsafe).some(node=>node.tagName==='A'))throw new Error('unsafe link protocol was allowed');
+const emoji=new TestNode('div');renderAssistantMarkdown(emoji,'✅ '+slash+'*done'+slash+'* 😂');
+if(emoji.textContent!=='✅ done 😂')throw new Error('emoji or escaped punctuation was corrupted: '+emoji.textContent);
 """
         subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
@@ -388,7 +403,7 @@ if(displayMessageText('<script>alert(1)</script>')!=='<script>alert(1)</script>'
         self.assertIn("Planning…", page)
         self.assertIn("Searching the web…", page)
         self.assertIn("Running tests…", page)
-        self.assertIn("body.textContent=displayMessageText(j.streamed||'')", page)
+        self.assertIn("renderAssistantMarkdown(body,j.streamed||'')", page)
         self.assertIn("placeholder.classList.toggle('has-stream',!!j.streamed)", page)
         self.assertIn("pollFailures++", page)
         self.assertIn("Math.min(4000,380*Math.pow(2", page)
