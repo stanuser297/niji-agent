@@ -228,14 +228,22 @@ class WebUITests(unittest.TestCase):
         script = PAGE.split("<script>", 1)[1].split("</script>", 1)[0]
         def function_source(start, end):
             return script[script.index(start):script.index(end, script.index(start))]
-        helpers = function_source("function summarizeLiveTask(", "function setLiveTaskLabel(")
+        helpers = function_source("function summarizeLiveTask(", "function addWorkingBubble(")
         helpers += function_source("function taskCompletionPercent(", "function renderJobPlan(")
         helpers += function_source("function formatRunElapsed(", "function updateRunElapsed(")
+        helpers += function_source("function updateProgress(", "function renderFileChanges(")
         probe = helpers + """
 const now=Date.UTC(2026,0,1);
 const longTask='Review the cloud execution architecture and verify the isolated worker lifecycle across the project';
+const meta={textContent:'',title:'',attrs:{},setAttribute(k,v){this.attrs[k]=v}};
+const detailEl={textContent:''};
+const placeholder={dataset:{},querySelector(s){return s==='.workmeta'?meta:(s==='.workdetail'?detailEl:null)}};
+updateProgress({label:'Using a tool',detail:'Tool call: run_tests · Running project tests.'},true,placeholder);
+const toolAction=meta.textContent;
+setLiveTaskLabel(placeholder,'Auditing Niji cloud readiness and runtime');
 console.log(JSON.stringify({
   tasks:[summarizeLiveTask('  Fix\\n  the bug  '),summarizeLiveTask(''),summarizeLiveTask(null),summarizeLiveTask(longTask)],
+  toolAction,planAction:meta.textContent,
   times:[formatRunElapsed(now/1000-75,now),formatRunElapsed(now/1000-3661,now),formatRunElapsed(true,now),formatRunElapsed([123],now),formatRunElapsed('bad',now),formatRunElapsed(now/1000+30,now)],
   progress:[taskCompletionPercent([{status:'pending'},{status:'completed'}]),taskCompletionPercent([{status:'completed'},{status:'completed'}]),taskCompletionPercent([{status:'pending'}]),taskCompletionPercent([]),taskCompletionPercent(null)]
 }));
@@ -248,6 +256,8 @@ console.log(JSON.stringify({
         self.assertTrue(data["tasks"][3].startswith("Review the cloud execution architecture"))
         self.assertTrue(data["tasks"][3].endswith("…"))
         self.assertLessEqual(len(data["tasks"][3]), 84)
+        self.assertEqual(data["toolAction"], "Running project tests.")
+        self.assertEqual(data["planAction"], "Auditing Niji cloud readiness and runtime")
         self.assertEqual(data["times"], ["Total elapsed · 01:15", "Total elapsed · 01:01:01",
                                           "Total elapsed · —", "Total elapsed · —",
                                           "Total elapsed · —", "Total elapsed · 00:00"])
@@ -429,8 +439,11 @@ if(emoji.textContent!=='✅ done 😂')throw new Error('emoji or escaped punctua
         self.assertIn("white-space:nowrap;overflow:hidden;text-overflow:ellipsis", page)
         self.assertIn(".message.live-status .workdetail,.message.live-status .run-elapsed", page)
         self.assertIn("function summarizeLiveTask(value)", page)
-        self.assertIn("setLiveTaskLabel(placeholder,j.original_message)", page)
-        self.assertIn("addWorkingBubble(planOnly,promptText)", page)
+        self.assertIn("addWorkingBubble(planOnly)", page)
+        self.assertIn("const detailAction=detail.replace", page)
+        self.assertIn("const activePlanItem=Array.isArray(j.plan)?j.plan.find", page)
+        self.assertIn("setLiveTaskLabel(placeholder,activePlanItem.content)", page)
+        self.assertIn("color:#858585;font-size:clamp(20px,3.8vw,24px)", page)
         self.assertNotIn("Thinking…", page)
         self.assertIn("Running a command…", page)
         self.assertIn("still running", page)
