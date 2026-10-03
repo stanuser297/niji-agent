@@ -111,14 +111,36 @@ def list_files(path: str = ".", depth: int = 2, ctx: dict = None) -> str:
     base = workspace_path(path, ctx)
     if not base.is_dir():
         return f"[error] not a directory: {path}"
+    try:
+        max_depth = max(0, int(depth))
+    except (TypeError, ValueError):
+        return "[error] depth must be a non-negative integer"
     out = []
-    for p in sorted(base.rglob("*")):
-        if len(p.parts) - len(base.parts) > depth:
-            continue
-        out.append(str(p))
-        if len(out) >= 500:
-            out.append("... [truncated at 500 entries]")
-            break
+    truncated = False
+
+    def visit(directory: Path, level: int) -> None:
+        nonlocal truncated
+        if truncated or level >= max_depth:
+            return
+        try:
+            with os.scandir(directory) as scan:
+                entries = sorted(scan, key=lambda entry: entry.name)
+        except OSError:
+            return
+        for entry in entries:
+            out.append(str(Path(entry.path)))
+            if len(out) >= 500:
+                truncated = True
+                return
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    visit(Path(entry.path), level + 1)
+            except OSError:
+                continue
+
+    visit(base, 0)
+    if truncated:
+        out.append("... [truncated at 500 entries]")
     return "\n".join(out) or "[empty]"
 
 

@@ -232,6 +232,7 @@ class WebUITests(unittest.TestCase):
         helpers += function_source("function taskCompletionPercent(", "function renderJobPlan(")
         helpers += function_source("function formatRunElapsed(", "function updateRunElapsed(")
         helpers += function_source("function updateProgress(", "function renderFileChanges(")
+        helpers += function_source("function visibleJobEvents(", "function renderJobEvents(")
         probe = helpers + """
 const now=Date.UTC(2026,0,1);
 const longTask='Review the cloud execution architecture and verify the isolated worker lifecycle across the project';
@@ -240,10 +241,13 @@ const detailEl={textContent:''};
 const placeholder={dataset:{},querySelector(s){return s==='.workmeta'?meta:(s==='.workdetail'?detailEl:null)}};
 updateProgress({label:'Using a tool',detail:'Tool call: run_tests · Running project tests.'},true,placeholder);
 const toolAction=meta.textContent;
+const recentEvents=visibleJobEvents([{level:'THINKING',message:'Thinking through the next step'},{level:'PLAN',message:'Executing 1 of 1 requested tool call(s)'},{level:'TOOL',message:'Tool call: list_files · Listing workspace files'}]);
+updateProgress({label:'Using a tool',detail:'Tool call: bash · still running (12s)'},true,placeholder);
+const timedAction=meta.textContent;
 setLiveTaskLabel(placeholder,'Auditing Niji cloud readiness and runtime');
 console.log(JSON.stringify({
   tasks:[summarizeLiveTask('  Fix\\n  the bug  '),summarizeLiveTask(''),summarizeLiveTask(null),summarizeLiveTask(longTask)],
-  toolAction,planAction:meta.textContent,
+  toolAction,timedAction,planAction:meta.textContent,recentEvents:recentEvents.map(e=>e.level),
   times:[formatRunElapsed(now/1000-75,now),formatRunElapsed(now/1000-3661,now),formatRunElapsed(true,now),formatRunElapsed([123],now),formatRunElapsed('bad',now),formatRunElapsed(now/1000+30,now)],
   progress:[taskCompletionPercent([{status:'pending'},{status:'completed'}]),taskCompletionPercent([{status:'completed'},{status:'completed'}]),taskCompletionPercent([{status:'pending'}]),taskCompletionPercent([]),taskCompletionPercent(null)]
 }));
@@ -257,6 +261,8 @@ console.log(JSON.stringify({
         self.assertTrue(data["tasks"][3].endswith("…"))
         self.assertLessEqual(len(data["tasks"][3]), 84)
         self.assertEqual(data["toolAction"], "Running project tests.")
+        self.assertEqual(data["recentEvents"], ["TOOL"])
+        self.assertEqual(data["timedAction"], "Running a command… · 12s")
         self.assertEqual(data["planAction"], "Auditing Niji cloud readiness and runtime")
         self.assertEqual(data["times"], ["Total elapsed · 01:15", "Total elapsed · 01:01:01",
                                           "Total elapsed · —", "Total elapsed · —",
@@ -441,9 +447,11 @@ if(emoji.textContent!=='✅ done 😂')throw new Error('emoji or escaped punctua
         self.assertIn("function summarizeLiveTask(value)", page)
         self.assertIn("addWorkingBubble(planOnly)", page)
         self.assertIn("const detailAction=detail.replace", page)
+        self.assertIn("function visibleJobEvents(events)", page)
+        self.assertIn("Listing workspace files…", page)
         self.assertIn("const activePlanItem=Array.isArray(j.plan)?j.plan.find", page)
         self.assertIn("setLiveTaskLabel(placeholder,activePlanItem.content)", page)
-        self.assertIn("color:#858585;font-size:clamp(20px,3.8vw,24px)", page)
+        self.assertIn("color:#858585;font-size:15px", page)
         self.assertNotIn("Thinking…", page)
         self.assertIn("Running a command…", page)
         self.assertIn("still running", page)
@@ -463,7 +471,7 @@ if(emoji.textContent!=='✅ done 😂')throw new Error('emoji or escaped punctua
         self.assertIn("renderAssistantMarkdown(body,j.streamed||'')", page)
         self.assertIn("placeholder.classList.toggle('has-stream',!!j.streamed)", page)
         self.assertIn("pollFailures++", page)
-        self.assertIn("Math.min(4000,380*Math.pow(2", page)
+        self.assertIn("Math.min(4000,250*Math.pow(2", page)
         self.assertIn("retrying its status check", page)
         self.assertIn("setTimeout(()=>watchJob(id,false,planOnly),1000)", page)
         self.assertIn(".message.live-status.has-stream .msgbody{display:block", page)

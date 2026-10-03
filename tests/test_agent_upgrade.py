@@ -15,7 +15,7 @@ _fake_openai.OpenAI = lambda **options: types.SimpleNamespace(options=options)
 sys.modules.setdefault("openai", _fake_openai)
 
 from niji.instructions import discover_skills, load_project_guidance, read_skill
-from niji.tools.builtin import bash, read_file, write_file
+from niji.tools.builtin import bash, list_files, read_file, write_file
 from niji.tools.subprocess_runner import run_process
 from niji.agent import Agent
 from niji.tools.stateful import task as spawn_task
@@ -177,6 +177,28 @@ class ReliabilityUpgradeTests(unittest.TestCase):
         self.assertTrue(cancelled)
         self.assertFalse(timed_out)
         self.assertLess(time.monotonic() - started, 4)
+
+
+class ListFilesDepthPerformanceTests(unittest.TestCase):
+    def test_long_file_list_scan_stops_at_requested_depth(self):
+        self.assertEqual(Agent._tool_progress_label("list_files"), "Listing workspace files")
+        self.assertEqual(Agent._tool_progress_label("grep"), "Searching project files")
+
+    def test_list_files_prunes_at_requested_depth_without_recursive_glob(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "visible.txt").write_text("visible")
+            nested = root / "folder"
+            nested.mkdir()
+            (nested / "nested.txt").write_text("nested")
+            deep = nested / "deep"
+            deep.mkdir()
+            (deep / "slow.txt").write_text("deep")
+            with patch.object(Path, "rglob", side_effect=AssertionError("must not scan below depth")):
+                output = list_files(str(root), depth=1)
+            self.assertIn(str(root / "visible.txt"), output)
+            self.assertIn(str(nested), output)
+            self.assertNotIn(str(nested / "nested.txt"), output)
 
 
 if __name__ == "__main__":
