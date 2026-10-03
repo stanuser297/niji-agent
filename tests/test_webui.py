@@ -267,18 +267,22 @@ if(saved.removed||savedEvents.removed)throw new Error('plan-only preview was rem
         probe = helpers + """
 const now=Date.UTC(2026,0,1);
 const longTask='Review the cloud execution architecture and verify the isolated worker lifecycle across the project';
-const meta={textContent:'',title:'',attrs:{},setAttribute(k,v){this.attrs[k]=v}};
+const meta={textContent:'',title:'',attrs:{},setAttribute(k,v){this.attrs[k]=v},getAttribute(k){return this.attrs[k]}};
 const detailEl={textContent:''};
 const placeholder={dataset:{},querySelector(s){return s==='.workmeta'?meta:(s==='.workdetail'?detailEl:null)}};
 updateProgress({label:'Using a tool',detail:'Tool call: run_tests · Running project tests.'},true,placeholder);
 const toolAction=meta.textContent;
+updateProgress({label:'Using a tool',detail:'Tool call: slack.search.messages · Searching Slack messages.'},true,placeholder);const connectorAction=meta.textContent;
 const recentEvents=visibleJobEvents([{level:'THINKING',message:'Thinking through the next step'},{level:'PLAN',message:'Executing 1 of 1 requested tool call(s)'},{level:'TOOL',message:'Tool call: list_files · Listing workspace files'}]);
 updateProgress({label:'Using a tool',detail:'Tool call: bash · still running (12s)'},true,placeholder);
 const timedAction=meta.textContent;
-setLiveTaskLabel(placeholder,'Auditing Niji cloud readiness and runtime');
+setLiveTaskLabel(placeholder,'Auditing Niji cloud readiness and runtime');const planAction=meta.textContent;
+setLiveTaskLabel(placeholder,'Running tests');meta.textContent='Paused safely';setLiveTaskLabel(placeholder,'Running tests');const recoveredStatus=meta.textContent;
 console.log(JSON.stringify({
   tasks:[summarizeLiveTask('  Fix\\n  the bug  '),summarizeLiveTask(''),summarizeLiveTask(null),summarizeLiveTask(longTask)],
-  toolAction,timedAction,planAction:meta.textContent,recentEvents:recentEvents.map(e=>e.level),
+  toolAction,connectorAction,timedAction,planAction,recentEvents:recentEvents.map(e=>e.level),
+  activityLabels:[formatJobEventMessage({message:'Tool call: list_files · Listing workspace files'}),formatJobEventMessage({message:'run_tests completed'}),formatJobEventMessage({message:'Tool call: bash · still running (9s)'}),formatJobEventMessage({message:'Tool call: slack.search.messages · Searching Slack messages'})],
+  recoveredStatus,
   times:[formatRunElapsed(now/1000-75,now),formatRunElapsed(now/1000-3661,now),formatRunElapsed(true,now),formatRunElapsed([123],now),formatRunElapsed('bad',now),formatRunElapsed(now/1000+30,now)],
   progress:[taskCompletionPercent([{status:'pending'},{status:'completed'}]),taskCompletionPercent([{status:'completed'},{status:'completed'}]),taskCompletionPercent([{status:'pending'}]),taskCompletionPercent([]),taskCompletionPercent(null)]
 }));
@@ -286,13 +290,15 @@ console.log(JSON.stringify({
         result = subprocess.run(["node", "-e", probe], capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
         data = json.loads(result.stdout)
-        self.assertEqual(data["tasks"][:3], ["Fix the bug", "Working on your request…",
-                                              "Working on your request…"])
+        self.assertEqual(data["tasks"][:3], ["Fix the bug", "Working", "Working"])
         self.assertTrue(data["tasks"][3].startswith("Review the cloud execution architecture"))
         self.assertTrue(data["tasks"][3].endswith("…"))
         self.assertLessEqual(len(data["tasks"][3]), 84)
         self.assertEqual(data["toolAction"], "Running project tests.")
+        self.assertEqual(data["connectorAction"], "Searching Slack messages.")
         self.assertEqual(data["recentEvents"], ["TOOL"])
+        self.assertEqual(data["activityLabels"], ["Listing workspace files", "Finished run tests", "Still running · 9s", "Searching Slack messages"])
+        self.assertEqual(data["recoveredStatus"], "Running tests")
         self.assertEqual(data["timedAction"], "Running a command… · 12s")
         self.assertEqual(data["planAction"], "Auditing Niji cloud readiness and runtime")
         self.assertEqual(data["times"], ["Total elapsed · 01:15", "Total elapsed · 01:01:01",
@@ -471,8 +477,13 @@ if(emoji.textContent!=='✅ done 😂')throw new Error('emoji or escaped punctua
         self.assertIn("box.classList.add('working','live-status')", page)
         self.assertIn(".message.live-status .msglabel{display:none}", page)
         self.assertIn(".message.live-status .msgbody{display:none}", page)
-        self.assertIn(".message.live-status:before,.message.live-status.has-stream:before{display:none}", page)
+        self.assertIn(".message.live-status:before,.message.live-status.has-stream:before{content:'';display:block", page)
         self.assertIn(".message.live-status .workmeta{display:block;width:100%", page)
+        self.assertIn(".message.live-status .run-activity-summary", page)
+        self.assertIn(".message.live-status .run-activity[open]", page)
+        self.assertIn("activity.className='run-activity'", page)
+        self.assertIn("Activity · ${visible.length}", page)
+        self.assertIn("root.dataset.signature===signature", page)
         self.assertIn("white-space:nowrap;overflow:hidden;text-overflow:ellipsis", page)
         self.assertIn(".message.live-status .workdetail,.message.live-status .run-elapsed", page)
         self.assertIn("function summarizeLiveTask(value)", page)
@@ -482,12 +493,14 @@ if(emoji.textContent!=='✅ done 😂')throw new Error('emoji or escaped punctua
         self.assertIn("Listing workspace files…", page)
         self.assertIn("const activePlanItem=Array.isArray(j.plan)?j.plan.find", page)
         self.assertIn("setLiveTaskLabel(placeholder,activePlanItem.content)", page)
-        self.assertIn("color:#858585;font-size:15px", page)
+        self.assertIn("color:var(--text);font-size:14px", page)
+        self.assertIn("@keyframes statuspulse", page)
+        self.assertIn("prefers-reduced-motion:reduce", page)
         self.assertNotIn("Thinking…", page)
         self.assertIn("Running a command…", page)
         self.assertIn("still running", page)
         self.assertIn("duration=detail.match", page)
-        self.assertIn("Planning your request…", page)
+        self.assertIn("Planning…", page)
         self.assertIn("Checking your request and deciding what action is needed.", page)
         self.assertIn("Running the requested command.", page)
         self.assertIn("Still running · ${duration}s.", page)
