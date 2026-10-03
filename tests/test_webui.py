@@ -228,11 +228,14 @@ class WebUITests(unittest.TestCase):
         script = PAGE.split("<script>", 1)[1].split("</script>", 1)[0]
         def function_source(start, end):
             return script[script.index(start):script.index(end, script.index(start))]
-        helpers = function_source("function taskCompletionPercent(", "function renderJobPlan(")
+        helpers = function_source("function summarizeLiveTask(", "function setLiveTaskLabel(")
+        helpers += function_source("function taskCompletionPercent(", "function renderJobPlan(")
         helpers += function_source("function formatRunElapsed(", "function updateRunElapsed(")
         probe = helpers + """
 const now=Date.UTC(2026,0,1);
+const longTask='Review the cloud execution architecture and verify the isolated worker lifecycle across the project';
 console.log(JSON.stringify({
+  tasks:[summarizeLiveTask('  Fix\\n  the bug  '),summarizeLiveTask(''),summarizeLiveTask(null),summarizeLiveTask(longTask)],
   times:[formatRunElapsed(now/1000-75,now),formatRunElapsed(now/1000-3661,now),formatRunElapsed(true,now),formatRunElapsed([123],now),formatRunElapsed('bad',now),formatRunElapsed(now/1000+30,now)],
   progress:[taskCompletionPercent([{status:'pending'},{status:'completed'}]),taskCompletionPercent([{status:'completed'},{status:'completed'}]),taskCompletionPercent([{status:'pending'}]),taskCompletionPercent([]),taskCompletionPercent(null)]
 }));
@@ -240,6 +243,11 @@ console.log(JSON.stringify({
         result = subprocess.run(["node", "-e", probe], capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
         data = json.loads(result.stdout)
+        self.assertEqual(data["tasks"][:3], ["Fix the bug", "Working on your request…",
+                                              "Working on your request…"])
+        self.assertTrue(data["tasks"][3].startswith("Review the cloud execution architecture"))
+        self.assertTrue(data["tasks"][3].endswith("…"))
+        self.assertLessEqual(len(data["tasks"][3]), 84)
         self.assertEqual(data["times"], ["Total elapsed · 01:15", "Total elapsed · 01:01:01",
                                           "Total elapsed · —", "Total elapsed · —",
                                           "Total elapsed · —", "Total elapsed · 00:00"])
@@ -416,13 +424,18 @@ if(emoji.textContent!=='✅ done 😂')throw new Error('emoji or escaped punctua
         self.assertIn("box.classList.add('working','live-status')", page)
         self.assertIn(".message.live-status .msglabel{display:none}", page)
         self.assertIn(".message.live-status .msgbody{display:none}", page)
-        self.assertIn(".message.live-status:before", page)
-        self.assertIn("Preparing next step…", page)
+        self.assertIn(".message.live-status:before,.message.live-status.has-stream:before{display:none}", page)
+        self.assertIn(".message.live-status .workmeta{display:block;width:100%", page)
+        self.assertIn("white-space:nowrap;overflow:hidden;text-overflow:ellipsis", page)
+        self.assertIn(".message.live-status .workdetail,.message.live-status .run-elapsed", page)
+        self.assertIn("function summarizeLiveTask(value)", page)
+        self.assertIn("setLiveTaskLabel(placeholder,j.original_message)", page)
+        self.assertIn("addWorkingBubble(planOnly,promptText)", page)
         self.assertNotIn("Thinking…", page)
         self.assertIn("Running a command…", page)
         self.assertIn("still running", page)
         self.assertIn("duration=detail.match", page)
-        self.assertIn("Planning the steps…", page)
+        self.assertIn("Planning your request…", page)
         self.assertIn("Checking your request and deciding what action is needed.", page)
         self.assertIn("Running the requested command.", page)
         self.assertIn("Still running · ${duration}s.", page)
